@@ -1,0 +1,99 @@
+(* ========================================================================= *)
+(*                     SPARK-0 (.ru) FORMAL EBNF GRAMMAR                     *)
+(* ========================================================================= *)
+
+Module           ::= TopLevelItem* EOF ;
+
+TopLevelItem     ::= StructDef
+                   | FnDef
+                   | ExternFnDecl ;
+
+(* -------------------------- Struct Definition ---------------------------- *)
+StructDef        ::= "struct" Identifier "{" ( FieldDef ( "," FieldDef )* ","? )? "}" ;
+FieldDef         ::= Identifier ":" Type ;
+
+(* ------------------------- Function Definition --------------------------- *)
+FnDef            ::= "fn" Identifier "(" ( Param ( "," Param )* ","? )? ")" ( "->" Type )? Block ;
+ExternFnDecl     ::= "extern" "fn" Identifier "(" ( Param ( "," Param )* ","? )? ")" ( "->" Type )? ";" ;
+Param            ::= Identifier ":" Type ;
+
+(* ------------------------------ Type System ------------------------------ *)
+Type             ::= PrimitiveType
+                   | PointerType
+                   | ArrayType
+                   | NamedType ;
+
+PrimitiveType    ::= "i64" | "u64" | "u32" | "u8" | "void" ;
+PointerType      ::= "*" "mut"? Type ;
+ArrayType        ::= "[" Type ";" IntegerLiteral "]" ;
+NamedType        ::= Identifier ;
+
+(* ------------------------------ Statements ------------------------------- *)
+Block            ::= "{" Statement* "}" ;
+
+Statement        ::= LetStmt
+                   | AssignStmt
+                   | IfStmt
+                   | WhileStmt
+                   | ReturnStmt
+                   | ExprStmt ;
+
+LetStmt          ::= "let" "mut"? Identifier ":" Type ( "=" Expr )? ";" ;
+AssignStmt       ::= LValue "=" Expr ";" ;
+IfStmt           ::= "if" Expr Block ( "else" ( IfStmt | Block ) )? ;
+WhileStmt        ::= "while" Expr Block ;
+ReturnStmt       ::= "return" Expr? ";" ;
+ExprStmt         ::= Expr ";" ;
+
+LValue           ::= Identifier
+                   | "*" LValue
+                   | PostfixExpr "." Identifier
+                   | PostfixExpr "[" Expr "]" ;
+
+(* ----------------------------- Expressions ------------------------------- *)
+Expr             ::= LogicalOrExpr ;
+
+LogicalOrExpr    ::= LogicalAndExpr ( "||" LogicalAndExpr )* ;
+LogicalAndExpr   ::= BitwiseOrExpr ( "&&" BitwiseOrExpr )* ;
+BitwiseOrExpr    ::= BitwiseXorExpr ( "|" BitwiseXorExpr )* ;
+BitwiseXorExpr   ::= BitwiseAndExpr ( "^" BitwiseAndExpr )* ;
+BitwiseAndExpr   ::= EqualityExpr ( "&" EqualityExpr )* ;
+
+EqualityExpr     ::= RelationalExpr ( ( "==" | "!=" ) RelationalExpr )* ;
+RelationalExpr   ::= ShiftExpr ( ( "<" | "<=" | ">" | ">=" ) ShiftExpr )* ;
+
+ShiftExpr        ::= AdditiveExpr ( ( "<<" | ">>" ) AdditiveExpr )* ;
+AdditiveExpr     ::= MultiplicativeExpr ( ( "+" | "-" ) MultiplicativeExpr )* ;
+MultiplicativeExpr ::= CastExpr ( ( "*" | "/" | "%" ) CastExpr )* ;
+
+CastExpr         ::= UnaryExpr ( "as" Type )* ;
+
+UnaryExpr        ::= PrefixOp UnaryExpr
+                   | PostfixExpr ;
+
+PrefixOp         ::= "-" | "!" | "~" | "*" | "&" | "&mut" ;
+
+PostfixExpr      ::= PrimaryExpr (
+                       "." Identifier             (* Field access: lowered to IR_FIELD_ADDR *)
+                     | "[" Expr "]"               (* Array indexing *)
+                     | "(" ArgList? ")"           (* Function call *)
+                     )* ;
+
+ArgList          ::= Expr ( "," Expr )* ","? ;
+
+PrimaryExpr      ::= Identifier
+                   | IntegerLiteral
+                   | CharLiteral
+                   | StringLiteral
+                   | SyscallIntrinsic
+                   | AsmIntrinsic
+                   | "(" Expr ")" ;
+
+SyscallIntrinsic ::= "syscall" "(" Expr ( "," Expr )* ")" ;
+AsmIntrinsic     ::= "asm" "(" StringLiteral ( "," Expr )* ")" ;
+
+(* -------------------------- Lexical Elements ----------------------------- *)
+Identifier       ::= [a-zA-Z_][a-zA-Z0-9_]* ;
+IntegerLiteral   ::= [0-9]+ | "0x" [0-9a-fA-F]+ ;
+CharLiteral      ::= "'" ( [^'\\] | "\\" . ) "'" ;
+StringLiteral    ::= '"' ( [^"\\] | "\\" . )* '"' ;

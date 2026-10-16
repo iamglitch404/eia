@@ -1,0 +1,21 @@
+struct Account {
+    id: u64,
+    balance: u64,
+    flags: u32,
+}
+
+fn main() -> i64 {
+    let mut acc: Account;
+    let p: *mut Account = &mut acc;
+
+    p.id = 1001;
+    p.balance = 42;
+    p.flags = 7;
+
+    let msg: *u8 = "EIA HOLE PATCHED OK\n";
+    syscall(1, 1, msg, 20);
+
+    let code: i64 = p.balance as i64;
+    syscall(60, code);
+    return 0;
+}

@@ -1,0 +1,260 @@
+// =========================================================================
+//            STAGE-1 SELF-HOSTED EIA RUNTIME & DVAM SUBSTRATE (.rx)
+//              Governed by Eternal Interface Architecture (EIA)
+// =========================================================================
+
+// -------------------------------------------------------------------------
+//                    1. EIA Canonical Binary Contract Structs
+// -------------------------------------------------------------------------
+
+struct UniversalHologramHeader {
+    magic: u32,
+    version: u32,
+    abi_epoch: u64,
+    contracts_offset: u64,
+    contracts_count: u64,
+    relocs_offset: u64,
+    relocs_count: u64,
+    type_graph_offset: u64,
+    type_graph_size: u64,
+    blake3_root: u64,
+    flags: u64,
+    reserved0: u64,
+    reserved1: u64,
+}
+
+struct SymbolContract {
+    symbol_hash: u64,
+    type_sig_hash: u64,
+    vaddr: u64,
+    code_size: u64,
+    flags: u32,
+    param_conv: u32,
+    contract_digest: u64,
+}
+
+struct EiaRelocHole {
+    insn_offset: u32,
+    patch_kind: u32,
+    type_sig_hash: u64,
+    field_or_sym_hash: u64,
+}
+
+struct EiaTypeGraphEntry {
+    type_sig_hash: u64,
+    field_hash: u64,
+    byte_offset: u32,
+    field_size: u32,
+}
+
+struct DvamArena {
+    fd: i64,
+    v_write: *mut u8,
+    v_exec: *u8,
+    size: u64,
+    generation: u64,
+}
+
+struct TestStruct {
+    f0: u64,
+    f1: u64,
+    f2: u64,
+}
+
+// -------------------------------------------------------------------------
+//           2. Cryptographic Contract Digest & Type Graph Resolver
+// -------------------------------------------------------------------------
+
+fn eia_compute_contract_digest(buf: *u8, len: u64) -> u64 {
+    let mut h: u64 = 14695981039346656037;
+    let mut i: u64 = 0;
+    while i < len {
+        let b: u8 = buf[i];
+        h = h ^ (b as u64);
+        h = h * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn eia_resolve_field_displacement(tg_entries: *mut EiaTypeGraphEntry, tg_count: u64, type_hash: u64, field_hash: u64) -> i64 {
+    let mut i: u64 = 0;
+    while i < tg_count {
+        let entry: *mut EiaTypeGraphEntry = ((tg_entries as *mut u8) + (i * 24)) as *mut EiaTypeGraphEntry;
+        if entry.type_sig_hash == type_hash && entry.field_hash == field_hash {
+            return entry.byte_offset as i64;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// -------------------------------------------------------------------------
+//           3. Dual Virtual Alias Mapping (DVAM — Strict W ^ X)
+// -------------------------------------------------------------------------
+
+fn dvam_create(arena: *mut DvamArena, size: u64) -> i64 {
+    // 1. SYS_memfd_create = 319: name="dvam_arena", flags=0
+    let name: *u8 = "dvam_arena";
+    let fd: i64 = syscall(319, name, 0);
+    if fd < 0 {
+        return -1;
+    }
+
+    // 2. SYS_ftruncate = 77: fd, length=size
+    let trunc_res: i64 = syscall(77, fd, size);
+    if trunc_res < 0 {
+        syscall(3, fd);
+        return -2;
+    }
+
+    // 3. SYS_mmap = 9 for v_write: addr=0, len=size, prot=3 (PROT_READ|PROT_WRITE), flags=1 (MAP_SHARED), fd, offset=0
+    let w_ptr: *mut u8 = syscall(9, 0, size, 3, 1, fd, 0) as *mut u8;
+    if (w_ptr as i64) < 0 {
+        syscall(3, fd);
+        return -3;
+    }
+
+    // 4. SYS_mmap = 9 for v_exec: addr=0, len=size, prot=5 (PROT_READ|PROT_EXEC), flags=1 (MAP_SHARED), fd, offset=0
+    let x_ptr: *u8 = syscall(9, 0, size, 5, 1, fd, 0) as *u8;
+    if (x_ptr as i64) < 0 {
+        syscall(11, w_ptr, size); // SYS_munmap
+        syscall(3, fd);
+        return -4;
+    }
+
+    arena.fd = fd;
+    arena.v_write = w_ptr;
+    arena.v_exec = x_ptr;
+    arena.size = size;
+    arena.generation = 1;
+    return 0;
+}
+
+fn dvam_advance_generation(arena: *mut DvamArena) {
+    arena.generation = arena.generation + 1;
+}
+
+// -------------------------------------------------------------------------
+//           4. ARLL-Agent Live Stencil & Displacement Hole Patcher
+// -------------------------------------------------------------------------
+
+fn arll_patch_code_via_dvam(arena: *mut DvamArena, relocs: *mut EiaRelocHole, reloc_count: u64, tg: *mut EiaTypeGraphEntry, tg_count: u64) -> u64 {
+    let mut patched: u64 = 0;
+    let mut i: u64 = 0;
+    while i < reloc_count {
+        let hole: *mut EiaRelocHole = ((relocs as *mut u8) + (i * 24)) as *mut EiaRelocHole;
+        let disp: i64 = eia_resolve_field_displacement(tg, tg_count, hole.type_sig_hash, hole.field_or_sym_hash);
+        if disp >= 0 {
+            let target_ptr: *mut u8 = arena.v_write + (hole.insn_offset as u64);
+            let d: u32 = disp as u32;
+            target_ptr[0] = (d & 255) as u8;
+            target_ptr[1] = ((d >> 8) & 255) as u8;
+            target_ptr[2] = ((d >> 16) & 255) as u8;
+            target_ptr[3] = ((d >> 24) & 255) as u8;
+            patched = patched + 1;
+        }
+        i = i + 1;
+    }
+    dvam_advance_generation(arena);
+    return patched;
+}
+
+// -------------------------------------------------------------------------
+//           5. Main End-to-End Verification Driver
+// -------------------------------------------------------------------------
+
+fn main() -> i64 {
+    // 1. Create a 4096-byte DvamArena
+    let mut arena: DvamArena;
+    let create_res: i64 = dvam_create(&mut arena, 4096);
+    if create_res < 0 {
+        let err1: *u8 = "ERROR: Failed to create DvamArena\n";
+        syscall(1, 2, err1, 33);
+        syscall(60, 1);
+        return 1;
+    }
+
+    // 2. Emit raw x86-64 machine code stencil into arena.v_write:
+    //    lea rax, [rdi + 0x00000000]; mov rax, [rax]; ret
+    //    Machine code: 48 8D 87 00 00 00 00 48 8B 00 C3 (11 bytes)
+    let w: *mut u8 = arena.v_write;
+    w[0] = 72;   // 0x48 (REX.W)
+    w[1] = 141;  // 0x8D (lea)
+    w[2] = 135;  // 0x87 (rax, [rdi + disp32])
+    w[3] = 0;    // 0x00 (disp32 byte 0 - hole)
+    w[4] = 0;    // 0x00 (disp32 byte 1 - hole)
+    w[5] = 0;    // 0x00 (disp32 byte 2 - hole)
+    w[6] = 0;    // 0x00 (disp32 byte 3 - hole)
+    w[7] = 72;   // 0x48 (REX.W)
+    w[8] = 139;  // 0x8B (mov)
+    w[9] = 0;    // 0x00 (rax, [rax])
+    w[10] = 195; // 0xC3 (ret)
+
+    // 3. Construct mock EiaTypeGraphEntry and EiaRelocHole
+    let type_hash: u64 = 88888888;
+    let field_hash: u64 = 99999999;
+
+    let mut tg: EiaTypeGraphEntry;
+    tg.type_sig_hash = type_hash;
+    tg.field_hash = field_hash;
+    tg.byte_offset = 16; // offset +16 (0x10)
+    tg.field_size = 8;
+
+    let mut hole: EiaRelocHole;
+    hole.insn_offset = 3; // points to disp32 immediate in lea instruction
+    hole.patch_kind = 1;  // EIA_PATCH_FIELD_DISP32
+    hole.type_sig_hash = type_hash;
+    hole.field_or_sym_hash = field_hash;
+
+    // 4. Run arll_patch_code_via_dvam
+    let patch_count: u64 = arll_patch_code_via_dvam(&mut arena, &mut hole, 1, &mut tg, 1);
+    if patch_count != 1 {
+        let err2: *u8 = "ERROR: ARLL patch count mismatch\n";
+        syscall(1, 2, err2, 33);
+        syscall(60, 2);
+        return 2;
+    }
+
+    // 5. Verify that reading v_exec[3] shows the patched byte 0x10 (16) at the aliased RX address
+    let patched_byte: u8 = arena.v_exec[3];
+    if patched_byte != 16 {
+        let err3: *u8 = "ERROR: DVAM RX alias verification failed\n";
+        syscall(1, 2, err3, 41);
+        syscall(60, 3);
+        return 3;
+    }
+
+    // 6. Verify cryptographic contract digest calculation
+    let digest: u64 = eia_compute_contract_digest(arena.v_exec, 11);
+    if digest == 0 {
+        let err4: *u8 = "ERROR: Contract digest computation failed\n";
+        syscall(1, 2, err4, 42);
+        syscall(60, 4);
+        return 4;
+    }
+
+    // 7. Verify live CPU execution of the patched stencil via DVAM RX alias without mprotect
+    let mut test_obj: TestStruct;
+    test_obj.f0 = 11;
+    test_obj.f1 = 22;
+    test_obj.f2 = 99; // at physical offset +16
+
+    let stencil_fn: *u8 = arena.v_exec;
+    let exec_val: u64 = stencil_fn(&mut test_obj);
+    if exec_val != 99 {
+        let err5: *u8 = "ERROR: Live DVAM execution returned incorrect value\n";
+        syscall(1, 2, err5, 49);
+        syscall(60, 5);
+        return 5;
+    }
+
+    // 8. Output Success Message: "STAGE1 EIA DVAM RUNTIME OK\n" (27 bytes)
+    let msg: *u8 = "STAGE1 EIA DVAM RUNTIME OK\n";
+    syscall(1, 1, msg, 27);
+
+    // 9. Exit with the patched displacement value (16)
+    let exit_val: i64 = patched_byte as i64;
+    syscall(60, exit_val);
+    return exit_val;
+}

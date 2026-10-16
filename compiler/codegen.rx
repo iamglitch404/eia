@@ -1,0 +1,139 @@
+// =========================================================================
+//         STAGE-1 SELF-HOSTED CODEGEN & ELF64+EIA PACKAGER (.rx)
+//              Governed by Eternal Interface Architecture (EIA)
+// =========================================================================
+
+// -------------------------------------------------------------------------
+//                         1. EIA Core Structures
+// -------------------------------------------------------------------------
+
+struct EiaRelocHole {
+    insn_offset: u32,
+    patch_kind: u32,
+    type_sig_hash: u64,
+    field_or_sym_hash: u64,
+}
+
+struct EiaTypeGraphEntry {
+    type_sig_hash: u64,
+    field_hash: u64,
+    byte_offset: u32,
+    field_size: u32,
+}
+
+struct SymbolContract {
+    symbol_hash: u64,
+    type_sig_hash: u64,
+    vaddr: u64,
+    code_size: u64,
+    flags: u32,
+    param_conv: u32,
+    contract_digest: u64,
+}
+
+struct UniversalHologramHeader {
+    magic: u32,
+    version: u32,
+    abi_epoch: u64,
+    contracts_offset: u64,
+    contracts_count: u64,
+    relocs_offset: u64,
+    relocs_count: u64,
+    type_graph_offset: u64,
+    type_graph_size: u64,
+    blake3_root: u64,
+    flags: u64,
+    reserved0: u64,
+    reserved1: u64,
+}
+
+// -------------------------------------------------------------------------
+//                         2. CodeGen State
+// -------------------------------------------------------------------------
+
+struct CodeGen {
+    text_buf: *mut u8,
+    text_size: u32,
+
+    rodata_buf: *mut u8,
+    rodata_size: u32,
+
+    relocs: *mut EiaRelocHole,
+    reloc_count: u32,
+
+    type_graph: *mut EiaTypeGraphEntry,
+    tg_count: u32,
+
+    contracts: *mut SymbolContract,
+    contract_count: u32,
+
+    call_main_hole: u32,
+}
+
+fn cg_init(cg: *mut CodeGen, t_buf: *mut u8, r_buf: *mut u8, rel_buf: *mut EiaRelocHole, tg_buf: *mut EiaTypeGraphEntry, sc_buf: *mut SymbolContract) {
+    cg.text_buf = t_buf;
+    cg.text_size = 0;
+    cg.rodata_buf = r_buf;
+    cg.rodata_size = 0;
+    cg.relocs = rel_buf;
+    cg.reloc_count = 0;
+    cg.type_graph = tg_buf;
+    cg.tg_count = 0;
+    cg.contracts = sc_buf;
+    cg.contract_count = 0;
+    cg.call_main_hole = 0;
+}
+
+fn cg_emit8(cg: *mut CodeGen, b: u8) {
+    cg.text_buf[cg.text_size as u64] = b;
+    cg.text_size = cg.text_size + 1;
+}
+
+fn cg_emit32(cg: *mut CodeGen, val: u32) {
+    cg_emit8(cg, (val & 255) as u8);
+    cg_emit8(cg, ((val >> 8) & 255) as u8);
+    cg_emit8(cg, ((val >> 16) & 255) as u8);
+    cg_emit8(cg, ((val >> 24) & 255) as u8);
+}
+
+fn cg_emit64(cg: *mut CodeGen, val: u64) {
+    cg_emit32(cg, (val & 4294967295) as u32);
+    cg_emit32(cg, ((val >> 32) & 4294967295) as u32);
+}
+
+fn cg_patch32(cg: *mut CodeGen, offset: u32, val: u32) {
+    cg.text_buf[offset as u64] = (val & 255) as u8;
+    cg.text_buf[(offset + 1) as u64] = ((val >> 8) & 255) as u8;
+    cg.text_buf[(offset + 2) as u64] = ((val >> 16) & 255) as u8;
+    cg.text_buf[(offset + 3) as u64] = ((val >> 24) & 255) as u8;
+}
+
+fn cg_add_reloc(cg: *mut CodeGen, insn_offset: u32, type_hash: u64, field_hash: u64) {
+    let hole: *mut EiaRelocHole = ((cg.relocs as *mut u8) + ((cg.reloc_count as u64) * 24)) as *mut EiaRelocHole;
+    hole.insn_offset = insn_offset;
+    hole.patch_kind = 1; // EIA_PATCH_FIELD_DISP32
+    hole.type_sig_hash = type_hash;
+    hole.field_or_sym_hash = field_hash;
+    cg.reloc_count = cg.reloc_count + 1;
+}
+
+fn cg_add_type_graph_entry(cg: *mut CodeGen, type_hash: u64, field_hash: u64, byte_offset: u32, field_size: u32) {
+    let entry: *mut EiaTypeGraphEntry = ((cg.type_graph as *mut u8) + ((cg.tg_count as u64) * 24)) as *mut EiaTypeGraphEntry;
+    entry.type_sig_hash = type_hash;
+    entry.field_hash = field_hash;
+    entry.byte_offset = byte_offset;
+    entry.field_size = field_size;
+    cg.tg_count = cg.tg_count + 1;
+}
+
+fn cg_add_contract(cg: *mut CodeGen, symbol_hash: u64, type_hash: u64, vaddr: u64, code_size: u64) {
+    let sc: *mut SymbolContract = ((cg.contracts as *mut u8) + ((cg.contract_count as u64) * 48)) as *mut SymbolContract;
+    sc.symbol_hash = symbol_hash;
+    sc.type_sig_hash = type_hash;
+    sc.vaddr = vaddr;
+    sc.code_size = code_size;
+    sc.flags = 1;
+    sc.param_conv = 0;
+    sc.contract_digest = symbol_hash ^ type_hash;
+    cg.contract_count = cg.contract_count + 1;
+}

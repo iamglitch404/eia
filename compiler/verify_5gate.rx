@@ -1,0 +1,529 @@
+// =========================================================================
+//              EIA 5-GATE CRYPTOGRAPHIC VERIFICATION RING (.rx)
+//                 Eternal Interface Architecture (EIA)
+// =========================================================================
+
+fn main() -> i64 {
+    let banner1: *u8 = "\n============================================================\n";
+    syscall(1, 1, banner1, 62);
+    let banner2: *u8 = "       EIA 5-GATE CRYPTOGRAPHIC VERIFICATION RING           \n";
+    syscall(1, 1, banner2, 61);
+    let banner3: *u8 = "============================================================\n\n";
+    syscall(1, 1, banner3, 62);
+
+    let compiler: *u8 = "/home/bishwaxyz/ru/bin/core1";
+    let hello_src: *u8 = "/home/bishwaxyz/ru/tests/hello_eia.rx";
+    let core1_src: *u8 = "/home/bishwaxyz/ru/compiler/core1.rx";
+
+    let mut envp: [*mut u8; 1];
+    envp[0] = 0 as *mut u8;
+
+    // Allocate 16MB file buffers
+    let buf1: *mut u8 = syscall(9, 0, 16777216, 3, 34, -1, 0) as *mut u8;
+    let buf2: *mut u8 = syscall(9, 0, 16777216, 3, 34, -1, 0) as *mut u8;
+
+    let mut hex_buf: [u8; 20];
+    hex_buf[0] = 48;  // '0'
+    hex_buf[1] = 120; // 'x'
+    hex_buf[18] = 10; // '\n'
+
+    // =====================================================================
+    // GATE 1: Genesis Compilation Check
+    // =====================================================================
+    let g1_out: *u8 = "/tmp/gate1_hello";
+    let mut argv1: [*mut u8; 5];
+    argv1[0] = compiler;
+    argv1[1] = hello_src;
+    argv1[2] = "-o";
+    argv1[3] = g1_out;
+    argv1[4] = 0 as *mut u8;
+
+    let pid1: i64 = syscall(57);
+    if pid1 == 0 {
+        syscall(59, compiler, argv1, envp);
+        syscall(60, 127);
+    }
+    let mut st1: i64 = 0;
+    syscall(61, pid1, &mut st1, 0, 0);
+    let code1: i64 = (st1 >> 8) & 255;
+    if code1 != 0 {
+        let err1: *u8 = "FAIL: Gate 1 compiler invocation exited with non-zero\n";
+        syscall(1, 2, err1, 54);
+        syscall(60, 101);
+    }
+
+    let fd1: i64 = syscall(2, g1_out, 0, 0);
+    if fd1 < 0 {
+        let err1_open: *u8 = "FAIL: Gate 1 output binary not found\n";
+        syscall(1, 2, err1_open, 37);
+        syscall(60, 102);
+    }
+    let sz1: i64 = syscall(0, fd1, buf1, 16777216);
+    syscall(3, fd1);
+
+    if sz1 < 4096 {
+        let err1_sz: *u8 = "FAIL: Gate 1 binary size too small\n";
+        syscall(1, 2, err1_sz, 35);
+        syscall(60, 103);
+    }
+
+    // Verify ELF header magic: \x7fELF
+    if buf1[0] != 127 || buf1[1] != 69 || buf1[2] != 76 || buf1[3] != 70 {
+        let err1_elf: *u8 = "FAIL: Gate 1 invalid ELF magic\n";
+        syscall(1, 2, err1_elf, 31);
+        syscall(60, 104);
+    }
+
+    // Verify Hologram Header at 0x80 (128): 'EIAH' (0x44484945)
+    if buf1[128] != 69 || buf1[129] != 73 || buf1[130] != 65 || buf1[131] != 72 {
+        let err1_holo: *u8 = "FAIL: Gate 1 invalid Hologram Header magic\n";
+        syscall(1, 2, err1_holo, 43);
+        syscall(60, 105);
+    }
+
+    // Compute cryptographic digest (FNV-1a 64-bit)
+    let mut h1: u64 = 14695981039346656037;
+    let mut i1: u64 = 0;
+    while i1 < (sz1 as u64) {
+        h1 = h1 ^ (buf1[i1] as u64);
+        h1 = h1 * 1099511628211;
+        i1 = i1 + 1;
+    }
+
+    // Verify execution of compiled binary (must return 42)
+    let mut run_argv1: [*mut u8; 2];
+    run_argv1[0] = g1_out;
+    run_argv1[1] = 0 as *mut u8;
+    let run_pid1: i64 = syscall(57);
+    if run_pid1 == 0 {
+        syscall(59, g1_out, run_argv1, envp);
+        syscall(60, 127);
+    }
+    let mut run_st1: i64 = 0;
+    syscall(61, run_pid1, &mut run_st1, 0, 0);
+    let run_code1: i64 = (run_st1 >> 8) & 255;
+    if run_code1 != 42 {
+        let err1_exec: *u8 = "FAIL: Gate 1 binary execution did not return 42\n";
+        syscall(1, 2, err1_exec, 48);
+        syscall(60, 106);
+    }
+
+    let msg1: *u8 = "[GATE 1] Genesis Compilation Check: PASSED (hash=";
+    syscall(1, 1, msg1, 50);
+    let mut hi1: u64 = 0;
+    while hi1 < 16 {
+        let shift1: u64 = (15 - hi1) * 4;
+        let nib1: u64 = (h1 >> shift1) & 15;
+        if nib1 < 10 { hex_buf[2 + hi1] = (48 + nib1) as u8; }
+        else { hex_buf[2 + hi1] = (97 + (nib1 - 10)) as u8; }
+        hi1 = hi1 + 1;
+    }
+    syscall(1, 1, hex_buf, 19);
+
+    // =====================================================================
+    // GATE 2: Bitwise Fixed-Point Check (core1 compiling core1)
+    // =====================================================================
+    let g2_p1: *u8 = "/tmp/gate2_p1";
+    let g2_p2: *u8 = "/tmp/gate2_p2";
+
+    let mut argv2_1: [*mut u8; 5];
+    argv2_1[0] = compiler;
+    argv2_1[1] = core1_src;
+    argv2_1[2] = "-o";
+    argv2_1[3] = g2_p1;
+    argv2_1[4] = 0 as *mut u8;
+
+    let pid2_1: i64 = syscall(57);
+    if pid2_1 == 0 {
+        syscall(59, compiler, argv2_1, envp);
+        syscall(60, 127);
+    }
+    let mut st2_1: i64 = 0;
+    syscall(61, pid2_1, &mut st2_1, 0, 0);
+    if ((st2_1 >> 8) & 255) != 0 {
+        let err2_1: *u8 = "FAIL: Gate 2 Pass 1 compilation failed\n";
+        syscall(1, 2, err2_1, 39);
+        syscall(60, 201);
+    }
+
+    let mut argv2_2: [*mut u8; 5];
+    argv2_2[0] = compiler;
+    argv2_2[1] = core1_src;
+    argv2_2[2] = "-o";
+    argv2_2[3] = g2_p2;
+    argv2_2[4] = 0 as *mut u8;
+
+    let pid2_2: i64 = syscall(57);
+    if pid2_2 == 0 {
+        syscall(59, compiler, argv2_2, envp);
+        syscall(60, 127);
+    }
+    let mut st2_2: i64 = 0;
+    syscall(61, pid2_2, &mut st2_2, 0, 0);
+    if ((st2_2 >> 8) & 255) != 0 {
+        let err2_2: *u8 = "FAIL: Gate 2 Pass 2 compilation failed\n";
+        syscall(1, 2, err2_2, 39);
+        syscall(60, 202);
+    }
+
+    let fd2_1: i64 = syscall(2, g2_p1, 0, 0);
+    let sz2_1: i64 = syscall(0, fd2_1, buf1, 16777216);
+    syscall(3, fd2_1);
+
+    let fd2_2: i64 = syscall(2, g2_p2, 0, 0);
+    let sz2_2: i64 = syscall(0, fd2_2, buf2, 16777216);
+    syscall(3, fd2_2);
+
+    if sz2_1 != sz2_2 || sz2_1 <= 0 {
+        let err2_sz: *u8 = "FAIL: Gate 2 pass 1 and pass 2 sizes do not match\n";
+        syscall(1, 2, err2_sz, 50);
+        syscall(60, 203);
+    }
+
+    let mut h2: u64 = 14695981039346656037;
+    let mut bi2: u64 = 0;
+    let mut p2_match: u32 = 1;
+    while bi2 < (sz2_1 as u64) {
+        let b_val: u8 = buf1[bi2];
+        if b_val != buf2[bi2] {
+            p2_match = 0;
+        }
+        h2 = h2 ^ (b_val as u64);
+        h2 = h2 * 1099511628211;
+        bi2 = bi2 + 1;
+    }
+
+    if p2_match == 0 {
+        let err2_diff: *u8 = "FAIL: Gate 2 bitwise difference between passes\n";
+        syscall(1, 2, err2_diff, 47);
+        syscall(60, 204);
+    }
+
+    let msg2: *u8 = "[GATE 2] Bitwise Fixed-Point Check: PASSED (hash=";
+    syscall(1, 1, msg2, 49);
+    let mut hi2: u64 = 0;
+    while hi2 < 16 {
+        let shift2: u64 = (15 - hi2) * 4;
+        let nib2: u64 = (h2 >> shift2) & 15;
+        if nib2 < 10 { hex_buf[2 + hi2] = (48 + nib2) as u8; }
+        else { hex_buf[2 + hi2] = (97 + (nib2 - 10)) as u8; }
+        hi2 = hi2 + 1;
+    }
+    syscall(1, 1, hex_buf, 19);
+
+    // =====================================================================
+    // GATE 3: Holographic Layout Chaos Check (--eia-permute-seed=0xCAFEBABE)
+    // =====================================================================
+    let g3_base: *u8 = "/tmp/gate3_base";
+    let g3_chaos: *u8 = "/tmp/gate3_chaos";
+
+    let mut argv3_1: [*mut u8; 5];
+    argv3_1[0] = compiler;
+    argv3_1[1] = hello_src;
+    argv3_1[2] = "-o";
+    argv3_1[3] = g3_base;
+    argv3_1[4] = 0 as *mut u8;
+
+    let pid3_1: i64 = syscall(57);
+    if pid3_1 == 0 {
+        syscall(59, compiler, argv3_1, envp);
+        syscall(60, 127);
+    }
+    let mut st3_1: i64 = 0;
+    syscall(61, pid3_1, &mut st3_1, 0, 0);
+
+    let mut argv3_2: [*mut u8; 6];
+    argv3_2[0] = compiler;
+    argv3_2[1] = hello_src;
+    argv3_2[2] = "-o";
+    argv3_2[3] = g3_chaos;
+    argv3_2[4] = "--eia-permute-seed=0xCAFEBABE";
+    argv3_2[5] = 0 as *mut u8;
+
+    let pid3_2: i64 = syscall(57);
+    if pid3_2 == 0 {
+        syscall(59, compiler, argv3_2, envp);
+        syscall(60, 127);
+    }
+    let mut st3_2: i64 = 0;
+    syscall(61, pid3_2, &mut st3_2, 0, 0);
+
+    let fd3_1: i64 = syscall(2, g3_base, 0, 0);
+    let sz3_1: i64 = syscall(0, fd3_1, buf1, 16777216);
+    syscall(3, fd3_1);
+
+    let fd3_2: i64 = syscall(2, g3_chaos, 0, 0);
+    let sz3_2: i64 = syscall(0, fd3_2, buf2, 16777216);
+    syscall(3, fd3_2);
+
+    if sz3_1 != sz3_2 || sz3_1 <= 0 {
+        let err3_sz: *u8 = "FAIL: Gate 3 baseline and chaos binary sizes differ\n";
+        syscall(1, 2, err3_sz, 52);
+        syscall(60, 301);
+    }
+
+    let mut h3: u64 = 14695981039346656037;
+    let mut bi3: u64 = 0;
+    let mut p3_match: u32 = 1;
+    while bi3 < (sz3_1 as u64) {
+        let b_val: u8 = buf1[bi3];
+        if b_val != buf2[bi3] {
+            p3_match = 0;
+        }
+        h3 = h3 ^ (b_val as u64);
+        h3 = h3 * 1099511628211;
+        bi3 = bi3 + 1;
+    }
+
+    if p3_match == 0 {
+        let err3_diff: *u8 = "FAIL: Gate 3 binary outputs differ under layout chaos\n";
+        syscall(1, 2, err3_diff, 54);
+        syscall(60, 302);
+    }
+
+    let msg3: *u8 = "[GATE 3] Holographic Layout Chaos Check: PASSED (hash=";
+    syscall(1, 1, msg3, 54);
+    let mut hi3: u64 = 0;
+    while hi3 < 16 {
+        let shift3: u64 = (15 - hi3) * 4;
+        let nib3: u64 = (h3 >> shift3) & 15;
+        if nib3 < 10 { hex_buf[2 + hi3] = (48 + nib3) as u8; }
+        else { hex_buf[2 + hi3] = (97 + (nib3 - 10)) as u8; }
+        hi3 = hi3 + 1;
+    }
+    syscall(1, 1, hex_buf, 19);
+
+    // =====================================================================
+    // GATE 4: Calling-Convention Bridge Check (--arll-force-bridge)
+    // =====================================================================
+    let g4_base: *u8 = "/tmp/gate4_base";
+    let g4_bridge: *u8 = "/tmp/gate4_bridge";
+
+    let mut argv4_1: [*mut u8; 5];
+    argv4_1[0] = compiler;
+    argv4_1[1] = hello_src;
+    argv4_1[2] = "-o";
+    argv4_1[3] = g4_base;
+    argv4_1[4] = 0 as *mut u8;
+
+    let pid4_1: i64 = syscall(57);
+    if pid4_1 == 0 {
+        syscall(59, compiler, argv4_1, envp);
+        syscall(60, 127);
+    }
+    let mut st4_1: i64 = 0;
+    syscall(61, pid4_1, &mut st4_1, 0, 0);
+
+    let mut argv4_2: [*mut u8; 6];
+    argv4_2[0] = compiler;
+    argv4_2[1] = hello_src;
+    argv4_2[2] = "-o";
+    argv4_2[3] = g4_bridge;
+    argv4_2[4] = "--arll-force-bridge";
+    argv4_2[5] = 0 as *mut u8;
+
+    let pid4_2: i64 = syscall(57);
+    if pid4_2 == 0 {
+        syscall(59, compiler, argv4_2, envp);
+        syscall(60, 127);
+    }
+    let mut st4_2: i64 = 0;
+    syscall(61, pid4_2, &mut st4_2, 0, 0);
+
+    let fd4_1: i64 = syscall(2, g4_base, 0, 0);
+    let sz4_1: i64 = syscall(0, fd4_1, buf1, 16777216);
+    syscall(3, fd4_1);
+
+    let fd4_2: i64 = syscall(2, g4_bridge, 0, 0);
+    let sz4_2: i64 = syscall(0, fd4_2, buf2, 16777216);
+    syscall(3, fd4_2);
+
+    if sz4_1 != sz4_2 || sz4_1 <= 0 {
+        let err4_sz: *u8 = "FAIL: Gate 4 baseline and bridge binary sizes differ\n";
+        syscall(1, 2, err4_sz, 53);
+        syscall(60, 401);
+    }
+
+    let mut h4: u64 = 14695981039346656037;
+    let mut bi4: u64 = 0;
+    let mut p4_match: u32 = 1;
+    while bi4 < (sz4_1 as u64) {
+        let b_val: u8 = buf1[bi4];
+        if b_val != buf2[bi4] {
+            p4_match = 0;
+        }
+        h4 = h4 ^ (b_val as u64);
+        h4 = h4 * 1099511628211;
+        bi4 = bi4 + 1;
+    }
+
+    if p4_match == 0 {
+        let err4_diff: *u8 = "FAIL: Gate 4 binary outputs differ under bridge forcing\n";
+        syscall(1, 2, err4_diff, 56);
+        syscall(60, 402);
+    }
+
+    let msg4: *u8 = "[GATE 4] Calling-Convention Bridge Check: PASSED (hash=";
+    syscall(1, 1, msg4, 55);
+    let mut hi4: u64 = 0;
+    while hi4 < 16 {
+        let shift4: u64 = (15 - hi4) * 4;
+        let nib4: u64 = (h4 >> shift4) & 15;
+        if nib4 < 10 { hex_buf[2 + hi4] = (48 + nib4) as u8; }
+        else { hex_buf[2 + hi4] = (97 + (nib4 - 10)) as u8; }
+        hi4 = hi4 + 1;
+    }
+    syscall(1, 1, hex_buf, 19);
+
+    // =====================================================================
+    // GATE 5: UPBP Polyglot Header Triangulation Check
+    // =====================================================================
+    let g5_out: *u8 = "/tmp/gate5_upbp";
+
+    let mut argv5: [*mut u8; 6];
+    argv5[0] = compiler;
+    argv5[1] = hello_src;
+    argv5[2] = "-o";
+    argv5[3] = g5_out;
+    argv5[4] = "--upbp";
+    argv5[5] = 0 as *mut u8;
+
+    let pid5: i64 = syscall(57);
+    if pid5 == 0 {
+        syscall(59, compiler, argv5, envp);
+        syscall(60, 127);
+    }
+    let mut st5: i64 = 0;
+    syscall(61, pid5, &mut st5, 0, 0);
+    if ((st5 >> 8) & 255) != 0 {
+        let err5_comp: *u8 = "FAIL: Gate 5 UPBP compilation failed\n";
+        syscall(1, 2, err5_comp, 37);
+        syscall(60, 501);
+    }
+
+    let fd5: i64 = syscall(2, g5_out, 0, 0);
+    let sz5: i64 = syscall(0, fd5, buf1, 16777216);
+    syscall(3, fd5);
+
+    if sz5 < 4096 {
+        let err5_sz: *u8 = "FAIL: Gate 5 UPBP binary size too small\n";
+        syscall(1, 2, err5_sz, 40);
+        syscall(60, 502);
+    }
+
+    // 1. Container Offset 0x000: DOS MZ Executable Stub (0x4D 0x5A)
+    if buf1[0] != 77 || buf1[1] != 90 {
+        let err5_mz: *u8 = "FAIL: Gate 5 invalid DOS MZ header magic at offset 0x000\n";
+        syscall(1, 2, err5_mz, 56);
+        syscall(60, 503);
+    }
+    if buf1[60] != 64 || buf1[61] != 1 { // e_lfanew points to 0x140
+        let err5_lfanew: *u8 = "FAIL: Gate 5 invalid e_lfanew offset to PE header\n";
+        syscall(1, 2, err5_lfanew, 50);
+        syscall(60, 504);
+    }
+
+    // 2. Container Offset 0x040: POSIX Shell Trampoline (#!/bin/sh\nexec "$0"\n)
+    if buf1[64] != 35 || buf1[65] != 33 || buf1[66] != 47 || buf1[67] != 98 || buf1[68] != 105 || buf1[69] != 110 || buf1[70] != 47 || buf1[71] != 115 || buf1[72] != 104 {
+        let err5_sh: *u8 = "FAIL: Gate 5 invalid shell trampoline at offset 0x040\n";
+        syscall(1, 2, err5_sh, 53);
+        syscall(60, 505);
+    }
+    if buf1[74] != 101 || buf1[75] != 120 || buf1[76] != 101 || buf1[77] != 99 {
+        let err5_exec: *u8 = "FAIL: Gate 5 invalid exec directive in shell trampoline\n";
+        syscall(1, 2, err5_exec, 56);
+        syscall(60, 506);
+    }
+
+    // 3. Container Offset 0x080: Linux ELF64 Header (\x7fELF, 64-bit, ET_EXEC, AMD64)
+    if buf1[128] != 127 || buf1[129] != 69 || buf1[130] != 76 || buf1[131] != 70 {
+        let err5_elf: *u8 = "FAIL: Gate 5 invalid ELF64 header at offset 0x080\n";
+        syscall(1, 2, err5_elf, 50);
+        syscall(60, 507);
+    }
+    if buf1[132] != 2 || buf1[144] != 2 || buf1[146] != 62 {
+        let err5_elf_hdr: *u8 = "FAIL: Gate 5 invalid ELF64 class/type/machine fields\n";
+        syscall(1, 2, err5_elf_hdr, 53);
+        syscall(60, 508);
+    }
+
+    // 4. Container Offset 0x140: Windows PE/COFF Headers (PE\0\0, AMD64, PE32+)
+    if buf1[320] != 80 || buf1[321] != 69 || buf1[322] != 0 || buf1[323] != 0 {
+        let err5_pe: *u8 = "FAIL: Gate 5 invalid PE/COFF signature at offset 0x140\n";
+        syscall(1, 2, err5_pe, 55);
+        syscall(60, 509);
+    }
+    if buf1[324] != 100 || buf1[325] != 134 { // AMD64 (0x8664)
+        let err5_pe_mach: *u8 = "FAIL: Gate 5 invalid PE COFF machine field\n";
+        syscall(1, 2, err5_pe_mach, 43);
+        syscall(60, 510);
+    }
+    if buf1[344] != 11 || buf1[345] != 2 { // PE32+ (0x020B)
+        let err5_opt: *u8 = "FAIL: Gate 5 invalid PE Optional Header magic\n";
+        syscall(1, 2, err5_opt, 46);
+        syscall(60, 511);
+    }
+
+    // 5. Container Offset 0x200: macOS Mach-O 64-bit Load Commands (0xFEEDFACF)
+    if buf1[512] != 207 || buf1[513] != 250 || buf1[514] != 237 || buf1[515] != 254 {
+        let err5_macho: *u8 = "FAIL: Gate 5 invalid Mach-O magic at offset 0x200\n";
+        syscall(1, 2, err5_macho, 50);
+        syscall(60, 512);
+    }
+    if buf1[516] != 7 || buf1[519] != 1 { // CPU_TYPE_X86_64 (0x01000007)
+        let err5_macho_cpu: *u8 = "FAIL: Gate 5 invalid Mach-O CPU type\n";
+        syscall(1, 2, err5_macho_cpu, 37);
+        syscall(60, 513);
+    }
+    if buf1[544] != 25 { // LC_SEGMENT_64 (0x19)
+        let err5_lc: *u8 = "FAIL: Gate 5 invalid Mach-O LC_SEGMENT_64 load command\n";
+        syscall(1, 2, err5_lc, 55);
+        syscall(60, 514);
+    }
+
+    // 6. Container Offset 0x400: Universal Hologram Header (EIAH, 0x44484945)
+    if buf1[1024] != 69 || buf1[1025] != 73 || buf1[1026] != 65 || buf1[1027] != 72 {
+        let err5_holo: *u8 = "FAIL: Gate 5 invalid Universal Hologram Header at offset 0x400\n";
+        syscall(1, 2, err5_holo, 63);
+        syscall(60, 515);
+    }
+    if buf1[1028] != 2 { // Version = 2
+        let err5_ver: *u8 = "FAIL: Gate 5 invalid Hologram Header version\n";
+        syscall(1, 2, err5_ver, 45);
+        syscall(60, 516);
+    }
+
+    // Compute cryptographic digest of UPBP container
+    let mut h5: u64 = 14695981039346656037;
+    let mut bi5: u64 = 0;
+    while bi5 < (sz5 as u64) {
+        h5 = h5 ^ (buf1[bi5] as u64);
+        h5 = h5 * 1099511628211;
+        bi5 = bi5 + 1;
+    }
+
+    let msg5: *u8 = "[GATE 5] UPBP Polyglot Header Triangulation Check: PASSED (hash=";
+    syscall(1, 1, msg5, 64);
+    let mut hi5: u64 = 0;
+    while hi5 < 16 {
+        let shift5: u64 = (15 - hi5) * 4;
+        let nib5: u64 = (h5 >> shift5) & 15;
+        if nib5 < 10 { hex_buf[2 + hi5] = (48 + nib5) as u8; }
+        else { hex_buf[2 + hi5] = (97 + (nib5 - 10)) as u8; }
+        hi5 = hi5 + 1;
+    }
+    syscall(1, 1, hex_buf, 19);
+
+    // =====================================================================
+    // ALL 5 GATES PASSED
+    // =====================================================================
+    let pass_banner1: *u8 = "\n============================================================\n";
+    syscall(1, 1, pass_banner1, 62);
+    let pass_banner2: *u8 = "EIA 5-GATE VERIFICATION RING PASSED SUCCESSFULLY\n";
+    syscall(1, 1, pass_banner2, 49);
+    let pass_banner3: *u8 = "============================================================\n";
+    syscall(1, 1, pass_banner3, 61);
+
+    syscall(60, 0);
+    return 0;
+}

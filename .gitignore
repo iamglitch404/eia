@@ -7,6 +7,7 @@ bin/
 *.g1_hello
 *.g3_base
 *.g3_chaos
+z
 
 # OS files
 .DS_Store

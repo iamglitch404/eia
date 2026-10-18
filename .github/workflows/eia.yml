@@ -7,7 +7,8 @@ on:
     branches: [main, master]
 
 jobs:
-  build-and-test:
+  cross-platform-upbp:
+    name: UPBP Polyglot & Cross-Compilation
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -26,6 +27,13 @@ jobs:
           gcc -O2 -Wall -Wextra -Iinclude -o bin/spark0 src/spark0_lexer.c src/spark0_parser.c src/spark0_codegen.c src/spark0_elf_writer.c src/spark0_main.c
           ./bin/spark0 compiler/core1.rx -o bin/core1
           echo "Stage-0 compiler successfully generated bin/core1 on ${{ matrix.os }}"
+
+      - name: Cross-platform compiler output fixed-point verification
+        run: |
+          ./bin/spark0 compiler/core1.rx -o bin/core1_pass1
+          ./bin/spark0 compiler/core1.rx -o bin/core1_pass2
+          cmp bin/core1_pass1 bin/core1_pass2
+          echo "Compiler fixed-point output verified on ${{ matrix.os }}"
 
       - name: Test UPBP polyglot binary compilation and shell trampoline (checks exit code 42)
         run: |
@@ -64,16 +72,31 @@ jobs:
           ./bin/spark0 compiler/frontend.rx -o bin/stage1_frontend
           echo "Stage-1 subsystems cross-compilation OK on ${{ matrix.os }}"
 
-      - name: Stage-1 self-hosting compiler fixed-point verification (Linux ELF)
-        if: matrix.os == 'ubuntu-latest'
+  eia-5gate-ring:
+    name: EIA 5-Gate Ring & Self-Hosting
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build stage-0 C compiler (spark0) and stage-1 compiler (core1)
+        run: |
+          mkdir -p bin
+          gcc -O2 -Wall -Wextra -Iinclude -o bin/spark0 src/spark0_lexer.c src/spark0_parser.c src/spark0_codegen.c src/spark0_elf_writer.c src/spark0_main.c
+          ./bin/spark0 compiler/core1.rx -o bin/core1
+          echo "Stage-0 compiler successfully generated bin/core1"
+
+      - name: Stage-1 self-hosting compiler fixed-point verification (core1 compiling core1)
         run: |
           ./bin/core1 compiler/core1.rx -o /tmp/core1_pass1
           ./bin/core1 compiler/core1.rx -o /tmp/core1_pass2
           cmp /tmp/core1_pass1 /tmp/core1_pass2
-          echo "Fixed-point self-compilation: OK"
+          echo "Stage-1 self-hosting fixed-point self-compilation: OK"
 
       - name: Compile and run hello_eia test (checks exit code 42)
-        if: matrix.os == 'ubuntu-latest'
         run: |
           ./bin/core1 tests/hello_eia.rx -o /tmp/hello_eia
           exit_code=0
@@ -86,14 +109,12 @@ jobs:
           echo "hello_eia test PASSED (exit code 42 verified)"
 
       - name: Run full 5-gate verification
-        if: matrix.os == 'ubuntu-latest'
         run: |
           ./bin/core1 compiler/verify_5gate.rx -o bin/verify_5gate
           ./bin/verify_5gate
           echo "5-gate verification: PASSED"
 
       - name: Test Stage-1 core1 UPBP emission
-        if: matrix.os == 'ubuntu-latest'
         run: |
           ./bin/core1 tests/hello_eia.rx -o /tmp/core1_hello_upbp --upbp
           exit_code=0
@@ -106,16 +127,18 @@ jobs:
           echo "Stage-1 core1 UPBP polyglot PASSED (exit code 42 verified)"
 
       - name: Verify Stage-1 Subsystems execution (Runtime DVAM, UPBP Packaging, Frontend)
-        if: matrix.os == 'ubuntu-latest'
         run: |
+          ./bin/spark0 compiler/runtime.rx -o bin/stage1_runtime
           rt_code=0
           ./bin/stage1_runtime || rt_code=$?
           [ "$rt_code" -eq 16 ] && echo "Stage-1 runtime DVAM benchmark PASSED (exit code 16)"
 
+          ./bin/spark0 compiler/packaging.rx -o bin/stage1_packaging
           pkg_code=0
           ./bin/stage1_packaging || pkg_code=$?
           [ "$pkg_code" -eq 42 ] && echo "Stage-1 UPBP packaging PASSED (exit code 42)"
 
+          ./bin/spark0 compiler/frontend.rx -o bin/stage1_frontend
           fe_code=0
           ./bin/stage1_frontend || fe_code=$?
           [ "$fe_code" -eq 38 ] && echo "Stage-1 frontend parser PASSED (exit code 38)"

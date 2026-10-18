@@ -477,3 +477,16 @@ Offset  Size  Field               Type        Description
 --------------------------------------------------------------------------
 Total Size: 24 bytes (0x18)
 ```
+
+#### 4.6 24-Byte `EiaTypeGraphEntry`
+```
+Offset  Size  Field               Type        Description
+--------------------------------------------------------------------------
+0x00    8     type_sig_hash       uint64_t    BLAKE3-64 structural type hash of struct
+0x08    8     field_hash          uint64_t    BLAKE3-64 field name hash
+0x10    4     byte_offset         uint32_t    Physical byte offset within struct
+0x14    4     field_size          uint32_t    Size of field in bytes
+--------------------------------------------------------------------------
+Total Size: 24 bytes (0x18)
+```
+

@@ -210,6 +210,111 @@ fn arll_emit_widening_stencil(stencil: *mut SchemaEvolutionStencil, old_size: u3
 }
 
 // -------------------------------------------------------------------------
+//         4b. Multi-OS Syscall Vector Dispatch Stencil
+// -------------------------------------------------------------------------
+
+// arll_resolve_host_syscall_vector:
+// Emits the native host syscall dispatch stencil for the target host OS:
+//   os_kind: 1 = Linux (syscall 0F 05),
+//            2 = Windows NT (mov r10, rcx; mov eax, ssn; syscall 0F 05; ret),
+//            3 = macOS Darwin (mov eax, 0x2000000 | sys_id; syscall 0F 05; ret).
+fn arll_resolve_host_syscall_vector(os_kind: u64, sys_id: u64, out_stencil: *mut u8) -> u64 {
+    // Linux AMD64:
+    // mov eax, sys_id (B8 id0 id1 id2 id3); syscall (0F 05); ret (C3)
+    if os_kind == 1 {
+        out_stencil[0] = 184;
+        let sid32: u32 = sys_id as u32;
+        out_stencil[1] = (sid32 & 255) as u8;
+        out_stencil[2] = ((sid32 >> 8) & 255) as u8;
+        out_stencil[3] = ((sid32 >> 16) & 255) as u8;
+        out_stencil[4] = ((sid32 >> 24) & 255) as u8;
+        out_stencil[5] = 15;
+        out_stencil[6] = 5;
+        out_stencil[7] = 195;
+        return 8;
+    }
+
+    // Windows NT AMD64:
+    // mov r10, rcx (4C 8B D1); mov eax, ssn (B8 s0 s1 s2 s3); syscall (0F 05); ret (C3)
+    if os_kind == 2 {
+        out_stencil[0] = 76;
+        out_stencil[1] = 139;
+        out_stencil[2] = 209;
+        out_stencil[3] = 184;
+        let sid32: u32 = sys_id as u32;
+        out_stencil[4] = (sid32 & 255) as u8;
+        out_stencil[5] = ((sid32 >> 8) & 255) as u8;
+        out_stencil[6] = ((sid32 >> 16) & 255) as u8;
+        out_stencil[7] = ((sid32 >> 24) & 255) as u8;
+        out_stencil[8] = 15;
+        out_stencil[9] = 5;
+        out_stencil[10] = 195;
+        return 11;
+    }
+
+    // macOS Darwin AMD64:
+    // Darwin syscalls use class 2 (UNIX) in high bits: 0x2000000 | sys_id
+    // mov eax, (0x2000000 | sys_id) (B8 d0 d1 d2 d3); syscall (0F 05); ret (C3)
+    if os_kind == 3 {
+        out_stencil[0] = 184;
+        let did32: u32 = ((sys_id as u32) | 33554432) & 4294967295; // 0x2000000 = 33554432
+        out_stencil[1] = (did32 & 255) as u8;
+        out_stencil[2] = ((did32 >> 8) & 255) as u8;
+        out_stencil[3] = ((did32 >> 16) & 255) as u8;
+        out_stencil[4] = ((did32 >> 24) & 255) as u8;
+        out_stencil[5] = 15;
+        out_stencil[6] = 5;
+        out_stencil[7] = 195;
+        return 8;
+    }
+
+    return 0;
+}
+
+// arll_host_syscall_gate_stencil:
+// Emits the full host-independent syscall dispatch trampoline:
+// Bridges standard POSIX arguments to the host kernel ABI.
+fn arll_host_syscall_gate_stencil(os_kind: u64, out_stencil: *mut u8) -> u64 {
+    // Linux AMD64:
+    // mov eax, edi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r10, r8; mov r8, r9; syscall; ret
+    if os_kind == 1 {
+        out_stencil[0] = 137; out_stencil[1] = 248; // mov eax, edi
+        out_stencil[2] = 72;  out_stencil[3] = 137; out_stencil[4] = 247; // mov rdi, rsi
+        out_stencil[5] = 72;  out_stencil[6] = 137; out_stencil[7] = 209; // mov rsi, rdx
+        out_stencil[8] = 72;  out_stencil[9] = 137; out_stencil[10] = 202; // mov rdx, rcx
+        out_stencil[11] = 77; out_stencil[12] = 137; out_stencil[13] = 194; // mov r10, r8
+        out_stencil[14] = 77; out_stencil[15] = 137; out_stencil[16] = 200; // mov r8, r9
+        out_stencil[17] = 15; out_stencil[18] = 5;   // syscall
+        out_stencil[19] = 195;                       // ret
+        return 20;
+    }
+    // Windows NT AMD64:
+    // mov r10, rdx; mov eax, ecx; syscall; ret
+    if os_kind == 2 {
+        out_stencil[0] = 76;  out_stencil[1] = 139; out_stencil[2] = 209; // mov r10, rcx
+        out_stencil[3] = 137; out_stencil[4] = 248;                       // mov eax, edi
+        out_stencil[5] = 15;  out_stencil[6] = 5;                         // syscall
+        out_stencil[7] = 195;                                             // ret
+        return 8;
+    }
+    // macOS Darwin AMD64:
+    // mov eax, edi; or eax, 0x2000000; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r10, r8; mov r8, r9; syscall; ret
+    if os_kind == 3 {
+        out_stencil[0] = 137; out_stencil[1] = 248; // mov eax, edi
+        out_stencil[2] = 13;  out_stencil[3] = 0;   out_stencil[4] = 0; out_stencil[5] = 0; out_stencil[6] = 2; // or eax, 0x2000000
+        out_stencil[7] = 72;  out_stencil[8] = 137; out_stencil[9] = 247;  // mov rdi, rsi
+        out_stencil[10] = 72; out_stencil[11] = 137; out_stencil[12] = 209; // mov rsi, rdx
+        out_stencil[13] = 72; out_stencil[14] = 137; out_stencil[15] = 202; // mov rdx, rcx
+        out_stencil[16] = 77; out_stencil[17] = 137; out_stencil[18] = 194; // mov r10, r8
+        out_stencil[19] = 77; out_stencil[20] = 137; out_stencil[21] = 200; // mov r8, r9
+        out_stencil[22] = 15; out_stencil[23] = 5;   // syscall
+        out_stencil[24] = 195;                       // ret
+        return 25;
+    }
+    return 0;
+}
+
+// -------------------------------------------------------------------------
 //         5. Universal Polyglot Binary Package (UPBP) Emitter
 // -------------------------------------------------------------------------
 
@@ -261,36 +366,25 @@ fn write_upbp_binary(cg: *mut CodeGen, out_path: *u8) -> i64 {
     // =====================================================================
     file_buf[0] = 77; // 'M'
     file_buf[1] = 90; // 'Z'
+    file_buf[2] = 61; // '='
+    file_buf[3] = 59; // ';'
+    file_buf[4] = 10; // '\n'
+    file_buf[5] = 35; // '#'
     // e_lfanew at 0x3C points to PE/COFF header at 0x140
     file_buf[60] = 64;  // 0x40
     file_buf[61] = 1;   // 0x01 -> 0x00000140
     file_buf[62] = 0;
-    file_buf[63] = 0;
+    file_buf[63] = 10;  // '\n'
 
     // =====================================================================
     // 2. Offset 0x040: POSIX Shell Script Trampoline
     // =====================================================================
-    // "#!/bin/sh\nexec \"$0\"\n"
-    file_buf[64] = 35;  // '#'
-    file_buf[65] = 33;  // '!'
-    file_buf[66] = 47;  // '/'
-    file_buf[67] = 98;  // 'b'
-    file_buf[68] = 105; // 'i'
-    file_buf[69] = 110; // 'n'
-    file_buf[70] = 47;  // '/'
-    file_buf[71] = 115; // 's'
-    file_buf[72] = 104; // 'h'
-    file_buf[73] = 10;  // '\n'
-    file_buf[74] = 101; // 'e'
-    file_buf[75] = 120; // 'x'
-    file_buf[76] = 101; // 'e'
-    file_buf[77] = 99;  // 'c'
-    file_buf[78] = 32;  // ' '
-    file_buf[79] = 34;  // '"'
-    file_buf[80] = 36;  // '$'
-    file_buf[81] = 48;  // '0'
-    file_buf[82] = 34;  // '"'
-    file_buf[83] = 10;  // '\n'
+    let tramp: *u8 = "f=/tmp/.rx_run.$$;tail -c +129 \"$0\">$f;chmod +x $f;exec $f \"$@\"\n";
+    let mut ti: u64 = 0;
+    while ti < 64 {
+        file_buf[64 + ti] = tramp[ti];
+        ti = ti + 1;
+    }
 
     // =====================================================================
     // 3. Offset 0x080: ELF64 Header & Program Header (\x7fELF)
@@ -481,6 +575,36 @@ fn main() -> i64 {
     let w_sz: u32 = arll_emit_widening_stencil(&mut stencil, 4, 8, 0);
     if w_sz != 3 {
         return 3;
+    }
+
+    // Test 3: Verify Multi-OS Syscall Vector Resolution
+    let mut sys_buf: [u8; 16];
+    let l_sz: u64 = arll_resolve_host_syscall_vector(1, 1, &mut sys_buf[0]);
+    if l_sz != 8 || sys_buf[5] != 15 || sys_buf[6] != 5 {
+        return 4;
+    }
+    let win_sz: u64 = arll_resolve_host_syscall_vector(2, 42, &mut sys_buf[0]);
+    if win_sz != 11 || sys_buf[0] != 76 || sys_buf[8] != 15 {
+        return 5;
+    }
+    let d_sz: u64 = arll_resolve_host_syscall_vector(3, 4, &mut sys_buf[0]);
+    if d_sz != 8 || sys_buf[5] != 15 || sys_buf[6] != 5 {
+        return 6;
+    }
+
+    // Test 4: Verify Full Multi-OS Syscall Gate Trampolines
+    let mut gate_buf: [u8; 32];
+    let gl_sz: u64 = arll_host_syscall_gate_stencil(1, &mut gate_buf[0]);
+    if gl_sz != 20 || gate_buf[0] != 137 || gate_buf[17] != 15 || gate_buf[18] != 5 {
+        return 7;
+    }
+    let gwin_sz: u64 = arll_host_syscall_gate_stencil(2, &mut gate_buf[0]);
+    if gwin_sz != 8 || gate_buf[0] != 76 || gate_buf[5] != 15 || gate_buf[6] != 5 {
+        return 8;
+    }
+    let gd_sz: u64 = arll_host_syscall_gate_stencil(3, &mut gate_buf[0]);
+    if gd_sz != 25 || gate_buf[0] != 137 || gate_buf[22] != 15 || gate_buf[23] != 5 {
+        return 9;
     }
 
     // Print verification message

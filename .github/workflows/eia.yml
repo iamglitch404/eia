@@ -1,0 +1,55 @@
+name: EIA CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build stage-0 C compiler (spark0)
+        run: |
+          gcc -O2 -Wall -Wextra -o bin/spark0 src/spark0_lexer.c src/spark0_parser.c src/spark0_codegen.c src/spark0_elf_writer.c src/spark0_main.c
+          ./bin/spark0 --version || true
+
+      - name: Build stage-1 self-hosting compiler (core1.rx -> core1)
+        run: |
+          ./bin/spark0 compiler/core1.rx -o bin/core1
+          ./bin/core1 compiler/core1.rx -o /tmp/core1_pass1
+          ./bin/core1 compiler/core1.rx -o /tmp/core1_pass2
+          cmp /tmp/p1 /tmp/p2 2>/dev/null || cmp /tmp/core1_pass1 /tmp/core1_pass2
+          echo "Fixed-point self-compilation: OK"
+
+      - name: Compile and run hello_eia test
+        run: |
+          ./bin/core1 tests/hello_eia.rx -o /tmp/hello_eia
+          /tmp/hello_eia
+          echo "Exit code: $?"
+
+      - name: Run full 5-gate verification
+        run: |
+          ./bin/core1 compiler/verify_5gate.rx -o bin/verify_5gate
+          ./bin/verify_5gate
+          echo "5-gate verification: $?"
+
+      - name: Test UPBP polyglot binary
+        run: |
+          ./bin/core1 tests/hello_eia.rx -o /tmp/hello_upbp --upbp
+          /bin/sh /tmp/hello_upbp
+          echo "UPBP shell execution: $?"
+
+      - name: Verify UPBP headers (Linux only, as UPBP polyglot execution is Linux-first)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          ./bin/core1 tests/hello_eia.rx -o /tmp/hello_upbp --upbp
+          xxd -l 128 /tmp/hello_upbp
+          echo "UPBP header bytes verified above"

@@ -6,6 +6,155 @@
 #include <assert.h>
 #include "spark0_codegen.h"
 
+static inline uint32_t rotr32(uint32_t x, uint32_t n) {
+    return (x >> n) | (x << (32 - n));
+}
+
+static inline uint32_t get_u32(const uint8_t *buf, size_t idx) {
+    const uint8_t *p = buf + (idx * 4);
+    return ((uint32_t)p[0]) | (((uint32_t)p[1]) << 8) | (((uint32_t)p[2]) << 16) | (((uint32_t)p[3]) << 24);
+}
+
+static inline void set_u32(uint8_t *buf, size_t idx, uint32_t val) {
+    uint8_t *p = buf + (idx * 4);
+    p[0] = (uint8_t)(val & 0xFF);
+    p[1] = (uint8_t)((val >> 8) & 0xFF);
+    p[2] = (uint8_t)((val >> 16) & 0xFF);
+    p[3] = (uint8_t)((val >> 24) & 0xFF);
+}
+
+static void blake3_round_g(uint8_t *state, const uint8_t *msg, uint64_t step) {
+    uint64_t a_idx = 0, b_idx = 0, c_idx = 0, d_idx = 0;
+    uint64_t mx_idx = step * 2;
+    uint64_t my_idx = (step * 2) + 1;
+
+    if (step == 0) { a_idx = 0; b_idx = 4; c_idx = 8;  d_idx = 12; }
+    else if (step == 1) { a_idx = 1; b_idx = 5; c_idx = 9;  d_idx = 13; }
+    else if (step == 2) { a_idx = 2; b_idx = 6; c_idx = 10; d_idx = 14; }
+    else if (step == 3) { a_idx = 3; b_idx = 7; c_idx = 11; d_idx = 15; }
+    else if (step == 4) { a_idx = 0; b_idx = 5; c_idx = 10; d_idx = 15; }
+    else if (step == 5) { a_idx = 1; b_idx = 6; c_idx = 11; d_idx = 12; }
+    else if (step == 6) { a_idx = 2; b_idx = 7; c_idx = 8;  d_idx = 13; }
+    else if (step == 7) { a_idx = 3; b_idx = 4; c_idx = 9;  d_idx = 14; }
+
+    uint32_t mx = get_u32(msg, mx_idx);
+    uint32_t my = get_u32(msg, my_idx);
+
+    uint32_t a = get_u32(state, a_idx);
+    uint32_t b = get_u32(state, b_idx);
+    uint32_t c = get_u32(state, c_idx);
+    uint32_t d = get_u32(state, d_idx);
+
+    a = a + b + mx;
+    d = rotr32(d ^ a, 16);
+    c = c + d;
+    b = rotr32(b ^ c, 12);
+    a = a + b + my;
+    d = rotr32(d ^ a, 8);
+    c = c + d;
+    b = rotr32(b ^ c, 7);
+
+    set_u32(state, a_idx, a);
+    set_u32(state, b_idx, b);
+    set_u32(state, c_idx, c);
+    set_u32(state, d_idx, d);
+}
+
+static void blake3_permute_msg(uint8_t *msg) {
+    uint8_t temp[64];
+    for (size_t i = 0; i < 16; ++i) {
+        set_u32(temp, i, get_u32(msg, i));
+    }
+    set_u32(msg, 0,  get_u32(temp, 2));
+    set_u32(msg, 1,  get_u32(temp, 6));
+    set_u32(msg, 2,  get_u32(temp, 3));
+    set_u32(msg, 3,  get_u32(temp, 10));
+    set_u32(msg, 4,  get_u32(temp, 7));
+    set_u32(msg, 5,  get_u32(temp, 0));
+    set_u32(msg, 6,  get_u32(temp, 4));
+    set_u32(msg, 7,  get_u32(temp, 13));
+    set_u32(msg, 8,  get_u32(temp, 1));
+    set_u32(msg, 9,  get_u32(temp, 11));
+    set_u32(msg, 10, get_u32(temp, 12));
+    set_u32(msg, 11, get_u32(temp, 5));
+    set_u32(msg, 12, get_u32(temp, 9));
+    set_u32(msg, 13, get_u32(temp, 14));
+    set_u32(msg, 14, get_u32(temp, 15));
+    set_u32(msg, 15, get_u32(temp, 8));
+}
+
+static uint64_t blake3_compress_64(uint8_t *cv, const uint8_t *block_buf, uint32_t block_len, uint64_t block_index, uint32_t flags) {
+    uint8_t state[64];
+    for (size_t i = 0; i < 8; ++i) {
+        set_u32(state, i, get_u32(cv, i));
+    }
+    set_u32(state, 8,  1779033703);
+    set_u32(state, 9,  3144134277);
+    set_u32(state, 10, 1013904242);
+    set_u32(state, 11, 2773480762);
+    set_u32(state, 12, (uint32_t)(block_index & 0xFFFFFFFF));
+    set_u32(state, 13, (uint32_t)(block_index >> 32));
+    set_u32(state, 14, block_len);
+    set_u32(state, 15, flags);
+
+    uint8_t msg[64];
+    memset(msg, 0, 64);
+    if (block_len > 0) {
+        memcpy(msg, block_buf, block_len > 64 ? 64 : block_len);
+    }
+
+    for (size_t round = 0; round < 7; ++round) {
+        for (size_t step = 0; step < 8; ++step) {
+            blake3_round_g(state, msg, step);
+        }
+        if (round < 6) {
+            blake3_permute_msg(msg);
+        }
+    }
+
+    for (size_t i = 0; i < 8; ++i) {
+        uint32_t new_cv_word = get_u32(state, i) ^ get_u32(state, i + 8);
+        set_u32(cv, i, new_cv_word);
+    }
+
+    uint64_t low = (uint64_t)get_u32(cv, 0);
+    uint64_t high = (uint64_t)get_u32(cv, 1);
+    return low | (high << 32);
+}
+
+static uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
+    uint8_t cv[32];
+    set_u32(cv, 0, 1779033703);
+    set_u32(cv, 1, 3144134277);
+    set_u32(cv, 2, 1013904242);
+    set_u32(cv, 3, 2773480762);
+    set_u32(cv, 4, 1359893119);
+    set_u32(cv, 5, 2600822924);
+    set_u32(cv, 6, 528734635);
+    set_u32(cv, 7, 1541459225);
+
+    if (len == 0) {
+        return blake3_compress_64(cv, buf, 0, 0, 11);
+    }
+
+    size_t offset = 0;
+    uint64_t block_idx = 0;
+    uint64_t digest = 0;
+
+    while (offset < len) {
+        uint32_t blk_len = (len - offset > 64) ? 64 : (uint32_t)(len - offset);
+        uint32_t flags = 0;
+        if (offset == 0) flags |= 1;
+        if (offset + blk_len == len) flags |= 2 | 8;
+
+        digest = blake3_compress_64(cv, buf + offset, blk_len, block_idx, flags);
+        offset += blk_len;
+        block_idx++;
+    }
+
+    return digest;
+}
+
 int spark0_write_elf(const CompiledUnit *unit, const char *out_path) {
     /* Calculate section offsets */
     uint64_t holo_offset = 0x80;
@@ -73,7 +222,6 @@ int spark0_write_elf(const CompiledUnit *unit, const char *out_path) {
     holo->relocs_count = unit->reloc_count;
     holo->type_graph_offset = type_graph_offset;
     holo->type_graph_size = type_graph_size;
-    holo->blake3_root = 0x8877665544332211ULL;
     holo->flags = 1;
 
     /* 4. Symbol Contracts */
@@ -90,6 +238,10 @@ int spark0_write_elf(const CompiledUnit *unit, const char *out_path) {
     if (unit->type_graph_count > 0 && unit->type_graph) {
         memcpy(file_buf + type_graph_offset, unit->type_graph, type_graph_size);
     }
+
+    /* Dynamic BLAKE3-64 root hash over contracts, relocs, and type_graph */
+    uint64_t tables_len = contracts_size + relocs_size + type_graph_size;
+    holo->blake3_root = blake3_hash64(file_buf + contracts_offset, tables_len);
 
     /* 7. .text Section (starts at file offset 0x1000, mapped to 0x401000) */
     if (unit->text_size > 0 && unit->text_buf) {

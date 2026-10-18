@@ -106,6 +106,7 @@ static RuStructDef *find_struct(RuModule *m, const char *name) {
 }
 
 static uint32_t get_type_size_ctx(const RuModule *m, const RuType *t);
+static uint32_t get_type_align(const RuType *t);
 
 static uint32_t get_struct_size(const RuModule *m, const char *sname) {
     RuStructDef *s = find_struct((RuModule *)m, sname);
@@ -114,7 +115,7 @@ static uint32_t get_struct_size(const RuModule *m, const char *sname) {
     uint32_t max_align = 8;
     for (uint32_t i = 0; i < s->field_count; ++i) {
         uint32_t f_size = get_type_size_ctx(m, s->fields[i].type);
-        uint32_t f_align = (f_size == 1) ? 1 : (f_size == 4) ? 4 : 8;
+        uint32_t f_align = get_type_align(s->fields[i].type);
         if (f_align > max_align) max_align = f_align;
         if (offset % f_align != 0) {
             offset += f_align - (offset % f_align);
@@ -161,6 +162,8 @@ static uint32_t get_type_align(const RuType *t) {
             return 8;
         case TYPE_STRUCT:
             return 8;
+        case TYPE_ARRAY:
+            return get_type_align(t->as.array.elem_type);
         default:
             return 8;
     }
@@ -655,6 +658,54 @@ static void compile_expr(FnCompiler *fc, RuExpr *e) {
     }
 
     if (e->kind == EXPR_BINARY) {
+        if (e->as.binary.op == BINOP_LOG_AND) {
+            compile_expr(fc, e->as.binary.lhs);
+            emit8(fc->u, 0x48); emit8(fc->u, 0x85); emit8(fc->u, 0xc0); /* test rax, rax */
+            emit8(fc->u, 0x0f); emit8(fc->u, 0x84); /* jz false_label */
+            uint32_t jz_disp = fc->u->text_size;
+            emit32_le(fc->u, 0);
+
+            compile_expr(fc, e->as.binary.rhs);
+            emit8(fc->u, 0x48); emit8(fc->u, 0x85); emit8(fc->u, 0xc0); /* test rax, rax */
+            emit8(fc->u, 0x0f); emit8(fc->u, 0x95); emit8(fc->u, 0xc0); /* setne al */
+            emit8(fc->u, 0x0f); emit8(fc->u, 0xb6); emit8(fc->u, 0xc0); /* movzx rax, al */
+            emit8(fc->u, 0xe9); /* jmp end_label */
+            uint32_t jmp_disp = fc->u->text_size;
+            emit32_le(fc->u, 0);
+
+            uint32_t false_offset = fc->u->text_size;
+            patch32(fc->u, jz_disp, false_offset - (jz_disp + 4));
+            emit8(fc->u, 0x48); emit8(fc->u, 0x31); emit8(fc->u, 0xc0); /* xor rax, rax */
+
+            uint32_t end_offset = fc->u->text_size;
+            patch32(fc->u, jmp_disp, end_offset - (jmp_disp + 4));
+            return;
+        }
+
+        if (e->as.binary.op == BINOP_LOG_OR) {
+            compile_expr(fc, e->as.binary.lhs);
+            emit8(fc->u, 0x48); emit8(fc->u, 0x85); emit8(fc->u, 0xc0); /* test rax, rax */
+            emit8(fc->u, 0x0f); emit8(fc->u, 0x85); /* jnz true_label */
+            uint32_t jnz_disp = fc->u->text_size;
+            emit32_le(fc->u, 0);
+
+            compile_expr(fc, e->as.binary.rhs);
+            emit8(fc->u, 0x48); emit8(fc->u, 0x85); emit8(fc->u, 0xc0); /* test rax, rax */
+            emit8(fc->u, 0x0f); emit8(fc->u, 0x95); emit8(fc->u, 0xc0); /* setne al */
+            emit8(fc->u, 0x0f); emit8(fc->u, 0xb6); emit8(fc->u, 0xc0); /* movzx rax, al */
+            emit8(fc->u, 0xe9); /* jmp end_label */
+            uint32_t jmp_disp = fc->u->text_size;
+            emit32_le(fc->u, 0);
+
+            uint32_t true_offset = fc->u->text_size;
+            patch32(fc->u, jnz_disp, true_offset - (jnz_disp + 4));
+            emit8(fc->u, 0x48); emit8(fc->u, 0xc7); emit8(fc->u, 0xc0); emit32_le(fc->u, 1); /* mov rax, 1 */
+
+            uint32_t end_offset = fc->u->text_size;
+            patch32(fc->u, jmp_disp, end_offset - (jmp_disp + 4));
+            return;
+        }
+
         compile_expr(fc, e->as.binary.lhs);
         emit8(fc->u, 0x50); /* push rax (LHS) */
         compile_expr(fc, e->as.binary.rhs);
@@ -723,20 +774,6 @@ static void compile_expr(FnCompiler *fc, RuExpr *e) {
             case BINOP_GE:
                 emit8(fc->u, 0x48); emit8(fc->u, 0x39); emit8(fc->u, 0xc8); /* cmp rax, rcx */
                 emit8(fc->u, 0x0f); emit8(fc->u, 0x93); emit8(fc->u, 0xc0); /* setae al */
-                emit8(fc->u, 0x0f); emit8(fc->u, 0xb6); emit8(fc->u, 0xc0); /* movzx rax, al */
-                break;
-            case BINOP_LOG_AND:
-                emit8(fc->u, 0x48); emit8(fc->u, 0x85); emit8(fc->u, 0xc0); /* test rax, rax */
-                emit8(fc->u, 0x0f); emit8(fc->u, 0x95); emit8(fc->u, 0xc0); /* setne al */
-                emit8(fc->u, 0x48); emit8(fc->u, 0x85); emit8(fc->u, 0xc9); /* test rcx, rcx */
-                emit8(fc->u, 0x0f); emit8(fc->u, 0x95); emit8(fc->u, 0xc1); /* setne cl */
-                emit8(fc->u, 0x20); emit8(fc->u, 0xc8);                     /* and al, cl */
-                emit8(fc->u, 0x0f); emit8(fc->u, 0xb6); emit8(fc->u, 0xc0); /* movzx rax, al */
-                break;
-            case BINOP_LOG_OR:
-                emit8(fc->u, 0x48); emit8(fc->u, 0x09); emit8(fc->u, 0xc8); /* or rax, rcx */
-                emit8(fc->u, 0x48); emit8(fc->u, 0x85); emit8(fc->u, 0xc0); /* test rax, rax */
-                emit8(fc->u, 0x0f); emit8(fc->u, 0x95); emit8(fc->u, 0xc0); /* setne al */
                 emit8(fc->u, 0x0f); emit8(fc->u, 0xb6); emit8(fc->u, 0xc0); /* movzx rax, al */
                 break;
             default:

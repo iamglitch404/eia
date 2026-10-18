@@ -1,0 +1,23 @@
+# Build artifacts
+bin/
+*.o
+*.exe
+*.bin
+*.g5_upbp
+*.g1_hello
+*.g3_base
+*.g3_chaos
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swoz
+bin/
+bin/
+*.bix
+*.rxc

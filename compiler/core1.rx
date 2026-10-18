@@ -1948,8 +1948,8 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
     arena_init(&mut cg_arena, 16777216);
 
     // 2. Parse Command Line Arguments
-    let mut in_path: *u8 = "/home/bishwaxyz/ru/tests/hello_eia.rx";
-    let mut out_path: *u8 = "/home/bishwaxyz/ru/bin/hello_from_core1";
+    let mut in_path: *u8 = "tests/hello_eia.rx";
+    let mut out_path: *u8 = "bin/hello_from_core1";
     let mut permute_seed: u64 = 0;
     let mut force_bridge: u32 = 0;
     let mut is_upbp: u32 = 0;

@@ -11,9 +11,9 @@ fn main() -> i64 {
     let banner3: *u8 = "============================================================\n\n";
     syscall(1, 1, banner3, 62);
 
-    let compiler: *u8 = "/home/bishwaxyz/ru/bin/core1";
-    let hello_src: *u8 = "/home/bishwaxyz/ru/tests/hello_eia.rx";
-    let core1_src: *u8 = "/home/bishwaxyz/ru/compiler/core1.rx";
+    let compiler: *u8 = "bin/core1";
+    let hello_src: *u8 = "tests/hello_eia.rx";
+    let core1_src: *u8 = "compiler/core1.rx";
 
     let mut envp: [*mut u8; 1];
     envp[0] = 0 as *mut u8;

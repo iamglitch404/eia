@@ -2147,11 +2147,12 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
             // Swap first two fields to change offsets consistently
             if cg.permute_seed != 0 && fcount >= 2 {
                 let f1: *mut AstNode = snode.child1;
-                let f2: *mut AstNode = (*f1).next;
+                let f2: *mut AstNode = f1.next;
                 if f1 != (0 as *mut AstNode) && f2 != (0 as *mut AstNode) {
+                    let f2_next: *mut AstNode = f2.next;
                     snode.child1 = f2;
-                    (*f1).next = (*f2).next;
-                    (*f2).next = f1;
+                    f1.next = f2_next;
+                    f2.next = f1;
                     f = f2; // f now points to new first field
                 }
             }

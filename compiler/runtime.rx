@@ -360,9 +360,8 @@ fn eia_validate_image(v_base: *mut u8, size: u64) -> i64 {
         return -2; // Unsupported version
     }
 
-    // Read table offsets and counts
     let abi_epoch: u64 = 0; // reserved for future
-    let _ = abi_epoch;
+    let _unused_epoch: u64 = abi_epoch;
 
     // contracts_offset at 0x10 (8 bytes)
     let contracts_offset: u64 = (v_base[0x10] as u64) | ((v_base[0x11] as u64) << 8) | ((v_base[0x12] as u64) << 16) | ((v_base[0x13] as u64) << 24) |
@@ -380,47 +379,38 @@ fn eia_validate_image(v_base: *mut u8, size: u64) -> i64 {
 
     // 3. Overflow checks for table bounds
     // contracts_offset + contracts_count * 48 must not overflow and must fit in image
-    let contracts_end: u64;
-    {
-        let mul: u64 = contracts_count * 48;
-        if mul / 48 != contracts_count {
-            return -5; // Integer overflow in contracts table size
-        }
-        contracts_end = contracts_offset + mul;
-        if contracts_end < contracts_offset {
-            return -5; // Integer overflow in contracts_end
-        }
-        if contracts_end > size {
-            return -4; // Contracts table extends beyond image
-        }
+    let contracts_mul: u64 = contracts_count * 48;
+    if contracts_mul / 48 != contracts_count {
+        return -5; // Integer overflow in contracts table size
+    }
+    let contracts_end: u64 = contracts_offset + contracts_mul;
+    if contracts_end < contracts_offset {
+        return -5; // Integer overflow in contracts_end
+    }
+    if contracts_end > size {
+        return -4; // Contracts table extends beyond image
     }
 
     // relocs_offset + relocs_count * 24 must not overflow and must fit in image
-    let relocs_end: u64;
-    {
-        let mul: u64 = relocs_count * 24;
-        if mul / 24 != relocs_count {
-            return -5; // Integer overflow in relocs table size
-        }
-        relocs_end = relocs_offset + mul;
-        if relocs_end < relocs_offset {
-            return -5; // Integer overflow in relocs_end
-        }
-        if relocs_end > size {
-            return -4; // Relocs table extends beyond image
-        }
+    let relocs_mul: u64 = relocs_count * 24;
+    if relocs_mul / 24 != relocs_count {
+        return -5; // Integer overflow in relocs table size
+    }
+    let relocs_end: u64 = relocs_offset + relocs_mul;
+    if relocs_end < relocs_offset {
+        return -5; // Integer overflow in relocs_end
+    }
+    if relocs_end > size {
+        return -4; // Relocs table extends beyond image
     }
 
     // type_graph_offset + type_graph_size must not overflow and must fit in image
-    let tg_end: u64;
-    {
-        tg_end = type_graph_offset + type_graph_size;
-        if tg_end < type_graph_offset {
-            return -5; // Integer overflow in type graph end
-        }
-        if tg_end > size {
-            return -4; // Type graph extends beyond image
-        }
+    let tg_end: u64 = type_graph_offset + type_graph_size;
+    if tg_end < type_graph_offset {
+        return -5; // Integer overflow in type graph end
+    }
+    if tg_end > size {
+        return -4; // Type graph extends beyond image
     }
 
     // 4. Validate type graph entries
@@ -438,8 +428,8 @@ fn eia_validate_image(v_base: *mut u8, size: u64) -> i64 {
                                 ((entry_ptr[12] as u64) << 32) | ((entry_ptr[13] as u64) << 40) | ((entry_ptr[14] as u64) << 48) | ((entry_ptr[15] as u64) << 56);
         let t_byte_offset: u32 = (entry_ptr[16] as u32) | ((entry_ptr[17] as u32) << 8) | ((entry_ptr[18] as u32) << 16) | ((entry_ptr[19] as u32) << 24);
         let t_field_size: u32 = (entry_ptr[20] as u32) | ((entry_ptr[21] as u32) << 8) | ((entry_ptr[22] as u32) << 16) | ((entry_ptr[23] as u32) << 24);
-        let _ = t_type_sig;
-        let _ = t_field_hash;
+        let _unused_sig: u64 = t_type_sig;
+        let _unused_hash: u64 = t_field_hash;
         // field_size must be non-zero and one of: 1, 2, 4, 8
         if t_field_size == 0 || (t_field_size != 1 && t_field_size != 2 && t_field_size != 4 && t_field_size != 8) {
             return -6; // Invalid field size in type graph entry
@@ -491,7 +481,7 @@ fn eia_validate_image(v_base: *mut u8, size: u64) -> i64 {
             if e_type_sig == r_type_sig && e_field_hash == r_field_hash {
                 found = 1;
                 field_size_at_offset = e_field_size;
-                break;
+                k = tg_count; // break
             }
             k = k + 1;
         }
@@ -510,16 +500,14 @@ fn eia_validate_image(v_base: *mut u8, size: u64) -> i64 {
         // Overlap if two relocs write to overlapping byte ranges
         let m: u64 = 0;
         while m < relocs_count {
-            if m == j {
-                m = m + 1;
-                continue;
-            }
-            let reloc_ptr2: *mut u8 = v_base + relocs_offset + (m * 24);
-            let r2_insn_offset: u32 = (reloc_ptr2[0] as u32) | ((reloc_ptr2[1] as u32) << 8) | ((reloc_ptr2[2] as u32) << 16) | ((reloc_ptr2[3] as u32) << 24);
-            // Two 4-byte displacement writes overlap if their insn_offsets are within 4 bytes of each other
-            let diff: i64 = (r_insn_offset as i64) - (r2_insn_offset as i64);
-            if diff >= -3 && diff <= 3 {
-                return -10; // Duplicate or overlapping relocation sites
+            if m != j {
+                let reloc_ptr2: *mut u8 = v_base + relocs_offset + (m * 24);
+                let r2_insn_offset: u32 = (reloc_ptr2[0] as u32) | ((reloc_ptr2[1] as u32) << 8) | ((reloc_ptr2[2] as u32) << 16) | ((reloc_ptr2[3] as u32) << 24);
+                // Two 4-byte displacement writes overlap if their insn_offsets are within 4 bytes of each other
+                let diff: i64 = (r_insn_offset as i64) - (r2_insn_offset as i64);
+                if diff >= -3 && diff <= 3 {
+                    return -10; // Duplicate or overlapping relocation sites
+                }
             }
             m = m + 1;
         }

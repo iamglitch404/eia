@@ -338,8 +338,8 @@ fn upbp_memzero(buf: *mut u8, size: u64) {
 //   Offset 0x10000: Native .text
 //   Offset 0x30000: Native .rodata
 fn write_upbp_binary(cg: *mut CodeGen, out_path: *u8) -> i64 {
-    let holo_offset: u64 = 1024; // 0x400
-    let contracts_offset: u64 = 1120; // 0x400 + 96 = 0x460
+    let holo_offset: u64 = 1152; // 0x480
+    let contracts_offset: u64 = 1248; // 0x480 + 96 = 0x4E0
     let contracts_size: u64 = (cg.contract_count as u64) * 48;
 
     let relocs_offset: u64 = contracts_offset + contracts_size;

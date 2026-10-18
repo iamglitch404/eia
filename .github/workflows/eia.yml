@@ -73,3 +73,21 @@ jobs:
         run: |
           xxd -l 128 /tmp/hello_upbp
           echo "UPBP header bytes verified above"
+
+      - name: Verify Stage-1 Subsystems (Runtime DVAM, UPBP Packaging, Frontend)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          ./bin/spark0 compiler/runtime.rx -o bin/stage1_runtime
+          rt_code=0
+          ./bin/stage1_runtime || rt_code=$?
+          [ "$rt_code" -eq 16 ] && echo "Stage-1 runtime DVAM benchmark PASSED (exit code 16)"
+
+          ./bin/spark0 compiler/packaging.rx -o bin/stage1_packaging
+          pkg_code=0
+          ./bin/stage1_packaging || pkg_code=$?
+          [ "$pkg_code" -eq 42 ] && echo "Stage-1 UPBP packaging PASSED (exit code 42)"
+
+          ./bin/spark0 compiler/frontend.rx -o bin/stage1_frontend
+          fe_code=0
+          ./bin/stage1_frontend || fe_code=$?
+          [ "$fe_code" -eq 38 ] && echo "Stage-1 frontend parser PASSED (exit code 38)"

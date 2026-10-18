@@ -10,14 +10,19 @@ jobs:
   build-and-test:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Build stage-0 C compiler (spark0)
         run: |
+          mkdir -p bin
           gcc -O2 -Wall -Wextra -o bin/spark0 src/spark0_lexer.c src/spark0_parser.c src/spark0_codegen.c src/spark0_elf_writer.c src/spark0_main.c
           ./bin/spark0 --version || true
 

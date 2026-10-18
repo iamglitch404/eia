@@ -24,37 +24,52 @@ jobs:
         run: |
           mkdir -p bin
           gcc -O2 -Wall -Wextra -o bin/spark0 src/spark0_lexer.c src/spark0_parser.c src/spark0_codegen.c src/spark0_elf_writer.c src/spark0_main.c
-          ./bin/spark0 --version || true
-
-      - name: Build stage-1 self-hosting compiler (core1.rx -> core1)
-        run: |
           ./bin/spark0 compiler/core1.rx -o bin/core1
+          echo "Stage-0 compiler successfully generated bin/core1 on ${{ matrix.os }}"
+
+      - name: Stage-1 self-hosting compiler fixed-point verification (Linux ELF)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
           ./bin/core1 compiler/core1.rx -o /tmp/core1_pass1
           ./bin/core1 compiler/core1.rx -o /tmp/core1_pass2
-          cmp /tmp/p1 /tmp/p2 2>/dev/null || cmp /tmp/core1_pass1 /tmp/core1_pass2
+          cmp /tmp/core1_pass1 /tmp/core1_pass2
           echo "Fixed-point self-compilation: OK"
 
-      - name: Compile and run hello_eia test
+      - name: Compile and run hello_eia test (checks exit code 42)
+        if: matrix.os == 'ubuntu-latest'
         run: |
           ./bin/core1 tests/hello_eia.rx -o /tmp/hello_eia
-          /tmp/hello_eia
-          echo "Exit code: $?"
+          exit_code=0
+          /tmp/hello_eia || exit_code=$?
+          echo "Exit code: $exit_code"
+          if [ "$exit_code" -ne 42 ]; then
+            echo "Expected exit code 42, got $exit_code"
+            exit 1
+          fi
+          echo "hello_eia test PASSED (exit code 42 verified)"
 
       - name: Run full 5-gate verification
+        if: matrix.os == 'ubuntu-latest'
         run: |
           ./bin/core1 compiler/verify_5gate.rx -o bin/verify_5gate
           ./bin/verify_5gate
-          echo "5-gate verification: $?"
+          echo "5-gate verification: PASSED"
 
-      - name: Test UPBP polyglot binary
-        run: |
-          ./bin/core1 tests/hello_eia.rx -o /tmp/hello_upbp --upbp
-          /bin/sh /tmp/hello_upbp
-          echo "UPBP shell execution: $?"
-
-      - name: Verify UPBP headers (Linux only, as UPBP polyglot execution is Linux-first)
+      - name: Test UPBP polyglot binary shell trampoline (checks exit code 42)
         if: matrix.os == 'ubuntu-latest'
         run: |
           ./bin/core1 tests/hello_eia.rx -o /tmp/hello_upbp --upbp
+          exit_code=0
+          /bin/sh /tmp/hello_upbp || exit_code=$?
+          echo "UPBP shell execution exit code: $exit_code"
+          if [ "$exit_code" -ne 42 ]; then
+            echo "Expected exit code 42, got $exit_code"
+            exit 1
+          fi
+          echo "UPBP polyglot shell trampoline PASSED (exit code 42 verified)"
+
+      - name: Verify UPBP headers
+        if: matrix.os == 'ubuntu-latest'
+        run: |
           xxd -l 128 /tmp/hello_upbp
           echo "UPBP header bytes verified above"

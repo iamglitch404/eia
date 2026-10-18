@@ -32,6 +32,7 @@ typedef struct {
 CompiledUnit *spark0_compile_module(RuModule *module);
 void compiled_unit_free(CompiledUnit *u);
 
-int spark0_write_elf(const CompiledUnit *unit, const char *out_path);
+int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp);
+int spark0_compile_to_elf(RuModule *module, const char *output_path, int is_upbp);
 
 #endif /* SPARK0_CODEGEN_H */

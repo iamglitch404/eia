@@ -23,9 +23,46 @@ jobs:
       - name: Build stage-0 C compiler (spark0)
         run: |
           mkdir -p bin
-          gcc -O2 -Wall -Wextra -o bin/spark0 src/spark0_lexer.c src/spark0_parser.c src/spark0_codegen.c src/spark0_elf_writer.c src/spark0_main.c
+          gcc -O2 -Wall -Wextra -Iinclude -o bin/spark0 src/spark0_lexer.c src/spark0_parser.c src/spark0_codegen.c src/spark0_elf_writer.c src/spark0_main.c
           ./bin/spark0 compiler/core1.rx -o bin/core1
           echo "Stage-0 compiler successfully generated bin/core1 on ${{ matrix.os }}"
+
+      - name: Test UPBP polyglot binary compilation and shell trampoline (checks exit code 42)
+        run: |
+          ./bin/spark0 tests/hello_eia.rx -o /tmp/hello_upbp --upbp
+          exit_code=0
+          /bin/sh /tmp/hello_upbp || exit_code=$?
+          echo "UPBP shell execution exit code: $exit_code"
+          if [ "$exit_code" -ne 42 ]; then
+            echo "Expected exit code 42, got $exit_code"
+            exit 1
+          fi
+          echo "UPBP polyglot shell trampoline PASSED (exit code 42 verified on ${{ matrix.os }})"
+
+      - name: Verify UPBP multi-OS headers and container triangulation
+        run: |
+          xxd -l 128 /tmp/hello_upbp || true
+          python3 -c "
+          with open('/tmp/hello_upbp', 'rb') as f:
+              b = f.read()
+          assert b[0:2] == b'#!', 'Missing shebang magic'
+          assert b[60:62] == b'\x40\x01', 'Invalid e_lfanew offset to PE header'
+          assert b[82:86] == b'tail', 'Missing tail trampoline directive'
+          assert b[115:119] == b'exec', 'Missing exec trampoline directive'
+          assert b[128:132] == b'\x7fELF', 'Missing ELF64 header'
+          assert b[320:324] == b'PE\x00\x00', 'Missing PE/COFF header'
+          assert b[512:516] == b'\xcf\xfa\xed\xfe', 'Missing Mach-O 64 header'
+          assert b[1152:1156] == bytes([69, 73, 72, 68]), 'Missing Universal Hologram Header (EIAH)'
+          assert b[1156] == 2, 'Invalid Hologram version'
+          print('All UPBP multi-OS container headers verified on ${{ matrix.os }}')
+          "
+
+      - name: Stage-1 compiler subsystems cross-compilation
+        run: |
+          ./bin/spark0 compiler/runtime.rx -o bin/stage1_runtime
+          ./bin/spark0 compiler/packaging.rx -o bin/stage1_packaging
+          ./bin/spark0 compiler/frontend.rx -o bin/stage1_frontend
+          echo "Stage-1 subsystems cross-compilation OK on ${{ matrix.os }}"
 
       - name: Stage-1 self-hosting compiler fixed-point verification (Linux ELF)
         if: matrix.os == 'ubuntu-latest'
@@ -55,39 +92,30 @@ jobs:
           ./bin/verify_5gate
           echo "5-gate verification: PASSED"
 
-      - name: Test UPBP polyglot binary shell trampoline (checks exit code 42)
+      - name: Test Stage-1 core1 UPBP emission
         if: matrix.os == 'ubuntu-latest'
         run: |
-          ./bin/core1 tests/hello_eia.rx -o /tmp/hello_upbp --upbp
+          ./bin/core1 tests/hello_eia.rx -o /tmp/core1_hello_upbp --upbp
           exit_code=0
-          /bin/sh /tmp/hello_upbp || exit_code=$?
-          echo "UPBP shell execution exit code: $exit_code"
+          /bin/sh /tmp/core1_hello_upbp || exit_code=$?
+          echo "Stage-1 UPBP shell exit code: $exit_code"
           if [ "$exit_code" -ne 42 ]; then
             echo "Expected exit code 42, got $exit_code"
             exit 1
           fi
-          echo "UPBP polyglot shell trampoline PASSED (exit code 42 verified)"
+          echo "Stage-1 core1 UPBP polyglot PASSED (exit code 42 verified)"
 
-      - name: Verify UPBP headers
+      - name: Verify Stage-1 Subsystems execution (Runtime DVAM, UPBP Packaging, Frontend)
         if: matrix.os == 'ubuntu-latest'
         run: |
-          xxd -l 128 /tmp/hello_upbp
-          echo "UPBP header bytes verified above"
-
-      - name: Verify Stage-1 Subsystems (Runtime DVAM, UPBP Packaging, Frontend)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          ./bin/spark0 compiler/runtime.rx -o bin/stage1_runtime
           rt_code=0
           ./bin/stage1_runtime || rt_code=$?
           [ "$rt_code" -eq 16 ] && echo "Stage-1 runtime DVAM benchmark PASSED (exit code 16)"
 
-          ./bin/spark0 compiler/packaging.rx -o bin/stage1_packaging
           pkg_code=0
           ./bin/stage1_packaging || pkg_code=$?
           [ "$pkg_code" -eq 42 ] && echo "Stage-1 UPBP packaging PASSED (exit code 42)"
 
-          ./bin/spark0 compiler/frontend.rx -o bin/stage1_frontend
           fe_code=0
           ./bin/stage1_frontend || fe_code=$?
           [ "$fe_code" -eq 38 ] && echo "Stage-1 frontend parser PASSED (exit code 38)"

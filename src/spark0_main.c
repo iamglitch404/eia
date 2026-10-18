@@ -50,6 +50,7 @@ int main(int argc, char **argv) {
 
     const char *input_path = NULL;
     const char *output_path = NULL;
+    int is_upbp = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-o") == 0) {
@@ -59,7 +60,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Error: -o requires an argument\n");
                 return 1;
             }
-        } else if (strncmp(argv[i], "--target=", 9) == 0 || strcmp(argv[i], "--upbp") == 0) {
+        } else if (strcmp(argv[i], "--upbp") == 0) {
+            is_upbp = 1;
+        } else if (strncmp(argv[i], "--target=", 9) == 0) {
             /* Handled / allowed flag */
         } else if (argv[i][0] != '-') {
             if (!input_path) {
@@ -86,9 +89,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int rc = spark0_compile_to_elf(module, output_path);
+    int rc = spark0_compile_to_elf(module, output_path, is_upbp);
     if (rc != 0) {
-        fprintf(stderr, "Error: compilation to ELF failed for '%s'\n", output_path);
+        fprintf(stderr, "Error: compilation failed for '%s'\n", output_path);
         free(src);
         return 1;
     }

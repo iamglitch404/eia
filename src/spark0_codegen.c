@@ -221,8 +221,12 @@ static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
     emit8(u, 0xba); emit32_le(u, 7);           /* mov edx, 7 */
     emit8(u, 0x0f); emit8(u, 0x05);            /* syscall */
 
-    /* 2. Hologram Boot Patcher */
+    /* 2. Hologram Boot Patcher: probe UPBP (0x400480) first, fallback to native ELF (0x400080) */
+    emit8(u, 0x49); emit8(u, 0xc7); emit8(u, 0xc4); emit32_le(u, 0x400480); /* mov r12, 0x400480 */
+    emit8(u, 0x41); emit8(u, 0x81); emit8(u, 0x3c); emit8(u, 0x24); emit32_le(u, 0x44484945); /* cmp dword [r12], 0x44484945 ('EIAH') */
+    emit8(u, 0x74); emit8(u, 0x07); /* je .Lfound (+7 bytes) */
     emit8(u, 0x49); emit8(u, 0xc7); emit8(u, 0xc4); emit32_le(u, 0x400080); /* mov r12, 0x400080 */
+    /* .Lfound: */
     emit8(u, 0x4d); emit8(u, 0x8b); emit8(u, 0x6c); emit8(u, 0x24); emit8(u, 0x20); /* mov r13, [r12 + 0x20] */
     emit8(u, 0x49); emit8(u, 0x81); emit8(u, 0xc5); emit32_le(u, 0x400000); /* add r13, 0x400000 */
     emit8(u, 0x4d); emit8(u, 0x8b); emit8(u, 0x74); emit8(u, 0x24); emit8(u, 0x28); /* mov r14, [r12 + 0x28] */

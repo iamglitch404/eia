@@ -276,7 +276,8 @@ typedef enum {
     TOKEN_LBRACE,
     TOKEN_RBRACE,
     TOKEN_LBRACKET,
-    TOKEN_RBRACKET
+    TOKEN_RBRACKET,
+    TOKEN_HASH         /* # for compiler attributes */
 } RuTokenType;
 
 #ifndef _WIN32
@@ -299,6 +300,7 @@ typedef struct RuStructDef {
     const char *name;
     uint64_t    name_hash;
     uint64_t    type_sig_hash; /* BLAKE3-64 hash of structural signature */
+    uint64_t    layout_hash;   /* BLAKE3-64 hash of physical field layout */
     RuFieldDef *fields;
     uint32_t    field_count;
     SourcePos   pos;
@@ -449,6 +451,7 @@ typedef struct RuFnDef {
     RuStmt     **body;
     uint32_t     stmt_count;
     bool         is_extern;
+    uint16_t     calling_conv; /* 0=SysV AMD64, 1=Win64, 2=EIA */
     SourcePos    pos;
 } RuFnDef;
 
@@ -592,15 +595,41 @@ typedef struct {
 /*                          6. COMPILER API INTERFACES                       */
 /* ========================================================================= */
 
+/*
+ * EIA Cryptographic Artifact Signature Block (112 bytes)
+ * Stored inside `.eia_auth` for production artifact provenance & authentication.
+ */
+typedef struct {
+    uint32_t magic;              /* 0x00: Constant 0x41555448 ('EISA' - EIA Signature Auth) */
+    uint16_t version;            /* 0x04: Format version (1) */
+    uint16_t key_epoch;          /* 0x06: Key rotation & anti-replay epoch */
+    uint64_t public_key_id;      /* 0x08: 64-bit public key identifier */
+    uint8_t  blake3_digest[32];  /* 0x10: Full 256-bit BLAKE3 artifact digest */
+    uint8_t  signature[64];      /* 0x30: 512-bit cryptographic signature */
+} __attribute__((packed)) EiaSignatureRecord;
+
+#define EIA_AUTH_MAGIC            0x41555448U /* 'EISA' - EIA Signature Auth */
+#define EIA_AUTH_VERSION          1U
+#define EIA_DEFAULT_KEY_EPOCH     1U
+#define EIA_TRUSTED_PUBKEY_ID     0x4549415F524F4F54ULL /* "EIA_ROOT" */
+#define EIA_MIN_TRUSTED_EPOCH     1U
+
+_Static_assert(sizeof(EiaSignatureRecord) == 112, "EiaSignatureRecord must be exactly 112 bytes");
+
 uint64_t spark0_hash64(const void *data, size_t len);
 uint64_t spark0_hash_str(const char *str);
 uint64_t blake3_hash64(const uint8_t *buf, size_t len);
+void     blake3_hash256(const uint8_t *buf, size_t len, uint8_t out_digest[32]);
 
 void     spark0_format_type_sig(const RuType *t, char *buf, size_t cap);
 uint64_t spark0_compute_fn_sig_hash(const RuFnDef *fn);
+uint64_t spark0_compute_struct_layout_hash(const RuStructDef *sdef);
+void     spark0_sign_digest(const uint8_t digest[32], uint16_t key_epoch, uint8_t out_sig[64]);
+bool     spark0_verify_signature(const uint8_t digest[32], uint16_t key_epoch, uint64_t pubkey_id, const uint8_t sig[64]);
 
 RuModule *spark0_parse(const char *source_text, const char *filename);
 int spark0_compile_to_elf(RuModule *module, const char *output_path, int is_upbp, int target_arch);
+int spark0_compile_to_elf_opt(RuModule *module, const char *output_path, int is_upbp, int target_arch, int is_signed);
 
 #ifdef __cplusplus
 }

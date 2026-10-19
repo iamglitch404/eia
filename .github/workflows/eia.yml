@@ -258,6 +258,23 @@ jobs:
           ./bin/test_eia_interop
           echo "EIA Independent Interoperability & Schema Evolution Matrix: 100% PASSED"
 
+          # Cryptographic Artifact Provenance & Authentication Suite (ASan + UBSan)
+          gcc -O2 -Wall -Wextra -fsanitize=address,undefined -Iinclude src/spark0_lexer.c src/spark0_parser.c src/spark0_codegen.c src/spark0_elf_writer.c tests/test_eia_auth.c -o bin/test_eia_auth
+          ./bin/test_eia_auth
+          echo "EIA Cryptographic Artifact Provenance & Authentication Suite: 100% PASSED"
+
+          # System V AMD64 <-> Win64 Calling Convention ABI Bridge Suite (ASan + UBSan)
+          gcc -O2 -Wall -Wextra -fsanitize=address,undefined -Iinclude -o bin/test_eia_abi_bridge tests/test_eia_abi_bridge.c
+          ./bin/test_eia_abi_bridge
+          echo "EIA System V AMD64 <-> Win64 ABI Calling Convention Bridge Suite: 100% PASSED"
+
+          # GDAM Concurrent Live Upgrade & Hot Migration Suite (TSan & ASan)
+          gcc -O2 -Wall -Wextra -pthread -fsanitize=thread -Iinclude -o bin/test_gdam_hot_migration_tsan tests/test_gdam_hot_migration.c
+          ./bin/test_gdam_hot_migration_tsan
+          gcc -O2 -Wall -Wextra -pthread -fsanitize=address,undefined -Iinclude -o bin/test_gdam_hot_migration_asan tests/test_gdam_hot_migration.c
+          ./bin/test_gdam_hot_migration_asan
+          echo "EIA GDAM Concurrent Live Upgrades & Hot Migration Suite: 100% PASSED"
+
       - name: Verify Multi-Architecture Emission & Semantic Execution (ARM64 and RISC-V 64 via QEMU)
         run: |
           ./bin/spark0 tests/hello_eia.rx -o bin/hello_arm64 --target=arm64

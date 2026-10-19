@@ -841,6 +841,51 @@ static void compile_expr(FnCompiler *fc, RuExpr *e) {
             compile_expr(fc, e->as.call.args[i]);
             emit8(fc->u, 0x50); /* push rax */
         }
+        int callee_cconv = 0;
+        if (is_direct_fn && fc->module) {
+            const char *cname = e->as.call.callee->as.var_name;
+            for (uint32_t fi = 0; fi < fc->module->function_count; ++fi) {
+                if (strcmp(fc->module->functions[fi]->name, cname) == 0) {
+                    callee_cconv = fc->module->functions[fi]->calling_conv;
+                    break;
+                }
+            }
+        }
+
+        if (callee_cconv == 1) {
+            /* Win64 caller ABI: rcx, rdx, r8, r9, [rsp+32], [rsp+40] */
+            for (int i = (int)n - 1; i >= 0; --i) {
+                if (i == 5) { emit8(fc->u, 0x41); emit8(fc->u, 0x5b); } /* pop r11 */
+                else if (i == 4) { emit8(fc->u, 0x41); emit8(fc->u, 0x5a); } /* pop r10 */
+                else if (i == 3) { emit8(fc->u, 0x41); emit8(fc->u, 0x59); } /* pop r9 */
+                else if (i == 2) { emit8(fc->u, 0x41); emit8(fc->u, 0x58); } /* pop r8 */
+                else if (i == 1) emit8(fc->u, 0x5a); /* pop rdx */
+                else if (i == 0) emit8(fc->u, 0x59); /* pop rcx */
+                else emit8(fc->u, 0x58);
+            }
+            emit8(fc->u, 0x48); emit8(fc->u, 0x83); emit8(fc->u, 0xec); emit8(fc->u, 0x30); /* sub rsp, 48 */
+            if (n >= 5) {
+                /* mov [rsp + 32], r10 */
+                emit8(fc->u, 0x4c); emit8(fc->u, 0x89); emit8(fc->u, 0x54); emit8(fc->u, 0x24); emit8(fc->u, 0x20);
+            }
+            if (n >= 6) {
+                /* mov [rsp + 40], r11 */
+                emit8(fc->u, 0x4c); emit8(fc->u, 0x89); emit8(fc->u, 0x5c); emit8(fc->u, 0x24); emit8(fc->u, 0x28);
+            }
+            if (is_direct_fn) {
+                const char *callee_name = e->as.call.callee->as.var_name;
+                emit8(fc->u, 0xe8); /* call rel32 */
+                uint32_t hole = fc->u->text_size;
+                emit32_le(fc->u, 0);
+                add_call_fixup(fc, hole, callee_name);
+            } else {
+                emit8(fc->u, 0x41); emit8(fc->u, 0x5b);
+                emit8(fc->u, 0x41); emit8(fc->u, 0xff); emit8(fc->u, 0xd3);
+            }
+            emit8(fc->u, 0x48); emit8(fc->u, 0x83); emit8(fc->u, 0xc4); emit8(fc->u, 0x30); /* add rsp, 48 */
+            return;
+        }
+
         /* Pop args into System V registers: rdi, rsi, rdx, rcx, r8, r9 */
         for (int i = (int)n - 1; i >= 0; --i) {
             if (i == 0) emit8(fc->u, 0x5f); /* pop rdi */
@@ -1930,7 +1975,7 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
             sc->code_size = 0;
             sc->flags = EIA_SYM_FLAG_IMPORT;
             sc->param_count = (uint16_t)fn->param_count;
-            sc->calling_conv = 0;
+            sc->calling_conv = fn->calling_conv;
             sc->contract_digest = fn->symbol_hash ^ 0xFEEDFACECAFEBABEULL;
             continue;
         }
@@ -2025,14 +2070,45 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
             /* Save incoming parameters into stack slots */
             for (uint32_t p_idx = 0; p_idx < fn->param_count && p_idx < 6; ++p_idx) {
                 VarBinding *vb = add_var(&fc, fn->params[p_idx].name, fn->params[p_idx].type);
-                /* mov [rbp - disp32], reg64 */
-                if (p_idx == 0) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xbd); } /* rdi */
-                else if (p_idx == 1) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xb5); } /* rsi */
-                else if (p_idx == 2) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0x95); } /* rdx */
-                else if (p_idx == 3) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0x8d); } /* rcx */
-                else if (p_idx == 4) { emit8(u, 0x4c); emit8(u, 0x89); emit8(u, 0x85); } /* r8 */
-                else if (p_idx == 5) { emit8(u, 0x4c); emit8(u, 0x89); emit8(u, 0x8d); } /* r9 */
-                emit32_le(u, (uint32_t)(-vb->rbp_offset));
+                if (fn->calling_conv == 1) {
+                    /* Win64 parameter passing: rcx, rdx, r8, r9, [rbp+48], [rbp+56] */
+                    if (p_idx == 0) {
+                        /* mov [rbp - disp32], rcx */
+                        emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0x8d);
+                        emit32_le(u, (uint32_t)(-vb->rbp_offset));
+                    } else if (p_idx == 1) {
+                        /* mov [rbp - disp32], rdx */
+                        emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0x95);
+                        emit32_le(u, (uint32_t)(-vb->rbp_offset));
+                    } else if (p_idx == 2) {
+                        /* mov [rbp - disp32], r8 */
+                        emit8(u, 0x4c); emit8(u, 0x89); emit8(u, 0x85);
+                        emit32_le(u, (uint32_t)(-vb->rbp_offset));
+                    } else if (p_idx == 3) {
+                        /* mov [rbp - disp32], r9 */
+                        emit8(u, 0x4c); emit8(u, 0x89); emit8(u, 0x8d);
+                        emit32_le(u, (uint32_t)(-vb->rbp_offset));
+                    } else if (p_idx == 4) {
+                        /* mov rax, [rbp + 48]; mov [rbp - disp32], rax */
+                        emit8(u, 0x48); emit8(u, 0x8b); emit8(u, 0x45); emit8(u, 48);
+                        emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0x85);
+                        emit32_le(u, (uint32_t)(-vb->rbp_offset));
+                    } else if (p_idx == 5) {
+                        /* mov rax, [rbp + 56]; mov [rbp - disp32], rax */
+                        emit8(u, 0x48); emit8(u, 0x8b); emit8(u, 0x45); emit8(u, 56);
+                        emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0x85);
+                        emit32_le(u, (uint32_t)(-vb->rbp_offset));
+                    }
+                } else {
+                    /* System V AMD64 parameter passing: rdi, rsi, rdx, rcx, r8, r9 */
+                    if (p_idx == 0) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xbd); } /* rdi */
+                    else if (p_idx == 1) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xb5); } /* rsi */
+                    else if (p_idx == 2) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0x95); } /* rdx */
+                    else if (p_idx == 3) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0x8d); } /* rcx */
+                    else if (p_idx == 4) { emit8(u, 0x4c); emit8(u, 0x89); emit8(u, 0x85); } /* r8 */
+                    else if (p_idx == 5) { emit8(u, 0x4c); emit8(u, 0x89); emit8(u, 0x8d); } /* r9 */
+                    emit32_le(u, (uint32_t)(-vb->rbp_offset));
+                }
             }
 
             /* Compile body statements */
@@ -2072,7 +2148,7 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
         sc->code_size = fn_size;
         sc->flags = EIA_SYM_FLAG_EXPORT;
         sc->param_count = (uint16_t)fn->param_count;
-        sc->calling_conv = 0;
+        sc->calling_conv = fn->calling_conv;
         sc->contract_digest = fn->symbol_hash ^ 0xFEEDFACECAFEBABEULL;
 
     }

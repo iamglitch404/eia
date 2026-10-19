@@ -791,24 +791,61 @@ int main(void) {
         dvam_create_arena(&widen_arena, 4096);
 
         /*
-         * Stencil: u32 -> u64 unsigned widening
+         * Stencil 1: u32 -> u64 unsigned widening
          *   mov eax, dword ptr [rdi] ; 8b 07
          *   ret                      ; c3
          */
-        uint8_t widen_stencil[] = { 0x8b, 0x07, 0xc3 };
-        memcpy(widen_arena.v_write, widen_stencil, sizeof(widen_stencil));
+        uint8_t widen_stencil32[] = { 0x8b, 0x07, 0xc3 };
+        memcpy(widen_arena.v_write, widen_stencil32, sizeof(widen_stencil32));
+
+        /*
+         * Stencil 2: u16 -> u64 unsigned widening at offset 64
+         *   movzx eax, word ptr [rdi] ; 0f b7 07
+         *   ret                       ; c3
+         */
+        uint8_t widen_stencil16[] = { 0x0f, 0xb7, 0x07, 0xc3 };
+        memcpy(widen_arena.v_write + 64, widen_stencil16, sizeof(widen_stencil16));
+
+        /*
+         * Stencil 3: u8 -> u64 unsigned widening at offset 128
+         *   movzx eax, byte ptr [rdi] ; 0f b6 07
+         *   ret                       ; c3
+         */
+        uint8_t widen_stencil8[] = { 0x0f, 0xb6, 0x07, 0xc3 };
+        memcpy(widen_arena.v_write + 128, widen_stencil8, sizeof(widen_stencil8));
+
+        /*
+         * Stencil 4: i32 -> i64 signed widening at offset 192
+         *   movsxd rax, dword ptr [rdi] ; 48 63 07
+         *   ret                         ; c3
+         */
+        uint8_t widen_stencil_i32[] = { 0x48, 0x63, 0x07, 0xc3 };
+        memcpy(widen_arena.v_write + 192, widen_stencil_i32, sizeof(widen_stencil_i32));
 
         hasi_cache_sync();
         dvam_lock_writer(&widen_arena);
 
         uint32_t u32_val = 42;
-        typedef uint64_t (*WidenFn)(const uint32_t *);
-        WidenFn widen_call = (WidenFn)widen_arena.v_exec;
-        uint64_t widened_val = widen_call(&u32_val);
+        typedef uint64_t (*WidenFn32)(const uint32_t *);
+        WidenFn32 widen_call32 = (WidenFn32)widen_arena.v_exec;
+        assert(widen_call32(&u32_val) == 42);
 
-        printf("  Widened value: %lu\n", (unsigned long)widened_val);
-        assert(widened_val == 42);
-        printf("  [PASS] Widening adapter stencil verified (u32 -> u64 = 42)\n");
+        uint16_t u16_val = 42;
+        typedef uint64_t (*WidenFn16)(const uint16_t *);
+        WidenFn16 widen_call16 = (WidenFn16)(widen_arena.v_exec + 64);
+        assert(widen_call16(&u16_val) == 42);
+
+        uint8_t u8_val = 42;
+        typedef uint64_t (*WidenFn8)(const uint8_t *);
+        WidenFn8 widen_call8 = (WidenFn8)(widen_arena.v_exec + 128);
+        assert(widen_call8(&u8_val) == 42);
+
+        int32_t i32_val = -42;
+        typedef int64_t (*WidenFnSigned)(const int32_t *);
+        WidenFnSigned widen_call_signed = (WidenFnSigned)(widen_arena.v_exec + 192);
+        assert(widen_call_signed(&i32_val) == -42);
+
+        printf("  [PASS] Widening adapter stencils verified (u32->u64=42, u16->u64=42, u8->u64=42, i32->i64=-42)\n");
 
         dvam_free_arena(&widen_arena);
     }

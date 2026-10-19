@@ -188,13 +188,10 @@ static void blake3_parent_cv(const uint8_t *left_cv, const uint8_t *right_cv, in
     blake3_compress_block(cv, block, 64, 0, flags, out_cv);
 }
 
-uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
+void blake3_hash256(const uint8_t *buf, size_t len, uint8_t out_digest[32]) {
     if (len <= 1024) {
-        uint8_t root_cv[32];
-        blake3_hash_chunk(buf, len, 0, 1, root_cv);
-        uint64_t low = (uint64_t)get_u32(root_cv, 0);
-        uint64_t high = (uint64_t)get_u32(root_cv, 1);
-        return low | (high << 32);
+        blake3_hash_chunk(buf, len, 0, 1, out_digest);
+        return;
     }
 
     size_t num_chunks = (len + 1023) / 1024;
@@ -221,10 +218,50 @@ uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
         cv_count = next_count;
     }
 
-    uint64_t low = (uint64_t)get_u32(cv_list[0], 0);
-    uint64_t high = (uint64_t)get_u32(cv_list[0], 1);
+    memcpy(out_digest, cv_list[0], 32);
     free(cv_list);
+}
+
+uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
+    uint8_t digest[32];
+    blake3_hash256(buf, len, digest);
+    uint64_t low = (uint64_t)get_u32(digest, 0);
+    uint64_t high = (uint64_t)get_u32(digest, 1);
     return low | (high << 32);
+}
+
+/* Sovereign EIA Root Authority Signing Key */
+static const uint8_t EIA_ROOT_KEY[32] = {
+    0x53, 0x4f, 0x56, 0x45, 0x52, 0x45, 0x49, 0x47, 
+    0x4e, 0x5f, 0x45, 0x49, 0x41, 0x5f, 0x52, 0x4f,
+    0x4f, 0x54, 0x5f, 0x4b, 0x45, 0x59, 0x5f, 0x32, 
+    0x30, 0x32, 0x36, 0x5f, 0x53, 0x49, 0x47, 0x4e
+};
+
+void spark0_sign_digest(const uint8_t digest[32], uint16_t key_epoch, uint8_t out_sig[64]) {
+    uint8_t sign_payload[64];
+    memcpy(sign_payload, digest, 32);
+    memcpy(sign_payload + 32, EIA_ROOT_KEY, 30);
+    sign_payload[62] = (uint8_t)(key_epoch & 0xFF);
+    sign_payload[63] = (uint8_t)((key_epoch >> 8) & 0xFF);
+
+    uint8_t h1[32], h2[32];
+    blake3_hash256(sign_payload, 64, h1);
+    sign_payload[0] ^= 0x5c;
+    blake3_hash256(sign_payload, 64, h2);
+    memcpy(out_sig, h1, 32);
+    memcpy(out_sig + 32, h2, 32);
+}
+
+bool spark0_verify_signature(const uint8_t digest[32], uint16_t key_epoch, uint64_t pubkey_id, const uint8_t sig[64]) {
+    if (pubkey_id != EIA_TRUSTED_PUBKEY_ID) return false;
+    uint8_t expected_sig[64];
+    spark0_sign_digest(digest, key_epoch, expected_sig);
+    uint8_t diff = 0;
+    for (size_t i = 0; i < 64; ++i) {
+        diff |= (expected_sig[i] ^ sig[i]);
+    }
+    return diff == 0;
 }
 
 /* Binary artifact representation */
@@ -246,9 +283,7 @@ typedef struct {
     uint64_t text_vaddr_base; /* Base virtual address of code section */
 } LoadedBinary;
 
-#define HASH_TABLE_CAP 4096
-
-/* Symbol export hash table entry */
+/* Symbol export dynamic hash table entry */
 typedef struct {
     uint64_t symbol_hash;
     uint64_t type_sig_hash;
@@ -259,7 +294,13 @@ typedef struct {
     bool occupied;
 } SymbolHashEntry;
 
-/* Type graph field hash table entry */
+typedef struct {
+    SymbolHashEntry *entries;
+    size_t capacity;
+    size_t count;
+} SymbolRegistry;
+
+/* Type graph field dynamic hash table entry */
 typedef struct {
     uint64_t type_sig_hash;
     uint64_t field_hash;
@@ -268,71 +309,160 @@ typedef struct {
     bool occupied;
 } TypeFieldHashEntry;
 
-static inline size_t hash_field_key(uint64_t type_hash, uint64_t field_hash) {
+typedef struct {
+    TypeFieldHashEntry *entries;
+    size_t capacity;
+    size_t count;
+} FieldRegistry;
+
+static inline size_t hash_field_key(uint64_t type_hash, uint64_t field_hash, size_t cap) {
     uint64_t k = type_hash ^ (field_hash * 0x100000001b3ULL);
     k ^= (k >> 33);
     k *= 0xff51afd7ed558ccdULL;
     k ^= (k >> 33);
-    return (size_t)(k & (HASH_TABLE_CAP - 1));
+    return (size_t)(k & (cap - 1));
 }
 
-static void insert_type_field(TypeFieldHashEntry *table, uint64_t type_hash, uint64_t field_hash, uint32_t offset, uint32_t size) {
-    size_t idx = hash_field_key(type_hash, field_hash);
-    for (size_t step = 0; step < HASH_TABLE_CAP; ++step) {
-        size_t i = (idx + step) & (HASH_TABLE_CAP - 1);
-        if (!table[i].occupied || (table[i].type_sig_hash == type_hash && table[i].field_hash == field_hash)) {
-            table[i].type_sig_hash = type_hash;
-            table[i].field_hash = field_hash;
-            table[i].byte_offset = offset;
-            table[i].field_size = size;
-            table[i].occupied = true;
+static void field_reg_init(FieldRegistry *r, size_t cap) {
+    r->capacity = cap ? cap : 1024;
+    r->count = 0;
+    r->entries = (TypeFieldHashEntry *)calloc(r->capacity, sizeof(TypeFieldHashEntry));
+}
+
+static void field_reg_free(FieldRegistry *r) {
+    if (r->entries) {
+        free(r->entries);
+        r->entries = NULL;
+    }
+    r->count = r->capacity = 0;
+}
+
+static void field_reg_grow(FieldRegistry *r);
+
+static void field_reg_insert(FieldRegistry *r, uint64_t type_hash, uint64_t field_hash, uint32_t offset, uint32_t size) {
+    if (r->count * 10 >= r->capacity * 7) {
+        field_reg_grow(r);
+    }
+    size_t idx = hash_field_key(type_hash, field_hash, r->capacity);
+    for (size_t step = 0; step < r->capacity; ++step) {
+        size_t i = (idx + step) & (r->capacity - 1);
+        if (!r->entries[i].occupied || (r->entries[i].type_sig_hash == type_hash && r->entries[i].field_hash == field_hash)) {
+            if (!r->entries[i].occupied) r->count++;
+            r->entries[i].type_sig_hash = type_hash;
+            r->entries[i].field_hash = field_hash;
+            r->entries[i].byte_offset = offset;
+            r->entries[i].field_size = size;
+            r->entries[i].occupied = true;
             return;
         }
     }
 }
 
-static const TypeFieldHashEntry *lookup_type_field(const TypeFieldHashEntry *table, uint64_t type_hash, uint64_t field_hash) {
-    size_t idx = hash_field_key(type_hash, field_hash);
-    for (size_t step = 0; step < HASH_TABLE_CAP; ++step) {
-        size_t i = (idx + step) & (HASH_TABLE_CAP - 1);
-        if (!table[i].occupied) return NULL;
-        if (table[i].type_sig_hash == type_hash && table[i].field_hash == field_hash) {
-            return &table[i];
+static void field_reg_grow(FieldRegistry *r) {
+    size_t old_cap = r->capacity;
+    TypeFieldHashEntry *old_entries = r->entries;
+
+    r->capacity = old_cap * 2;
+    r->count = 0;
+    r->entries = (TypeFieldHashEntry *)calloc(r->capacity, sizeof(TypeFieldHashEntry));
+
+    for (size_t i = 0; i < old_cap; ++i) {
+        if (old_entries[i].occupied) {
+            field_reg_insert(r, old_entries[i].type_sig_hash, old_entries[i].field_hash, old_entries[i].byte_offset, old_entries[i].field_size);
+        }
+    }
+    free(old_entries);
+}
+
+static const TypeFieldHashEntry *field_reg_lookup(const FieldRegistry *r, uint64_t type_hash, uint64_t field_hash) {
+    if (!r->entries || r->capacity == 0) return NULL;
+    size_t idx = hash_field_key(type_hash, field_hash, r->capacity);
+    for (size_t step = 0; step < r->capacity; ++step) {
+        size_t i = (idx + step) & (r->capacity - 1);
+        if (!r->entries[i].occupied) return NULL;
+        if (r->entries[i].type_sig_hash == type_hash && r->entries[i].field_hash == field_hash) {
+            return &r->entries[i];
         }
     }
     return NULL;
 }
 
-static inline size_t hash_sym_key(uint64_t sym_hash) {
+static inline size_t hash_sym_key(uint64_t sym_hash, size_t cap) {
     uint64_t k = sym_hash ^ (sym_hash >> 33);
     k *= 0xff51afd7ed558ccdULL;
     k ^= (k >> 33);
-    return (size_t)(k & (HASH_TABLE_CAP - 1));
+    return (size_t)(k & (cap - 1));
 }
 
-static void insert_exported_symbol(SymbolHashEntry *table, uint64_t sym_hash, uint64_t type_sig_hash, uint64_t target_vaddr, uint16_t param_cnt, uint16_t cconv, const char *bin_name) {
-    size_t idx = hash_sym_key(sym_hash);
-    for (size_t step = 0; step < HASH_TABLE_CAP; ++step) {
-        size_t i = (idx + step) & (HASH_TABLE_CAP - 1);
-        if (!table[i].occupied || table[i].symbol_hash == sym_hash) {
-            table[i].symbol_hash = sym_hash;
-            table[i].type_sig_hash = type_sig_hash;
-            table[i].target_vaddr = target_vaddr;
-            table[i].param_count = param_cnt;
-            table[i].calling_conv = cconv;
-            table[i].binary_name = bin_name;
-            table[i].occupied = true;
+static void sym_reg_init(SymbolRegistry *r, size_t cap) {
+    r->capacity = cap ? cap : 1024;
+    r->count = 0;
+    r->entries = (SymbolHashEntry *)calloc(r->capacity, sizeof(SymbolHashEntry));
+}
+
+static void sym_reg_free(SymbolRegistry *r) {
+    if (r->entries) {
+        free(r->entries);
+        r->entries = NULL;
+    }
+    r->count = r->capacity = 0;
+}
+
+static void sym_reg_grow(SymbolRegistry *r);
+
+static void sym_reg_insert(SymbolRegistry *r, uint64_t sym_hash, uint64_t type_sig_hash, uint64_t target_vaddr, uint16_t param_cnt, uint16_t cconv, const char *bin_name) {
+    if (r->count * 10 >= r->capacity * 7) {
+        sym_reg_grow(r);
+    }
+    size_t idx = hash_sym_key(sym_hash, r->capacity);
+    for (size_t step = 0; step < r->capacity; ++step) {
+        size_t i = (idx + step) & (r->capacity - 1);
+        if (!r->entries[i].occupied) {
+            r->entries[i].symbol_hash = sym_hash;
+            r->entries[i].type_sig_hash = type_sig_hash;
+            r->entries[i].target_vaddr = target_vaddr;
+            r->entries[i].param_count = param_cnt;
+            r->entries[i].calling_conv = cconv;
+            r->entries[i].binary_name = bin_name;
+            r->entries[i].occupied = true;
+            r->count++;
+            return;
+        } else if (r->entries[i].symbol_hash == sym_hash) {
+            /* Duplicate symbol policy: First-Provider-Precedence */
+            if (bin_name && r->entries[i].binary_name && strcmp(r->entries[i].binary_name, bin_name) != 0) {
+                printf("[EIA LINK] Duplicate exported symbol 0x%016lx in '%s' (keeping initial export from '%s')\n",
+                       (unsigned long)sym_hash, bin_name, r->entries[i].binary_name);
+            }
             return;
         }
     }
 }
 
-static const SymbolHashEntry *lookup_exported_symbol(const SymbolHashEntry *table, uint64_t sym_hash) {
-    size_t idx = hash_sym_key(sym_hash);
-    for (size_t step = 0; step < HASH_TABLE_CAP; ++step) {
-        size_t i = (idx + step) & (HASH_TABLE_CAP - 1);
-        if (!table[i].occupied) return NULL;
-        if (table[i].symbol_hash == sym_hash) return &table[i];
+static void sym_reg_grow(SymbolRegistry *r) {
+    size_t old_cap = r->capacity;
+    SymbolHashEntry *old_entries = r->entries;
+
+    r->capacity = old_cap * 2;
+    r->count = 0;
+    r->entries = (SymbolHashEntry *)calloc(r->capacity, sizeof(SymbolHashEntry));
+
+    for (size_t i = 0; i < old_cap; ++i) {
+        if (old_entries[i].occupied) {
+            sym_reg_insert(r, old_entries[i].symbol_hash, old_entries[i].type_sig_hash,
+                           old_entries[i].target_vaddr, old_entries[i].param_count,
+                           old_entries[i].calling_conv, old_entries[i].binary_name);
+        }
+    }
+    free(old_entries);
+}
+
+static const SymbolHashEntry *sym_reg_lookup(const SymbolRegistry *r, uint64_t sym_hash) {
+    if (!r->entries || r->capacity == 0) return NULL;
+    size_t idx = hash_sym_key(sym_hash, r->capacity);
+    for (size_t step = 0; step < r->capacity; ++step) {
+        size_t i = (idx + step) & (r->capacity - 1);
+        if (!r->entries[i].occupied) return NULL;
+        if (r->entries[i].symbol_hash == sym_hash) return &r->entries[i];
     }
     return NULL;
 }
@@ -547,6 +677,54 @@ static LoadedBinary *load_binary(const char *path) {
         return NULL;
     }
 
+    /* Verify artifact cryptographic authentication if signed */
+    uint64_t auth_offset = *(const uint64_t *)(&holo->reserved[0]);
+    uint64_t auth_size   = *(const uint64_t *)(&holo->reserved[8]);
+    if (auth_offset != 0 && auth_size >= sizeof(EiaSignatureRecord)) {
+        if (auth_offset + sizeof(EiaSignatureRecord) > sz) {
+            fprintf(stderr, "[EIA ERROR] '%s': Auth record overflows file bounds\n", path);
+            free(data);
+            return NULL;
+        }
+        const EiaSignatureRecord *sig = (const EiaSignatureRecord *)(data + auth_offset);
+        if (sig->magic != EIA_AUTH_MAGIC) {
+            fprintf(stderr, "[EIA ERROR] '%s': Invalid signature magic 0x%08x\n", path, sig->magic);
+            free(data);
+            return NULL;
+        }
+        if (sig->version != EIA_AUTH_VERSION) {
+            fprintf(stderr, "[EIA ERROR] '%s': Unsupported signature version %u\n", path, sig->version);
+            free(data);
+            return NULL;
+        }
+        if (sig->key_epoch < EIA_MIN_TRUSTED_EPOCH) {
+            fprintf(stderr, "[EIA ERROR] '%s': Key epoch %u is outdated or revoked (min required: %u)\n",
+                    path, sig->key_epoch, EIA_MIN_TRUSTED_EPOCH);
+            free(data);
+            return NULL;
+        }
+        if (sig->public_key_id != EIA_TRUSTED_PUBKEY_ID) {
+            fprintf(stderr, "[EIA ERROR] '%s': Untrusted public key ID 0x%016lx\n",
+                    path, (unsigned long)sig->public_key_id);
+            free(data);
+            return NULL;
+        }
+        uint8_t computed_digest[32];
+        blake3_hash256(data + holo->contracts_offset, tables_len, computed_digest);
+        if (memcmp(computed_digest, sig->blake3_digest, 32) != 0) {
+            fprintf(stderr, "[EIA ERROR] '%s': Cryptographic 256-bit BLAKE3 digest mismatch!\n", path);
+            free(data);
+            return NULL;
+        }
+        if (!spark0_verify_signature(sig->blake3_digest, sig->key_epoch, sig->public_key_id, sig->signature)) {
+            fprintf(stderr, "[EIA ERROR] '%s': Cryptographic signature verification failed!\n", path);
+            free(data);
+            return NULL;
+        }
+        printf("[EIA AUTH] Cryptographic provenance verified for '%s' (epoch=%u, pubkey=0x%016lx)\n",
+               path, sig->key_epoch, (unsigned long)sig->public_key_id);
+    }
+
     LoadedBinary *b = (LoadedBinary *)calloc(1, sizeof(LoadedBinary));
     b->path = path;
     b->file_data = data;
@@ -559,20 +737,25 @@ static LoadedBinary *load_binary(const char *path) {
     b->type_graph = (const EiaTypeGraphEntry *)(data + holo->type_graph_offset);
     b->type_graph_count = holo->type_graph_size / sizeof(EiaTypeGraphEntry);
 
-    /* Dynamically parse architecture and code segment layout from ELF headers */
-    size_t elf_off = 0;
-    if (sz >= 64 && data[0] == 0x7f && data[1] == 'E' && data[2] == 'L' && data[3] == 'F') {
-        elf_off = 0;
-    } else if (sz >= 128 + 64 && data[128] == 0x7f && data[129] == 'E' && data[130] == 'L' && data[131] == 'F') {
-        elf_off = 128;
-    }
-
+    /* Dynamically parse architecture and code segment layout from ELF, PE, or Mach-O */
     uint16_t t_arch = 0;
     uint64_t text_vaddr_base = 0x410000;
     size_t text_off = 0x10000;
     size_t text_sz = 0;
+    bool format_parsed = false;
 
-    if (sz >= elf_off + sizeof(Elf64Header)) {
+    /* 1. Probe ELF headers (at 0 or 128) */
+    size_t elf_off = 0;
+    bool is_elf = false;
+    if (sz >= 64 && data[0] == 0x7f && data[1] == 'E' && data[2] == 'L' && data[3] == 'F') {
+        elf_off = 0;
+        is_elf = true;
+    } else if (sz >= 128 + 64 && data[128] == 0x7f && data[129] == 'E' && data[130] == 'L' && data[131] == 'F') {
+        elf_off = 128;
+        is_elf = true;
+    }
+
+    if (is_elf && sz >= elf_off + sizeof(Elf64Header)) {
         const Elf64Header *eh = (const Elf64Header *)(data + elf_off);
         uint16_t em = eh->e_machine;
         if (em == 183) t_arch = 1;      /* AArch64 */
@@ -585,6 +768,80 @@ static LoadedBinary *load_binary(const char *path) {
             if (eh->e_entry >= ph->p_vaddr && (eh->e_entry - ph->p_vaddr) < sz) {
                 text_off = (size_t)(eh->e_entry - ph->p_vaddr);
                 text_sz = sz - text_off;
+                format_parsed = true;
+            }
+        }
+    }
+
+    /* 2. Probe PE headers if not ELF */
+    if (!format_parsed && sz >= 64 && data[0] == 'M' && data[1] == 'Z') {
+        uint32_t pe_offset = *(const uint32_t *)(data + 0x3C);
+        if (pe_offset + 264 <= sz && memcmp(data + pe_offset, "PE\0\0", 4) == 0) {
+            uint16_t machine = *(const uint16_t *)(data + pe_offset + 4);
+            if (machine == 0xaa64) t_arch = 1;
+            else if (machine == 0x5064) t_arch = 2;
+            else t_arch = 0;
+
+            uint16_t num_sections = *(const uint16_t *)(data + pe_offset + 6);
+            uint16_t opt_size = *(const uint16_t *)(data + pe_offset + 20);
+            if (opt_size >= 112) {
+                uint32_t entry_rva = *(const uint32_t *)(data + pe_offset + 24 + 16);
+                uint64_t image_base = *(const uint64_t *)(data + pe_offset + 24 + 24);
+                text_vaddr_base = image_base + entry_rva;
+            }
+
+            size_t sec_table = pe_offset + 24 + opt_size;
+            for (uint16_t s = 0; s < num_sections && sec_table + (s + 1) * 40 <= sz; ++s) {
+                const uint8_t *sec = data + sec_table + s * 40;
+                if (memcmp(sec, ".text", 5) == 0) {
+                    uint32_t raw_size = *(const uint32_t *)(sec + 16);
+                    uint32_t raw_ptr = *(const uint32_t *)(sec + 20);
+                    if (raw_ptr + raw_size <= sz) {
+                        text_off = raw_ptr;
+                        text_sz = raw_size;
+                        format_parsed = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /* 3. Probe Mach-O 64 headers */
+    if (!format_parsed) {
+        size_t m_off = 0;
+        bool is_macho = false;
+        if (sz >= 32 && *(const uint32_t *)data == 0xfeedfacf) {
+            m_off = 0;
+            is_macho = true;
+        } else if (sz >= 512 + 32 && *(const uint32_t *)(data + 512) == 0xfeedfacf) {
+            m_off = 512;
+            is_macho = true;
+        }
+
+        if (is_macho) {
+            uint32_t cputype = *(const uint32_t *)(data + m_off + 4);
+            if (cputype == 0x0100000c) t_arch = 1;
+            else t_arch = 0;
+
+            uint32_t ncmds = *(const uint32_t *)(data + m_off + 16);
+            size_t cmd_ptr = m_off + 32;
+            for (uint32_t c = 0; c < ncmds && cmd_ptr + 8 <= sz; ++c) {
+                uint32_t cmd = *(const uint32_t *)(data + cmd_ptr);
+                uint32_t cmdsize = *(const uint32_t *)(data + cmd_ptr + 4);
+                if (cmd == 0x19 && cmdsize >= 72) {
+                    if (memcmp(data + cmd_ptr + 8, "__TEXT", 6) == 0) {
+                        uint64_t vmaddr = *(const uint64_t *)(data + cmd_ptr + 24);
+                        uint64_t fileoff = *(const uint64_t *)(data + cmd_ptr + 40);
+                        uint64_t filesize = *(const uint64_t *)(data + cmd_ptr + 48);
+                        text_vaddr_base = vmaddr ? vmaddr : 0x100000000ULL;
+                        text_off = (size_t)fileoff;
+                        text_sz = (size_t)filesize;
+                        format_parsed = true;
+                        break;
+                    }
+                }
+                cmd_ptr += cmdsize;
             }
         }
     }
@@ -613,6 +870,22 @@ static LoadedBinary *load_binary(const char *path) {
     return b;
 }
 
+static void cleanup_loaded_binaries(LoadedBinary *client, LoadedBinary **providers, int count) {
+    if (client) {
+        if (client->file_data) free(client->file_data);
+        free(client);
+    }
+    if (providers) {
+        for (int i = 0; i < count; ++i) {
+            if (providers[i]) {
+                if (providers[i]->file_data) free(providers[i]->file_data);
+                free(providers[i]);
+            }
+        }
+        free(providers);
+    }
+}
+
 /* ========================================================================= */
 /*                               MAIN LOADER                                 */
 /* ========================================================================= */
@@ -639,6 +912,7 @@ int main(int argc, char **argv) {
             providers[i] = load_binary(argv[2 + i]);
             if (!providers[i]) {
                 fprintf(stderr, "[EIA ERROR] Failed to load provider artifact '%s'\n", argv[2 + i]);
+                cleanup_loaded_binaries(client, providers, provider_count);
                 return 1;
             }
         }
@@ -705,12 +979,12 @@ int main(int argc, char **argv) {
         memcpy(v_write + providers[i]->arena_offset, providers[i]->text_data, providers[i]->text_size);
     }
 
-    /* 5. Build Global Export Catalog & Global Type Graph Index (O(1) Hash Tables) */
-    static SymbolHashEntry sym_table[HASH_TABLE_CAP];
-    memset(sym_table, 0, sizeof(sym_table));
+    /* 5. Build Global Export Catalog & Global Type Graph Index (Dynamic Hash Registries) */
+    SymbolRegistry sym_reg;
+    sym_reg_init(&sym_reg, 1024);
 
-    static TypeFieldHashEntry field_table[HASH_TABLE_CAP];
-    memset(field_table, 0, sizeof(field_table));
+    FieldRegistry field_reg;
+    field_reg_init(&field_reg, 1024);
 
     /* Register provider exports and type graph entries */
     for (int p = 0; p < provider_count; ++p) {
@@ -722,22 +996,22 @@ int main(int argc, char **argv) {
             if (sc->flags & EIA_SYM_FLAG_EXPORT) {
                 uint32_t fn_offset = (uint32_t)(sc->vaddr - pb->text_vaddr_base);
                 uint64_t target_vaddr = (uint64_t)(v_exec + pb->arena_offset + fn_offset);
-                insert_exported_symbol(sym_table, sc->symbol_hash, sc->type_sig_hash, target_vaddr, sc->param_count, sc->calling_conv, pb->path);
+                sym_reg_insert(&sym_reg, sc->symbol_hash, sc->type_sig_hash, target_vaddr, sc->param_count, sc->calling_conv, pb->path);
             }
         }
 
         /* Type graph */
         for (size_t t = 0; t < pb->type_graph_count; ++t) {
             const EiaTypeGraphEntry *tge = &pb->type_graph[t];
-            insert_type_field(field_table, tge->type_sig_hash, tge->field_hash, tge->byte_offset, tge->field_size);
+            field_reg_insert(&field_reg, tge->type_sig_hash, tge->field_hash, tge->byte_offset, tge->field_size);
         }
     }
 
     /* Also register client's own type graph entries as baseline fallback */
     for (size_t t = 0; t < client->type_graph_count; ++t) {
         const EiaTypeGraphEntry *tge = &client->type_graph[t];
-        if (!lookup_type_field(field_table, tge->type_sig_hash, tge->field_hash)) {
-            insert_type_field(field_table, tge->type_sig_hash, tge->field_hash, tge->byte_offset, tge->field_size);
+        if (!field_reg_lookup(&field_reg, tge->type_sig_hash, tge->field_hash)) {
+            field_reg_insert(&field_reg, tge->type_sig_hash, tge->field_hash, tge->byte_offset, tge->field_size);
         }
     }
 
@@ -819,7 +1093,7 @@ int main(int argc, char **argv) {
                     return 1;
                 }
 
-                const TypeFieldHashEntry *f = lookup_type_field(field_table, hole->type_sig_hash, hole->field_or_sym_hash);
+                const TypeFieldHashEntry *f = field_reg_lookup(&field_reg, hole->type_sig_hash, hole->field_or_sym_hash);
                 if (!f) {
                     fprintf(stderr, "[EIA ERROR] Field resolution failed for hash 0x%016lx in '%s'\n",
                             (unsigned long)hole->field_or_sym_hash, curr->path);
@@ -827,30 +1101,121 @@ int main(int argc, char **argv) {
                     return 1;
                 }
 
-                /* Check schema narrowing rule & inject widening adapter if safe */
+                /* Check schema narrowing rule & inject widening/truncation adapter if safe */
                 for (size_t t = 0; t < curr->type_graph_count; ++t) {
                     if (curr->type_graph[t].type_sig_hash == hole->type_sig_hash &&
                         curr->type_graph[t].field_hash == hole->field_or_sym_hash) {
                         uint32_t expected_size = curr->type_graph[t].field_size;
                         if (f->field_size < expected_size) {
                             bool adapted = false;
-                            /* On x86-64: adapt u32 load (48 8b 07) to zero-extending u32 load (8b 07 90) */
-                            if (curr->target_arch == 0 && expected_size == 8 && f->field_size == 4) {
+                            if (curr->target_arch == 0 && expected_size == 8) {
+                                /* x86-64: adapt 64-bit load (48 8b 07) or store (48 89 07) */
                                 uint8_t *next_code = patch_site + 4;
-                                if (hole->insn_offset + 7 <= curr->text_size &&
-                                    next_code[0] == 0x48 && next_code[1] == 0x8b && next_code[2] == 0x07) {
-                                    next_code[0] = 0x8b; /* mov eax, [rdi] (zero-extends into rax) */
-                                    next_code[1] = 0x07;
-                                    next_code[2] = 0x90; /* nop */
-                                    adapted = true;
-                                    printf("[EIA LINK] Injected widening adapter (u32 -> u64 zero-extension) at 0x%x in '%s'\n",
-                                           hole->insn_offset, curr->path);
+                                if (hole->insn_offset + 7 <= curr->text_size) {
+                                    if (next_code[0] == 0x48 && next_code[1] == 0x8b && next_code[2] == 0x07) {
+                                        /* Unsigned widening load */
+                                        if (f->field_size == 4) {
+                                            next_code[0] = 0x8b; next_code[1] = 0x07; next_code[2] = 0x90; /* mov eax, [rdi]; nop */
+                                            adapted = true;
+                                        } else if (f->field_size == 2) {
+                                            next_code[0] = 0x0f; next_code[1] = 0xb7; next_code[2] = 0x07; /* movzx eax, word ptr [rdi] */
+                                            adapted = true;
+                                        } else if (f->field_size == 1) {
+                                            next_code[0] = 0x0f; next_code[1] = 0xb6; next_code[2] = 0x07; /* movzx eax, byte ptr [rdi] */
+                                            adapted = true;
+                                        }
+                                    } else if (next_code[0] == 0x48 && next_code[1] == 0x63 && next_code[2] == 0x07) {
+                                        /* Signed widening load */
+                                        if (f->field_size == 4) {
+                                            adapted = true; /* movsxd rax, dword ptr [rdi] */
+                                        } else if (f->field_size == 2) {
+                                            next_code[0] = 0x48; next_code[1] = 0x0f; next_code[2] = 0xbf; /* movsx rax, word ptr [rdi] */
+                                            adapted = true;
+                                        } else if (f->field_size == 1) {
+                                            next_code[0] = 0x48; next_code[1] = 0x0f; next_code[2] = 0xbe; /* movsx rax, byte ptr [rdi] */
+                                            adapted = true;
+                                        }
+                                    } else if (next_code[0] == 0x48 && next_code[1] == 0x89 && next_code[2] == 0x07) {
+                                        /* Truncating store */
+                                        if (f->field_size == 4) {
+                                            next_code[0] = 0x89; next_code[1] = 0x07; next_code[2] = 0x90; /* mov [rdi], eax; nop */
+                                            adapted = true;
+                                        } else if (f->field_size == 2) {
+                                            next_code[0] = 0x66; next_code[1] = 0x89; next_code[2] = 0x07; /* mov [rdi], ax */
+                                            adapted = true;
+                                        } else if (f->field_size == 1) {
+                                            next_code[0] = 0x88; next_code[1] = 0x07; next_code[2] = 0x90; /* mov [rdi], al; nop */
+                                            adapted = true;
+                                        }
+                                    }
+                                }
+                            } else if (curr->target_arch == 1 && expected_size == 8) {
+                                /* ARM64: adapt ldr x0, [x1] (0xf9400020) or str x0, [x1] (0xf9000020) */
+                                if (hole->insn_offset + 16 <= curr->text_size) {
+                                    uint32_t *next_insn = (uint32_t *)(patch_site + 12);
+                                    if (*next_insn == 0xf9400020) {
+                                        if (f->field_size == 4) {
+                                            *next_insn = 0xb9400020; /* ldr w0, [x1] */
+                                            adapted = true;
+                                        } else if (f->field_size == 2) {
+                                            *next_insn = 0x79400020; /* ldrh w0, [x1] */
+                                            adapted = true;
+                                        } else if (f->field_size == 1) {
+                                            *next_insn = 0x39400020; /* ldrb w0, [x1] */
+                                            adapted = true;
+                                        }
+                                    } else if (*next_insn == 0xf9000020) {
+                                        if (f->field_size == 4) {
+                                            *next_insn = 0xb9000020; /* str w0, [x1] */
+                                            adapted = true;
+                                        } else if (f->field_size == 2) {
+                                            *next_insn = 0x79000020; /* strh w0, [x1] */
+                                            adapted = true;
+                                        } else if (f->field_size == 1) {
+                                            *next_insn = 0x39000020; /* strb w0, [x1] */
+                                            adapted = true;
+                                        }
+                                    }
+                                }
+                            } else if (curr->target_arch == 2 && expected_size == 8) {
+                                /* RISC-V 64: adapt ld a0, 0(a1) (0x0005b503) or sd a0, 0(a1) (0x00a5b023) */
+                                if (hole->insn_offset + 16 <= curr->text_size) {
+                                    uint32_t *next_insn = (uint32_t *)(patch_site + 12);
+                                    if (*next_insn == 0x0005b503) {
+                                        if (f->field_size == 4) {
+                                            *next_insn = 0x0005e503; /* lwu a0, 0(a1) */
+                                            adapted = true;
+                                        } else if (f->field_size == 2) {
+                                            *next_insn = 0x0005d503; /* lhu a0, 0(a1) */
+                                            adapted = true;
+                                        } else if (f->field_size == 1) {
+                                            *next_insn = 0x0005c503; /* lbu a0, 0(a1) */
+                                            adapted = true;
+                                        }
+                                    } else if (*next_insn == 0x00a5b023) {
+                                        if (f->field_size == 4) {
+                                            *next_insn = 0x00a5a023; /* sw a0, 0(a1) */
+                                            adapted = true;
+                                        } else if (f->field_size == 2) {
+                                            *next_insn = 0x00a59023; /* sh a0, 0(a1) */
+                                            adapted = true;
+                                        } else if (f->field_size == 1) {
+                                            *next_insn = 0x00a58023; /* sb a0, 0(a1) */
+                                            adapted = true;
+                                        }
+                                    }
                                 }
                             }
-                            if (!adapted) {
+                            if (adapted) {
+                                printf("[EIA LINK] Injected widening/truncation adapter (field %u bytes -> expected %u bytes) at 0x%x in '%s' (arch=%u)\n",
+                                       f->field_size, expected_size, hole->insn_offset, curr->path, curr->target_arch);
+                            } else {
                                 fprintf(stderr, "[EIA ERROR] Schema rejection: field narrowing unsupported for type 0x%016lx field 0x%016lx (expected %u bytes, provider has %u bytes)\n",
                                         (unsigned long)hole->type_sig_hash, (unsigned long)hole->field_or_sym_hash,
                                         expected_size, f->field_size);
+                                sym_reg_free(&sym_reg);
+                                field_reg_free(&field_reg);
+                                cleanup_loaded_binaries(client, providers, provider_count);
                                 free(all_bins);
                                 return 1;
                             }
@@ -882,10 +1247,13 @@ int main(int argc, char **argv) {
                     patch_site[3] = (uint8_t)((resolved_disp >> 24) & 0xFF);
                 }
             } else if (hole->patch_kind == EIA_PATCH_SYM_REL32) {
-                const SymbolHashEntry *s = lookup_exported_symbol(sym_table, hole->field_or_sym_hash);
+                const SymbolHashEntry *s = sym_reg_lookup(&sym_reg, hole->field_or_sym_hash);
                 if (!s) {
                     fprintf(stderr, "[EIA ERROR] Unresolved external symbol: hash 0x%016lx in '%s'\n",
                             (unsigned long)hole->field_or_sym_hash, curr->path);
+                    sym_reg_free(&sym_reg);
+                    field_reg_free(&field_reg);
+                    cleanup_loaded_binaries(client, providers, provider_count);
                     free(all_bins);
                     return 1;
                 }
@@ -898,8 +1266,11 @@ int main(int argc, char **argv) {
                         (curr->contracts[c].flags & EIA_SYM_FLAG_IMPORT)) {
                         if (curr->contracts[c].param_count != s->param_count) {
                             fprintf(stderr, "[EIA ERROR] Signature mismatch for symbol 0x%016lx: caller '%s' expects %u params, callee '%s' exports %u params\n",
-                                    (unsigned long)hole->field_or_sym_hash, curr->path,
+                                     (unsigned long)hole->field_or_sym_hash, curr->path,
                                     curr->contracts[c].param_count, s->binary_name, s->param_count);
+                            sym_reg_free(&sym_reg);
+                            field_reg_free(&field_reg);
+                            cleanup_loaded_binaries(client, providers, provider_count);
                             free(all_bins);
                             return 1;
                         }
@@ -911,19 +1282,24 @@ int main(int argc, char **argv) {
                                 uint32_t thunk_off = (uint32_t)(thunk_arena_offset + thunk_used);
                                 uint8_t *thunk_ptr = v_write + thunk_off;
                                 if (caller_conv == 0 && callee_conv == 1) {
-                                    /* SysV AMD64 caller -> Win64 callee bridge */
+                                    /* SysV AMD64 caller -> Win64 callee bridge (full 6 integer args + stack forwarding) */
                                     size_t b_idx = 0;
+                                    thunk_ptr[b_idx++] = 0x55;                                          // push rbp
+                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xe5; // mov rbp, rsp
+                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x83; thunk_ptr[b_idx++] = 0xec; thunk_ptr[b_idx++] = 0x30; // sub rsp, 48
+                                    thunk_ptr[b_idx++] = 0x4c; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0x44; thunk_ptr[b_idx++] = 0x24; thunk_ptr[b_idx++] = 0x20; // mov [rsp + 32], r8
+                                    thunk_ptr[b_idx++] = 0x4c; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0x4c; thunk_ptr[b_idx++] = 0x24; thunk_ptr[b_idx++] = 0x28; // mov [rsp + 40], r9
                                     thunk_ptr[b_idx++] = 0x49; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xc9; // mov r9, rcx
                                     thunk_ptr[b_idx++] = 0x49; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xd0; // mov r8, rdx
                                     thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xf2; // mov rdx, rsi
                                     thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xf9; // mov rcx, rdi
-                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x83; thunk_ptr[b_idx++] = 0xec; thunk_ptr[b_idx++] = 0x28; // sub rsp, 40
                                     thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0xb8; // mov rax, imm64
                                     uint64_t callee_addr = s->target_vaddr;
                                     memcpy(thunk_ptr + b_idx, &callee_addr, 8);
                                     b_idx += 8;
                                     thunk_ptr[b_idx++] = 0xff; thunk_ptr[b_idx++] = 0xd0; // call rax
-                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x83; thunk_ptr[b_idx++] = 0xc4; thunk_ptr[b_idx++] = 0x28; // add rsp, 40
+                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xec; // mov rsp, rbp
+                                    thunk_ptr[b_idx++] = 0x5d; // pop rbp
                                     thunk_ptr[b_idx++] = 0xc3; // ret
                                     thunk_used += 64;
                                     target_exec_vaddr = (uint64_t)(v_exec + thunk_off);
@@ -931,17 +1307,30 @@ int main(int argc, char **argv) {
                                     printf("[EIA LINK] Injected SysV AMD64 -> Win64 ABI bridge thunk for symbol 0x%016lx\n",
                                            (unsigned long)hole->field_or_sym_hash);
                                 } else if (caller_conv == 1 && callee_conv == 0) {
-                                    /* Win64 caller -> SysV AMD64 callee bridge */
+                                    /* Win64 caller -> SysV AMD64 callee bridge (full 6 integer args + stack forwarding) */
                                     size_t b_idx = 0;
+                                    thunk_ptr[b_idx++] = 0x55;                                          // push rbp
+                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xe5; // mov rbp, rsp
+                                    thunk_ptr[b_idx++] = 0x57;                                          // push rdi (preserve Win64 non-volatile)
+                                    thunk_ptr[b_idx++] = 0x56;                                          // push rsi (preserve Win64 non-volatile)
+                                    thunk_ptr[b_idx++] = 0x4c; thunk_ptr[b_idx++] = 0x8b; thunk_ptr[b_idx++] = 0x55; thunk_ptr[b_idx++] = 0x30; // mov r10, [rbp + 48]
+                                    thunk_ptr[b_idx++] = 0x4c; thunk_ptr[b_idx++] = 0x8b; thunk_ptr[b_idx++] = 0x5d; thunk_ptr[b_idx++] = 0x38; // mov r11, [rbp + 56]
                                     thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xcf; // mov rdi, rcx
                                     thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xd6; // mov rsi, rdx
                                     thunk_ptr[b_idx++] = 0x4c; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xc2; // mov rdx, r8
                                     thunk_ptr[b_idx++] = 0x4c; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xc9; // mov rcx, r9
+                                    thunk_ptr[b_idx++] = 0x4d; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xd0; // mov r8, r10
+                                    thunk_ptr[b_idx++] = 0x4d; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xd9; // mov r9, r11
                                     thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0xb8; // mov rax, imm64
                                     uint64_t callee_addr = s->target_vaddr;
                                     memcpy(thunk_ptr + b_idx, &callee_addr, 8);
                                     b_idx += 8;
-                                    thunk_ptr[b_idx++] = 0xff; thunk_ptr[b_idx++] = 0xe0; // jmp rax
+                                    thunk_ptr[b_idx++] = 0xff; thunk_ptr[b_idx++] = 0xd0; // call rax
+                                    thunk_ptr[b_idx++] = 0x5e;                                          // pop rsi
+                                    thunk_ptr[b_idx++] = 0x5f;                                          // pop rdi
+                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xec; // mov rsp, rbp
+                                    thunk_ptr[b_idx++] = 0x5d;                                          // pop rbp
+                                    thunk_ptr[b_idx++] = 0xc3;                                          // ret
                                     thunk_used += 64;
                                     target_exec_vaddr = (uint64_t)(v_exec + thunk_off);
                                     bridged = true;
@@ -953,6 +1342,9 @@ int main(int argc, char **argv) {
                                 fprintf(stderr, "[EIA ERROR] Calling convention mismatch for symbol 0x%016lx: caller '%s' conv %u, callee '%s' conv %u (no bridge available)\n",
                                         (unsigned long)hole->field_or_sym_hash, curr->path,
                                         caller_conv, s->binary_name, callee_conv);
+                                sym_reg_free(&sym_reg);
+                                field_reg_free(&field_reg);
+                                cleanup_loaded_binaries(client, providers, provider_count);
                                 free(all_bins);
                                 return 1;
                             }
@@ -961,6 +1353,9 @@ int main(int argc, char **argv) {
                             curr->contracts[c].type_sig_hash != s->type_sig_hash) {
                             fprintf(stderr, "[EIA ERROR] Structural signature mismatch for symbol 0x%016lx: caller expects 0x%016lx, callee has 0x%016lx\n",
                                     (unsigned long)hole->field_or_sym_hash, (unsigned long)curr->contracts[c].type_sig_hash, (unsigned long)s->type_sig_hash);
+                            sym_reg_free(&sym_reg);
+                            field_reg_free(&field_reg);
+                            cleanup_loaded_binaries(client, providers, provider_count);
                             free(all_bins);
                             return 1;
                         }
@@ -974,6 +1369,9 @@ int main(int argc, char **argv) {
                     if ((insn & 0xfc000000) != 0x94000000) {
                         fprintf(stderr, "[EIA ERROR] Invalid instruction shape for symbol call at 0x%x in '%s' (expected BL)\n",
                                 hole->insn_offset, curr->path);
+                        sym_reg_free(&sym_reg);
+                        field_reg_free(&field_reg);
+                        cleanup_loaded_binaries(client, providers, provider_count);
                         free(all_bins);
                         return 1;
                     }
@@ -987,6 +1385,9 @@ int main(int argc, char **argv) {
                     if ((insn & 0x7f) != 0x6f) {
                         fprintf(stderr, "[EIA ERROR] Invalid instruction shape for symbol call at 0x%x in '%s' (expected JAL)\n",
                                 hole->insn_offset, curr->path);
+                        sym_reg_free(&sym_reg);
+                        field_reg_free(&field_reg);
+                        cleanup_loaded_binaries(client, providers, provider_count);
                         free(all_bins);
                         return 1;
                     }
@@ -1003,6 +1404,9 @@ int main(int argc, char **argv) {
                     if (hole->insn_offset > 0 && patch_site[-1] != 0xE8) {
                         fprintf(stderr, "[EIA ERROR] Invalid instruction shape for symbol call at 0x%x in '%s' (expected 0xE8, got 0x%02x)\n",
                                 hole->insn_offset, curr->path, patch_site[-1]);
+                        sym_reg_free(&sym_reg);
+                        field_reg_free(&field_reg);
+                        cleanup_loaded_binaries(client, providers, provider_count);
                         free(all_bins);
                         return 1;
                     }
@@ -1011,6 +1415,9 @@ int main(int argc, char **argv) {
                     int64_t rel_disp = (int64_t)target_exec_vaddr - (int64_t)(call_site_exec + 4);
                     if (rel_disp < -2147483648LL || rel_disp > 2147483647LL) {
                         fprintf(stderr, "[EIA ERROR] Inter-binary displacement exceeds 32-bit range\n");
+                        sym_reg_free(&sym_reg);
+                        field_reg_free(&field_reg);
+                        cleanup_loaded_binaries(client, providers, provider_count);
                         free(all_bins);
                         return 1;
                     }
@@ -1069,6 +1476,9 @@ int main(int argc, char **argv) {
 
     if (!found_main) {
         fprintf(stderr, "[EIA ERROR] No callable entrypoint found in '%s'\n", client_path);
+        sym_reg_free(&sym_reg);
+        field_reg_free(&field_reg);
+        cleanup_loaded_binaries(client, providers, provider_count);
         return 1;
     }
 
@@ -1133,11 +1543,17 @@ int main(int argc, char **argv) {
         if (!emu_executed) {
             fprintf(stderr, "[EIA ERROR] Unsupported execution environment: target architecture %u cannot be executed natively on host and emulator '%s' is unavailable\n",
                     client->target_arch, emu ? emu : "unknown");
+            sym_reg_free(&sym_reg);
+            field_reg_free(&field_reg);
+            cleanup_loaded_binaries(client, providers, provider_count);
             return 1;
         }
 #else
         fprintf(stderr, "[EIA ERROR] Unsupported execution environment: target architecture %u cannot be executed on Windows host\n",
                 client->target_arch);
+        sym_reg_free(&sym_reg);
+        field_reg_free(&field_reg);
+        cleanup_loaded_binaries(client, providers, provider_count);
         return 1;
 #endif
     }
@@ -1150,15 +1566,9 @@ int main(int argc, char **argv) {
     munmap(v_exec, total_code_size);
     close(memfd);
 #endif
-    free(client->file_data);
-    free(client);
-    if (providers) {
-        for (int i = 0; i < provider_count; ++i) {
-            free(providers[i]->file_data);
-            free(providers[i]);
-        }
-        free(providers);
-    }
+    sym_reg_free(&sym_reg);
+    field_reg_free(&field_reg);
+    cleanup_loaded_binaries(client, providers, provider_count);
 
     return (int)exit_code;
 }

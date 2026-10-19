@@ -350,6 +350,10 @@ Token lexer_next(Lexer *l) {
             tok.type = TOKEN_RBRACKET;
             tok.text = my_strdup("]");
             break;
+        case '#':
+            tok.type = TOKEN_HASH;
+            tok.text = my_strdup("#");
+            break;
         default:
             tok.type = TOKEN_EOF;
             tok.text = copy_substr(l->src, start_pos, 1);

@@ -163,13 +163,10 @@ static void blake3_parent_cv(const uint8_t *left_cv, const uint8_t *right_cv, in
     blake3_compress_block(cv, block, 64, 0, flags, out_cv);
 }
 
-uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
+void blake3_hash256(const uint8_t *buf, size_t len, uint8_t out_digest[32]) {
     if (len <= 1024) {
-        uint8_t root_cv[32];
-        blake3_hash_chunk(buf, len, 0, 1, root_cv);
-        uint64_t low = (uint64_t)get_u32(root_cv, 0);
-        uint64_t high = (uint64_t)get_u32(root_cv, 1);
-        return low | (high << 32);
+        blake3_hash_chunk(buf, len, 0, 1, out_digest);
+        return;
     }
 
     size_t num_chunks = (len + 1023) / 1024;
@@ -196,13 +193,54 @@ uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
         cv_count = next_count;
     }
 
-    uint64_t low = (uint64_t)get_u32(cv_list[0], 0);
-    uint64_t high = (uint64_t)get_u32(cv_list[0], 1);
+    memcpy(out_digest, cv_list[0], 32);
     free(cv_list);
+}
+
+uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
+    uint8_t digest[32];
+    blake3_hash256(buf, len, digest);
+    uint64_t low = (uint64_t)get_u32(digest, 0);
+    uint64_t high = (uint64_t)get_u32(digest, 1);
     return low | (high << 32);
 }
 
-int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp, int target_arch) {
+/* Sovereign EIA Root Authority Signing Key (symmetric/HMAC key derivation) */
+static const uint8_t EIA_ROOT_KEY[32] = {
+    0x53, 0x4f, 0x56, 0x45, 0x52, 0x45, 0x49, 0x47, 
+    0x4e, 0x5f, 0x45, 0x49, 0x41, 0x5f, 0x52, 0x4f,
+    0x4f, 0x54, 0x5f, 0x4b, 0x45, 0x59, 0x5f, 0x32, 
+    0x30, 0x32, 0x36, 0x5f, 0x53, 0x49, 0x47, 0x4e
+};
+
+void spark0_sign_digest(const uint8_t digest[32], uint16_t key_epoch, uint8_t out_sig[64]) {
+    uint8_t sign_payload[64];
+    memcpy(sign_payload, digest, 32);
+    memcpy(sign_payload + 32, EIA_ROOT_KEY, 30);
+    sign_payload[62] = (uint8_t)(key_epoch & 0xFF);
+    sign_payload[63] = (uint8_t)((key_epoch >> 8) & 0xFF);
+
+    uint8_t h1[32], h2[32];
+    blake3_hash256(sign_payload, 64, h1);
+    /* Dual-pass HMAC for 512-bit signature */
+    sign_payload[0] ^= 0x5c;
+    blake3_hash256(sign_payload, 64, h2);
+    memcpy(out_sig, h1, 32);
+    memcpy(out_sig + 32, h2, 32);
+}
+
+bool spark0_verify_signature(const uint8_t digest[32], uint16_t key_epoch, uint64_t pubkey_id, const uint8_t sig[64]) {
+    if (pubkey_id != EIA_TRUSTED_PUBKEY_ID) return false;
+    uint8_t expected_sig[64];
+    spark0_sign_digest(digest, key_epoch, expected_sig);
+    uint8_t diff = 0;
+    for (size_t i = 0; i < 64; ++i) {
+        diff |= (expected_sig[i] ^ sig[i]);
+    }
+    return diff == 0;
+}
+
+int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_upbp, int target_arch, int is_signed) {
     /* Calculate section offsets */
     uint64_t holo_offset = is_upbp ? 1152 : 0x80;
     uint64_t contracts_offset = is_upbp ? 1248 : (holo_offset + sizeof(UniversalHologramHeader)); /* 0x80 + 96 = 0xE0 */
@@ -390,6 +428,26 @@ int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp
     uint64_t tables_len = contracts_size + relocs_size + type_graph_size;
     holo->blake3_root = blake3_hash64(file_buf + contracts_offset, tables_len);
 
+    if (is_signed) {
+        uint64_t auth_offset = type_graph_offset + type_graph_size;
+        uint64_t auth_size = sizeof(EiaSignatureRecord);
+        EiaSignatureRecord sig_rec;
+        memset(&sig_rec, 0, sizeof(sig_rec));
+        sig_rec.magic = EIA_AUTH_MAGIC;
+        sig_rec.version = EIA_AUTH_VERSION;
+        sig_rec.key_epoch = EIA_DEFAULT_KEY_EPOCH;
+        sig_rec.public_key_id = EIA_TRUSTED_PUBKEY_ID;
+
+        /* Full 256-bit BLAKE3 digest of hologram tables */
+        blake3_hash256(file_buf + contracts_offset, tables_len, sig_rec.blake3_digest);
+        spark0_sign_digest(sig_rec.blake3_digest, sig_rec.key_epoch, sig_rec.signature);
+
+        memcpy(file_buf + auth_offset, &sig_rec, sizeof(sig_rec));
+        memcpy(&holo->reserved[0], &auth_offset, 8);
+        memcpy(&holo->reserved[8], &auth_size, 8);
+        holo->flags |= 2; /* EIA_FLAG_AUTHENTICATED */
+    }
+
     /* 7. .text Section (starts at file offset 0x1000, mapped to 0x401000) */
     if (unit->text_size > 0 && unit->text_buf) {
         memcpy(file_buf + text_offset, unit->text_buf, unit->text_size);
@@ -461,10 +519,18 @@ int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp
     return 0;
 }
 
-int spark0_compile_to_elf(RuModule *module, const char *output_path, int is_upbp, int target_arch) {
+int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp, int target_arch) {
+    return spark0_write_elf_opt(unit, out_path, is_upbp, target_arch, 0);
+}
+
+int spark0_compile_to_elf_opt(RuModule *module, const char *output_path, int is_upbp, int target_arch, int is_signed) {
     CompiledUnit *u = spark0_compile_module(module, target_arch);
     if (!u) return -1;
-    int rc = spark0_write_elf(u, output_path, is_upbp, target_arch);
+    int rc = spark0_write_elf_opt(u, output_path, is_upbp, target_arch, is_signed);
     compiled_unit_free(u);
     return rc;
+}
+
+int spark0_compile_to_elf(RuModule *module, const char *output_path, int is_upbp, int target_arch) {
+    return spark0_compile_to_elf_opt(module, output_path, is_upbp, target_arch, 0);
 }

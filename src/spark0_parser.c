@@ -721,10 +721,30 @@ static RuStructDef *parse_struct_def(Parser *p) {
     sdef->field_count = count;
     sdef->pos = pos;
 
-    /* Canonical structural type signature hash is the struct interface name hash */
+    /* Canonical structural type signature hash */
     sdef->type_sig_hash = sdef->name_hash;
+    sdef->layout_hash = spark0_compute_struct_layout_hash(sdef);
 
     return sdef;
+}
+
+static uint64_t get_canonical_type_hash(const RuType *t, uint32_t *is_ptr_out);
+
+uint64_t spark0_compute_struct_layout_hash(const RuStructDef *sdef) {
+    if (!sdef) return 0;
+    if (sdef->field_count == 0) return spark0_hash_str("struct{}");
+    size_t cap = sdef->field_count * 24;
+    uint8_t *buf = (uint8_t *)calloc(cap, 1);
+    for (uint32_t i = 0; i < sdef->field_count; ++i) {
+        uint64_t f_type_hash = get_canonical_type_hash(sdef->fields[i].type, NULL);
+        uint32_t f_size = sdef->fields[i].type ? sdef->fields[i].type->size_bytes : 8;
+        memcpy(buf + i * 24, &f_type_hash, 8);
+        memcpy(buf + i * 24 + 8, &f_size, 4);
+        memcpy(buf + i * 24 + 16, &sdef->fields[i].name_hash, 8);
+    }
+    uint64_t h = blake3_hash64(buf, cap);
+    free(buf);
+    return h;
 }
 
 static uint64_t get_canonical_type_hash(const RuType *t, uint32_t *is_ptr_out) {
@@ -799,7 +819,6 @@ uint64_t spark0_compute_fn_sig_hash(const RuFnDef *fn) {
     memset(sig_buf, 0, sizeof(sig_buf));
 
     uint32_t param_cnt = fn->param_count;
-    uint32_t calling_conv = 0;
     uint32_t is_ret_ptr = 0;
     uint64_t ret_type_hash = get_canonical_type_hash(fn->return_type, &is_ret_ptr);
 
@@ -809,11 +828,11 @@ uint64_t spark0_compute_fn_sig_hash(const RuFnDef *fn) {
     sig_buf[2] = (uint8_t)((param_cnt >> 16) & 0xFF);
     sig_buf[3] = (uint8_t)((param_cnt >> 24) & 0xFF);
 
-    // Bytes 4..7: calling_conv (LE)
-    sig_buf[4] = (uint8_t)(calling_conv & 0xFF);
-    sig_buf[5] = (uint8_t)((calling_conv >> 8) & 0xFF);
-    sig_buf[6] = (uint8_t)((calling_conv >> 16) & 0xFF);
-    sig_buf[7] = (uint8_t)((calling_conv >> 24) & 0xFF);
+    // Bytes 4..7: calling_conv (0) for canonical structural typing matching core1.rx
+    sig_buf[4] = 0;
+    sig_buf[5] = 0;
+    sig_buf[6] = 0;
+    sig_buf[7] = 0;
 
     // Bytes 8..15: ret_type_hash (LE)
     for (int b = 0; b < 8; ++b) {
@@ -835,7 +854,7 @@ uint64_t spark0_compute_fn_sig_hash(const RuFnDef *fn) {
     return blake3_hash64(sig_buf, total_len);
 }
 
-static RuFnDef *parse_fn_def(Parser *p, bool is_extern) {
+static RuFnDef *parse_fn_def(Parser *p, bool is_extern, uint16_t calling_conv) {
     SourcePos pos = p->cur.pos;
     expect(p, TOKEN_FN, "expected 'fn'");
     if (!check(p, TOKEN_IDENT)) {
@@ -901,6 +920,7 @@ static RuFnDef *parse_fn_def(Parser *p, bool is_extern) {
     fndef->body = body;
     fndef->stmt_count = stmt_cnt;
     fndef->is_extern = is_extern;
+    fndef->calling_conv = calling_conv;
     fndef->pos = pos;
     fndef->type_sig_hash = spark0_compute_fn_sig_hash(fndef);
 
@@ -920,6 +940,25 @@ RuModule *spark0_parse(const char *source_text, const char *filename) {
     uint32_t f_cap = 0, f_cnt = 0;
 
     while (!check(&p, TOKEN_EOF)) {
+        uint16_t pending_cconv = 0;
+        if (check(&p, TOKEN_HASH)) {
+            parser_advance(&p);
+            expect(&p, TOKEN_LBRACKET, "expected '[' after '#'");
+            if (check(&p, TOKEN_IDENT) && strcmp(p.cur.text, "abi") == 0) {
+                parser_advance(&p);
+                expect(&p, TOKEN_LPAREN, "expected '(' after 'abi'");
+                if (check(&p, TOKEN_STRING_LIT)) {
+                    const char *s = p.cur.str_val ? p.cur.str_val : p.cur.text;
+                    if (strstr(s, "win64")) pending_cconv = 1;
+                    else if (strstr(s, "sysv")) pending_cconv = 0;
+                    else if (strstr(s, "eia")) pending_cconv = 2;
+                    parser_advance(&p);
+                }
+                expect(&p, TOKEN_RPAREN, "expected ')' after ABI convention string");
+            }
+            expect(&p, TOKEN_RBRACKET, "expected ']' after attribute");
+        }
+
         if (check(&p, TOKEN_STRUCT)) {
             if (s_cnt >= s_cap) {
                 s_cap = s_cap ? s_cap * 2 : 4;
@@ -932,13 +971,13 @@ RuModule *spark0_parse(const char *source_text, const char *filename) {
                 f_cap = f_cap ? f_cap * 2 : 4;
                 fns = (RuFnDef **)realloc(fns, f_cap * sizeof(RuFnDef *));
             }
-            fns[f_cnt++] = parse_fn_def(&p, true);
+            fns[f_cnt++] = parse_fn_def(&p, true, pending_cconv);
         } else if (check(&p, TOKEN_FN)) {
             if (f_cnt >= f_cap) {
                 f_cap = f_cap ? f_cap * 2 : 4;
                 fns = (RuFnDef **)realloc(fns, f_cap * sizeof(RuFnDef *));
             }
-            fns[f_cnt++] = parse_fn_def(&p, false);
+            fns[f_cnt++] = parse_fn_def(&p, false, pending_cconv);
         } else {
             fprintf(stderr, "%s:%u:%u: unexpected top-level token: '%s'\n",
                     p.lexer.filename, p.cur.pos.line, p.cur.pos.col,

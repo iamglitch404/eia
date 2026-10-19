@@ -51,6 +51,7 @@ int main(int argc, char **argv) {
     const char *input_path = NULL;
     const char *output_path = NULL;
     int is_upbp = 0;
+    int is_signed = 0;
 
     int target_arch = 0; /* 0=x86_64, 1=arm64, 2=riscv64 */
 
@@ -64,6 +65,8 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--upbp") == 0) {
             is_upbp = 1;
+        } else if (strcmp(argv[i], "--sign") == 0 || strcmp(argv[i], "--auth") == 0) {
+            is_signed = 1;
         } else if (strncmp(argv[i], "--target=", 9) == 0 || strncmp(argv[i], "-target=", 8) == 0) {
             const char *t = strchr(argv[i], '=') + 1;
             if (strcmp(t, "x86_64") == 0) {
@@ -118,7 +121,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int rc = spark0_compile_to_elf(module, output_path, is_upbp, target_arch);
+    int rc = spark0_compile_to_elf_opt(module, output_path, is_upbp, target_arch, is_signed);
     if (rc != 0) {
         fprintf(stderr, "Error: compilation failed for '%s'\n", output_path);
         free(src);

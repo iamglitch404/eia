@@ -64,8 +64,8 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--upbp") == 0) {
             is_upbp = 1;
-        } else if (strncmp(argv[i], "--target=", 9) == 0) {
-            const char *t = argv[i] + 9;
+        } else if (strncmp(argv[i], "--target=", 9) == 0 || strncmp(argv[i], "-target=", 8) == 0) {
+            const char *t = strchr(argv[i], '=') + 1;
             if (strcmp(t, "x86_64") == 0) {
                 target_arch = 0;
             } else if (strcmp(t, "arm64") == 0 || strcmp(t, "aarch64") == 0) {
@@ -74,6 +74,23 @@ int main(int argc, char **argv) {
                 target_arch = 2;
             } else {
                 fprintf(stderr, "Error: unsupported target architecture '%s'\n", t);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--target") == 0 || strcmp(argv[i], "-target") == 0) {
+            if (i + 1 < argc) {
+                const char *t = argv[++i];
+                if (strcmp(t, "x86_64") == 0) {
+                    target_arch = 0;
+                } else if (strcmp(t, "arm64") == 0 || strcmp(t, "aarch64") == 0) {
+                    target_arch = 1;
+                } else if (strcmp(t, "riscv64") == 0) {
+                    target_arch = 2;
+                } else {
+                    fprintf(stderr, "Error: unsupported target architecture '%s'\n", t);
+                    return 1;
+                }
+            } else {
+                fprintf(stderr, "Error: %s requires a target architecture argument\n", argv[i]);
                 return 1;
             }
         } else if (argv[i][0] != '-') {

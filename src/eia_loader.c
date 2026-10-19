@@ -351,6 +351,45 @@ static inline void hasi_cache_sync(void *addr, size_t size) {
 #endif
 }
 
+/* Cross-platform execution bridge: guarantees System V ABI & preserves Win64 callee-saved registers */
+static inline int64_t call_sysv_entry(void *fn_ptr) {
+#if defined(_WIN32) && defined(__x86_64__)
+    register void *target __asm__("r10") = fn_ptr;
+    int64_t result;
+    __asm__ __volatile__(
+        "pushq %%rsi\n\t"
+        "pushq %%rdi\n\t"
+        "pushq %%rbx\n\t"
+        "pushq %%r12\n\t"
+        "pushq %%r13\n\t"
+        "pushq %%r14\n\t"
+        "pushq %%r15\n\t"
+        "pushq %%rbp\n\t"
+        "movq %%rsp, %%rbp\n\t"
+        "subq $32, %%rsp\n\t"
+        "andq $-16, %%rsp\n\t"
+        "callq *%%r10\n\t"
+        "movq %%rbp, %%rsp\n\t"
+        "popq %%rbp\n\t"
+        "popq %%r15\n\t"
+        "popq %%r14\n\t"
+        "popq %%r13\n\t"
+        "popq %%r12\n\t"
+        "popq %%rbx\n\t"
+        "popq %%rdi\n\t"
+        "popq %%rsi\n\t"
+        : "=a"(result)
+        : "r"(target)
+        : "rcx", "rdx", "r8", "r9", "r11", "memory"
+    );
+    return result;
+#else
+    typedef int64_t (*ClientMainFn)(void);
+    ClientMainFn fn = (ClientMainFn)fn_ptr;
+    return fn();
+#endif
+}
+
 /* Instruction shape validation: ensures patch site is an LEA or MOV memory disp32 */
 static int validate_field_insn_shape(const uint8_t *code, uint32_t insn_offset) {
     if (insn_offset >= 3) {
@@ -796,6 +835,8 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     UnmapViewOfFile(v_write);
     v_write = NULL;
+    DWORD oldProtect = 0;
+    VirtualProtect(v_exec, total_code_size, PAGE_EXECUTE_READ, &oldProtect);
 #else
     munmap(v_write, total_code_size);
     v_write = NULL;
@@ -831,11 +872,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    typedef int64_t (*ClientMainFn)(void);
-    ClientMainFn run_entry = (ClientMainFn)(v_exec + client->arena_offset + main_fn_offset);
-
-    /* 10. Execute direct native machine code */
-    int64_t exit_code = run_entry();
+    /* 10. Execute direct native machine code via cross-platform SysV bridge */
+    void *entry_ptr = (void *)(v_exec + client->arena_offset + main_fn_offset);
+    int64_t exit_code = call_sysv_entry(entry_ptr);
 
     /* Clean up */
 #ifdef _WIN32

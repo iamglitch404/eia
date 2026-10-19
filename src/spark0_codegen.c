@@ -1837,7 +1837,7 @@ static void compile_stmt_riscv(FnCompiler *fc, RuStmt *s) {
         } else {
             emit32_le(fc->u, 0x00000513); /* li a0, 0 */
         }
-        emit32_le(fc->u, 0xff040113); /* addi sp, s0, -16 */
+        emit32_le(fc->u, 0x00040113); /* mv sp, s0 (addi sp, s0, 0) */
         emit32_le(fc->u, 0x00813083); /* ld ra, 8(sp) */
         emit32_le(fc->u, 0x00013403); /* ld s0, 0(sp) */
         emit32_le(fc->u, 0x01010113); /* addi sp, sp, 16 */
@@ -1953,7 +1953,7 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
             emit32_le(u, 0xff010113); /* addi sp, sp, -16 */
             emit32_le(u, 0x00113423); /* sd ra, 8(sp) */
             emit32_le(u, 0x00813023); /* sd s0, 0(sp) */
-            emit32_le(u, 0x01010413); /* addi s0, sp, 16 */
+            emit32_le(u, 0x00010413); /* mv s0, sp (addi s0, sp, 0) */
             emit32_le(u, 0xe0010113); /* addi sp, sp, -512 */
 
             /* Save incoming parameters into stack slots */
@@ -1970,7 +1970,7 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
 
             /* Default Epilogue */
             emit32_le(u, 0x00000513); /* li a0, 0 */
-            emit32_le(u, 0xff040113); /* addi sp, s0, -16 */
+            emit32_le(u, 0x00040113); /* mv sp, s0 (addi sp, s0, 0) */
             emit32_le(u, 0x00813083); /* ld ra, 8(sp) */
             emit32_le(u, 0x00013403); /* ld s0, 0(sp) */
             emit32_le(u, 0x01010113); /* addi sp, sp, 16 */

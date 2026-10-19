@@ -1,0 +1,27 @@
+struct Point {
+    x: u64,
+    y: u64,
+}
+
+fn add_points(p: *Point) -> u64 {
+    return p.x + p.y;
+}
+
+fn compute() -> i64 {
+    let mut pt: Point;
+    pt.x = 20;
+    pt.y = 22;
+    let mut sum: u64 = add_points(&pt);
+    let mut i: u64 = 0;
+    while i < 10 {
+        sum = sum + 2;
+        i = i + 1;
+    }
+    return (sum - 20) as i64;
+}
+
+fn main() -> i64 {
+    let res: i64 = compute();
+    syscall(60, res);
+    return 0;
+}

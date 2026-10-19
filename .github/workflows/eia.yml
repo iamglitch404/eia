@@ -96,6 +96,14 @@ jobs:
           echo "Production eia-run loader compiled successfully on ${{ matrix.os }}"
           ./bin/spark0 tests/client_v1.rx -o bin/client_v1
           ./bin/spark0 tests/provider_v2.rx -o bin/provider_v2
+          # Verify fail-closed behavior on missing provider across all platforms
+          fc_code=0
+          ./bin/eia-run bin/client_v1 >/dev/null 2>&1 || fc_code=$?
+          if [ "$fc_code" -ne 1 ]; then
+            echo "Expected eia-run missing provider exit code 1, got $fc_code"
+            exit 1
+          fi
+          echo "Production eia-run fail-closed missing symbol verification PASSED on ${{ matrix.os }} (exit code 1)"
           if [ "${{ matrix.os }}" = "ubuntu-latest" ] || [ "${{ matrix.os }}" = "windows-latest" ]; then
             run_code=0
             ./bin/eia-run bin/client_v1 bin/provider_v2 || run_code=$?
@@ -231,6 +239,8 @@ jobs:
         run: |
           ./bin/spark0 tests/hello_eia.rx -o bin/hello_arm64 --target=arm64
           ./bin/spark0 tests/hello_eia.rx -o bin/hello_riscv64 --target=riscv64
+          ./bin/spark0 tests/test_semantic_multiarch.rx -o bin/sem_arm64 --target=arm64
+          ./bin/spark0 tests/test_semantic_multiarch.rx -o bin/sem_riscv64 --target=riscv64
           sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user || true
           if command -v qemu-aarch64 >/dev/null 2>&1; then
             arm_code=0
@@ -239,6 +249,11 @@ jobs:
             [ "$arm_code" -eq 42 ]
             echo "$arm_out" | grep -q "EIA HOLE PATCHED OK"
             echo "ARM64 general semantic execution via QEMU: PASSED (verified semantic stdout and exit code 42)"
+
+            sem_arm=0
+            qemu-aarch64 bin/sem_arm64 || sem_arm=$?
+            [ "$sem_arm" -eq 42 ]
+            echo "ARM64 multi-feature semantics (struct pointers, function calls, loops): PASSED (exit code 42)"
           fi
           if command -v qemu-riscv64 >/dev/null 2>&1; then
             riscv_code=0
@@ -247,4 +262,9 @@ jobs:
             [ "$riscv_code" -eq 42 ]
             echo "$riscv_out" | grep -q "EIA HOLE PATCHED OK"
             echo "RISC-V 64 general semantic execution via QEMU: PASSED (verified semantic stdout and exit code 42)"
+
+            sem_rv=0
+            qemu-riscv64 bin/sem_riscv64 || sem_rv=$?
+            [ "$sem_rv" -eq 42 ]
+            echo "RISC-V 64 multi-feature semantics (struct pointers, function calls, loops): PASSED (exit code 42)"
           fi

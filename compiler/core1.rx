@@ -1597,19 +1597,19 @@ fn compile_fn(cg: *mut CodeGen, fnode: *mut AstNode) {
     let fn_code_size: u64 = (cg.text_size - fn_text_offset) as u64;
 
     // Collect parameter types and ptr kinds
-    let mut param_types_buf: [u64; 8];
-    let mut param_ptrs_buf: [u64; 8];
+    let mut param_types_buf: [u64; 64];
+    let mut param_ptrs_buf: [u64; 64];
     let p_types: *mut u64 = &mut param_types_buf[0];
     let p_ptrs: *mut u64 = &mut param_ptrs_buf[0];
     let mut pc: *mut AstNode = fnode.child2;
     let mut p_count: u32 = 0;
-    while pc != (0 as *mut AstNode) && p_count < 8 {
+    while pc != (0 as *mut AstNode) && p_count < 64 {
         p_types[p_count as u64] = pc.val;
         p_ptrs[p_count as u64] = pc.is_mut as u64;
         p_count = p_count + 1;
         pc = pc.next;
     }
-    let sig_hash: u64 = compute_canonical_sig_hash(p_count, fnode.val, p_types as *u64, p_ptrs as *u64);
+    let sig_hash: u64 = compute_canonical_sig_hash(p_count, 0, fnode.val, p_types as *u64, p_ptrs as *u64);
 
     // Register SymbolContract
     let sc: *mut SymbolContract = ((cg.contracts as *mut u8) + ((cg.contract_count as u64) * 48)) as *mut SymbolContract;
@@ -2002,11 +2002,11 @@ fn blake3_hash64(buf: *u8, len: u64) -> u64 {
     return low | (high << 32);
 }
 
-fn compute_canonical_sig_hash(param_cnt: u32, ret_type_hash: u64, param_types: *u64, param_ptrs: *u64) -> u64 {
-    let mut sig_buf: [u8; 144];
+fn compute_canonical_sig_hash(param_cnt: u32, calling_conv: u32, ret_type_hash: u64, param_types: *u64, param_ptrs: *u64) -> u64 {
+    let mut sig_buf: [u8; 1040];
     let p: *mut u8 = &mut sig_buf[0];
     let mut i: u64 = 0;
-    while i < 144 {
+    while i < 1040 {
         p[i] = 0;
         i = i + 1;
     }
@@ -2017,8 +2017,11 @@ fn compute_canonical_sig_hash(param_cnt: u32, ret_type_hash: u64, param_types: *
     p[2] = ((param_cnt >> 16) & 255) as u8;
     p[3] = ((param_cnt >> 24) & 255) as u8;
 
-    // Bytes 4..7: calling_conv (0)
-    p[4] = 0; p[5] = 0; p[6] = 0; p[7] = 0;
+    // Bytes 4..7: calling_conv
+    p[4] = (calling_conv & 255) as u8;
+    p[5] = ((calling_conv >> 8) & 255) as u8;
+    p[6] = ((calling_conv >> 16) & 255) as u8;
+    p[7] = ((calling_conv >> 24) & 255) as u8;
 
     // Bytes 8..15: ret_type_hash
     let mut rh: u64 = ret_type_hash;
@@ -2031,7 +2034,7 @@ fn compute_canonical_sig_hash(param_cnt: u32, ret_type_hash: u64, param_types: *
 
     // Bytes 16 + i*16 .. : params
     let mut pi: u32 = 0;
-    while pi < param_cnt && pi < 8 {
+    while pi < param_cnt && pi < 64 {
         let base: u64 = 16 + ((pi as u64) * 16);
         let mut th: u64 = param_types[pi as u64];
         let mut ptr_kind: u64 = param_ptrs[pi as u64];
@@ -2103,26 +2106,16 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
         file_buf[2] = 61; // '='
         file_buf[3] = 59; // ';'
         file_buf[4] = 10; // '\n'
-        file_buf[5] = 35; // '#'
-        file_buf[6] = 33; // '!'
-        file_buf[7] = 47; // '/'
-        file_buf[8] = 98; // 'b'
-        file_buf[9] = 105; // 'i'
-        file_buf[10] = 110; // 'n'
-        file_buf[11] = 47;  // '/'
-        file_buf[12] = 115; // 's'
-        file_buf[13] = 104; // 'h'
-        file_buf[14] = 10;  // '\n'
 
-        // bytes 15-49: shell trampoline with exit 42
-        let tramp1: *u8 = "tail -c+129 \"$0\">z 2>/dev/null;exit 42\n";
+        // bytes 5-59: robust shell trampoline
+        let tramp1: *u8 = "tail -c+129 \"$0\">z;chmod +x z;./z \"$@\"||exit 42\n";
         let mut ti: u64 = 0;
-        while ti < 39 {
-            file_buf[15 + ti] = tramp1[ti];
+        while ti < 48 {
+            file_buf[5 + ti] = tramp1[ti];
             ti = ti + 1;
         }
-        while ti < 45 {
-            file_buf[15 + ti] = 32;
+        while ti < 55 {
+            file_buf[5 + ti] = 32;
             ti = ti + 1;
         }
 
@@ -2174,7 +2167,11 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
         file_buf[elf_base + 16] = 2; file_buf[elf_base + 17] = 0;
         file_buf[elf_base + 18] = emach; file_buf[elf_base + 19] = 0;
         file_buf[elf_base + 20] = 1;
-        file_buf[elf_base + 24] = 0; file_buf[elf_base + 25] = 0; file_buf[elf_base + 26] = 65; file_buf[elf_base + 27] = 0;
+        let entry_addr: u64 = 4194304 + (text_offset - 128);
+        file_buf[elf_base + 24] = (entry_addr & 255) as u8;
+        file_buf[elf_base + 25] = ((entry_addr >> 8) & 255) as u8;
+        file_buf[elf_base + 26] = ((entry_addr >> 16) & 255) as u8;
+        file_buf[elf_base + 27] = ((entry_addr >> 24) & 255) as u8;
 
         file_buf[elf_base + 32] = 64;
         file_buf[elf_base + 52] = 64;
@@ -2661,8 +2658,8 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
             let ext_name_hash: u64 = parser.cur_tok.hash;
             parser_expect(&mut parser, 1);  // ident
             parser_expect(&mut parser, 60); // (
-            let mut param_types_buf: [u64; 8];
-            let mut param_ptrs_buf: [u64; 8];
+            let mut param_types_buf: [u64; 64];
+            let mut param_ptrs_buf: [u64; 64];
             let p_types: *mut u64 = &mut param_types_buf[0];
             let p_ptrs: *mut u64 = &mut param_ptrs_buf[0];
             let mut param_cnt: u32 = 0;
@@ -2676,7 +2673,7 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
                 if parser.cur_tok.kind == 13 { parser_expect(&mut parser, 13); is_ptr = 2; } // mut
                 let p_type_hash: u64 = parser.cur_tok.hash;
                 lex_next_token(parser.lex, &mut parser.cur_tok); // type
-                if param_cnt < 8 {
+                if param_cnt < 64 {
                     p_types[param_cnt as u64] = p_type_hash;
                     p_ptrs[param_cnt as u64] = is_ptr as u64;
                 }
@@ -2694,7 +2691,7 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
                 parser_expect(&mut parser, 71);
             }
 
-            let ext_sig_hash: u64 = compute_canonical_sig_hash(param_cnt, ret_type_hash, p_types as *u64, p_ptrs as *u64);
+            let ext_sig_hash: u64 = compute_canonical_sig_hash(param_cnt, 0, ret_type_hash, p_types as *u64, p_ptrs as *u64);
 
             // Register SymbolContract (EIA_SYM_FLAG_IMPORT = 2)
             let sc: *mut SymbolContract = ((cg.contracts as *mut u8) + ((cg.contract_count as u64) * 48)) as *mut SymbolContract;

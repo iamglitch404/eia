@@ -61,7 +61,9 @@ typedef struct {
     GdamGeneration           *staged_generation;
 } ConcurrentGdamState;
 
+#define MAX_LOADED_PROVIDERS 64
 static ConcurrentGdamState g_runtime_gdam;
+static GdamGeneration g_provider_gens[MAX_LOADED_PROVIDERS + 1];
 
 static inline void gdam_init(ConcurrentGdamState *gdam, GdamGeneration *init_gen) {
     memset(gdam, 0, sizeof(*gdam));
@@ -69,9 +71,10 @@ static inline void gdam_init(ConcurrentGdamState *gdam, GdamGeneration *init_gen
 }
 
 static inline uint64_t gdam_atomic_publish(ConcurrentGdamState *gdam, GdamGeneration *new_gen) {
+    if (!gdam || !new_gen) return 0;
     gdam->previous_generation = atomic_load(&gdam->active_generation);
     atomic_store_explicit(&gdam->active_generation, new_gen, memory_order_release);
-    return new_gen->epoch;
+    return new_gen->epoch ? new_gen->epoch : 1;
 }
 
 static inline int gdam_rollback(ConcurrentGdamState *gdam) {
@@ -302,39 +305,7 @@ uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
     return low | (high << 32);
 }
 
-/* Sovereign EIA Root Authority Signing Key */
-static const uint8_t EIA_ROOT_KEY[32] = {
-    0x53, 0x4f, 0x56, 0x45, 0x52, 0x45, 0x49, 0x47, 
-    0x4e, 0x5f, 0x45, 0x49, 0x41, 0x5f, 0x52, 0x4f,
-    0x4f, 0x54, 0x5f, 0x4b, 0x45, 0x59, 0x5f, 0x32, 
-    0x30, 0x32, 0x36, 0x5f, 0x53, 0x49, 0x47, 0x4e
-};
-
-void spark0_sign_digest(const uint8_t digest[32], uint16_t key_epoch, uint8_t out_sig[64]) {
-    uint8_t sign_payload[64];
-    memcpy(sign_payload, digest, 32);
-    memcpy(sign_payload + 32, EIA_ROOT_KEY, 30);
-    sign_payload[62] = (uint8_t)(key_epoch & 0xFF);
-    sign_payload[63] = (uint8_t)((key_epoch >> 8) & 0xFF);
-
-    uint8_t h1[32], h2[32];
-    blake3_hash256(sign_payload, 64, h1);
-    sign_payload[0] ^= 0x5c;
-    blake3_hash256(sign_payload, 64, h2);
-    memcpy(out_sig, h1, 32);
-    memcpy(out_sig + 32, h2, 32);
-}
-
-bool spark0_verify_signature(const uint8_t digest[32], uint16_t key_epoch, uint64_t pubkey_id, const uint8_t sig[64]) {
-    if (pubkey_id != EIA_TRUSTED_PUBKEY_ID) return false;
-    uint8_t expected_sig[64];
-    spark0_sign_digest(digest, key_epoch, expected_sig);
-    uint8_t diff = 0;
-    for (size_t i = 0; i < 64; ++i) {
-        diff |= (expected_sig[i] ^ sig[i]);
-    }
-    return diff == 0;
-}
+#include "eia_ed25519.c"
 
 /* Binary artifact representation */
 typedef struct {
@@ -1073,13 +1044,26 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Initialize GDAM generational runtime */
-    GdamGeneration init_gen;
-    memset(&init_gen, 0, sizeof(init_gen));
-    init_gen.epoch = client->holo->abi_epoch;
-    init_gen.count = client->type_graph_count;
-    init_gen.schema = (const GdamFieldEntry *)client->type_graph;
-    gdam_init(&g_runtime_gdam, &init_gen);
+    /* Initialize GDAM generational runtime with client baseline */
+    memset(&g_provider_gens[0], 0, sizeof(g_provider_gens[0]));
+    g_provider_gens[0].epoch = client->holo->abi_epoch;
+    g_provider_gens[0].count = client->type_graph_count;
+    g_provider_gens[0].schema = (const GdamFieldEntry *)client->type_graph;
+    gdam_init(&g_runtime_gdam, &g_provider_gens[0]);
+
+    /* Atomically publish each loaded provider's schema generation */
+    for (int i = 0; i < provider_count && i < MAX_LOADED_PROVIDERS; ++i) {
+        memset(&g_provider_gens[i + 1], 0, sizeof(g_provider_gens[i + 1]));
+        g_provider_gens[i + 1].epoch = providers[i]->holo->abi_epoch;
+        g_provider_gens[i + 1].count = providers[i]->type_graph_count;
+        g_provider_gens[i + 1].schema = (const GdamFieldEntry *)providers[i]->type_graph;
+        if (gdam_atomic_publish(&g_runtime_gdam, &g_provider_gens[i + 1]) == 0) {
+            fprintf(stderr, "[EIA ERROR] GDAM publication failed for provider '%s'; rolling back generation\n", providers[i]->path);
+            gdam_rollback(&g_runtime_gdam);
+            cleanup_loaded_binaries(client, providers, provider_count);
+            return 1;
+        }
+    }
 
     /* 3. Compute required DVAM arena size */
     size_t total_code_size = (client->text_size + 0xFFF) & ~0xFFFULL;

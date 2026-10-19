@@ -205,40 +205,8 @@ uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
     return low | (high << 32);
 }
 
-/* Sovereign EIA Root Authority Signing Key (symmetric/HMAC key derivation) */
-static const uint8_t EIA_ROOT_KEY[32] = {
-    0x53, 0x4f, 0x56, 0x45, 0x52, 0x45, 0x49, 0x47, 
-    0x4e, 0x5f, 0x45, 0x49, 0x41, 0x5f, 0x52, 0x4f,
-    0x4f, 0x54, 0x5f, 0x4b, 0x45, 0x59, 0x5f, 0x32, 
-    0x30, 0x32, 0x36, 0x5f, 0x53, 0x49, 0x47, 0x4e
-};
-
-void spark0_sign_digest(const uint8_t digest[32], uint16_t key_epoch, uint8_t out_sig[64]) {
-    uint8_t sign_payload[64];
-    memcpy(sign_payload, digest, 32);
-    memcpy(sign_payload + 32, EIA_ROOT_KEY, 30);
-    sign_payload[62] = (uint8_t)(key_epoch & 0xFF);
-    sign_payload[63] = (uint8_t)((key_epoch >> 8) & 0xFF);
-
-    uint8_t h1[32], h2[32];
-    blake3_hash256(sign_payload, 64, h1);
-    /* Dual-pass HMAC for 512-bit signature */
-    sign_payload[0] ^= 0x5c;
-    blake3_hash256(sign_payload, 64, h2);
-    memcpy(out_sig, h1, 32);
-    memcpy(out_sig + 32, h2, 32);
-}
-
-bool spark0_verify_signature(const uint8_t digest[32], uint16_t key_epoch, uint64_t pubkey_id, const uint8_t sig[64]) {
-    if (pubkey_id != EIA_TRUSTED_PUBKEY_ID) return false;
-    uint8_t expected_sig[64];
-    spark0_sign_digest(digest, key_epoch, expected_sig);
-    uint8_t diff = 0;
-    for (size_t i = 0; i < 64; ++i) {
-        diff |= (expected_sig[i] ^ sig[i]);
-    }
-    return diff == 0;
-}
+#define EIA_SIGNER_ENABLED 1
+#include "eia_ed25519.c"
 
 int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_upbp, int target_arch, int is_signed) {
     /* Calculate section offsets */
@@ -271,10 +239,9 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
         /* 1. DOS MZ Header Stub at Offset 0x000 (0x4D 0x5A) */
         /* Compatible with Windows loader and POSIX shell variable assignment */
         memcpy(file_buf, "MZ=;\n", 5);
-        memcpy(file_buf + 5, "#!/bin/sh\n", 10);
-        const char *tramp1 = "tail -c+129 \"$0\">z;chmod +x z;exec ./z \"$@\"\n";
-        memcpy(file_buf + 15, tramp1, strlen(tramp1));
-        memset(file_buf + 15 + strlen(tramp1), ' ', 60 - (15 + strlen(tramp1)));
+        const char *tramp1 = "tail -c+129 \"$0\">z;chmod +x z;./z \"$@\"||exit 42\n";
+        memcpy(file_buf + 5, tramp1, strlen(tramp1));
+        memset(file_buf + 5 + strlen(tramp1), ' ', 60 - (5 + strlen(tramp1)));
         /* bytes 60-63: e_lfanew = 0x140 */
         file_buf[60] = 0x40;
         file_buf[61] = 0x01;

@@ -420,8 +420,9 @@ static int eia_load_and_patch(
             if (!tg_map[probe].occupied) break;
             if (tg_map[probe].type_hash == hole->type_sig_hash &&
                 tg_map[probe].field_hash == hole->field_or_sym_hash) {
-                if (expected_field_size != 0 && tg_map[probe].field_size != expected_field_size) {
-                    if (tg_map[probe].field_size < expected_field_size) {
+                uint32_t actual_fs = tg_map[probe].field_size & 0xFFFF;
+                if (expected_field_size != 0 && actual_fs != expected_field_size) {
+                    if (actual_fs < expected_field_size) {
                         return EIA_ERR_NARROWING_UNSUPPORTED;
                     }
                     return EIA_ERR_WIDTH_MISMATCH;

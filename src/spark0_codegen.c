@@ -210,24 +210,26 @@ static void build_type_graph(CompiledUnit *u, RuModule *module) {
 static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
     if (u->target_arch == 1) {
         /* ARM64 start stub:
-           mov x0, 42       ; 0xd2800540
-           mov x8, 93       ; 0xd2800ba8 (SYS_exit)
-           svc 0            ; 0xd4000001
+           bl main          ; hole (offset +0)
+           mov x8, 93       ; SYS_exit
+           svc 0
         */
-        emit32_le(u, 0xd2800540);
-        emit32_le(u, 0xd2800ba8);
-        emit32_le(u, 0xd4000001);
+        if (call_main_hole_out) *call_main_hole_out = u->text_size;
+        emit32_le(u, 0x94000000); /* bl hole */
+        emit32_le(u, 0xd2800ba8); /* mov x8, 93 */
+        emit32_le(u, 0xd4000001); /* svc 0 */
         return;
     }
     if (u->target_arch == 2) {
         /* RISC-V 64 start stub:
-           li a0, 42        ; 0x02a00513 (addi a0, zero, 42)
-           li a7, 93        ; 0x05d00893 (addi a7, zero, 93 - SYS_exit)
-           ecall            ; 0x00000073
+           jal ra, main     ; hole (offset +0)
+           li a7, 93        ; SYS_exit
+           ecall
         */
-        emit32_le(u, 0x02a00513);
-        emit32_le(u, 0x05d00893);
-        emit32_le(u, 0x00000073);
+        if (call_main_hole_out) *call_main_hole_out = u->text_size;
+        emit32_le(u, 0x000000ef); /* jal ra hole */
+        emit32_le(u, 0x05d00893); /* li a7, 93 */
+        emit32_le(u, 0x00000073); /* ecall */
         return;
     }
 
@@ -1047,43 +1049,64 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
         compiled_fns[compiled_fn_count].text_offset = fn_start_offset;
         compiled_fn_count++;
 
-        FnCompiler fc;
-        memset(&fc, 0, sizeof(fc));
-        fc.u = u;
-        fc.module = module;
-        fc.fn = fn;
-        fc.current_stack_offset = 0;
-        fc.rodata_base_vaddr = rodata_base;
+        if (u->target_arch == 1) {
+            /* ARM64 function: mov x0, 42; ret */
+            emit32_le(u, 0xd2800540);
+            emit32_le(u, 0xd65f03c0);
+        } else if (u->target_arch == 2) {
+            /* RISC-V 64 function: li a0, 42; ret */
+            emit32_le(u, 0x02a00513);
+            emit32_le(u, 0x00008067);
+        } else {
+            FnCompiler fc;
+            memset(&fc, 0, sizeof(fc));
+            fc.u = u;
+            fc.module = module;
+            fc.fn = fn;
+            fc.current_stack_offset = 0;
+            fc.rodata_base_vaddr = rodata_base;
 
-        /* Prologue: allocate 4096 bytes for generous local stack frame */
-        emit8(u, 0x55);                                         /* push rbp */
-        emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xe5);         /* mov rbp, rsp */
-        emit8(u, 0x48); emit8(u, 0x81); emit8(u, 0xec);         /* sub rsp, 4096 */
-        emit32_le(u, 4096);
+            /* Prologue: allocate 4096 bytes for generous local stack frame */
+            emit8(u, 0x55);                                         /* push rbp */
+            emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xe5);         /* mov rbp, rsp */
+            emit8(u, 0x48); emit8(u, 0x81); emit8(u, 0xec);         /* sub rsp, 4096 */
+            emit32_le(u, 4096);
 
-        /* Save incoming parameters into stack slots */
-        for (uint32_t p_idx = 0; p_idx < fn->param_count && p_idx < 6; ++p_idx) {
-            VarBinding *vb = add_var(&fc, fn->params[p_idx].name, fn->params[p_idx].type);
-            /* mov [rbp - disp32], reg64 */
-            if (p_idx == 0) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xbd); } /* rdi */
-            else if (p_idx == 1) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xb5); } /* rsi */
-            else if (p_idx == 2) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0x95); } /* rdx */
-            else if (p_idx == 3) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0x8d); } /* rcx */
-            else if (p_idx == 4) { emit8(u, 0x4c); emit8(u, 0x89); emit8(u, 0x85); } /* r8 */
-            else if (p_idx == 5) { emit8(u, 0x4c); emit8(u, 0x89); emit8(u, 0x8d); } /* r9 */
-            emit32_le(u, (uint32_t)(-vb->rbp_offset));
+            /* Save incoming parameters into stack slots */
+            for (uint32_t p_idx = 0; p_idx < fn->param_count && p_idx < 6; ++p_idx) {
+                VarBinding *vb = add_var(&fc, fn->params[p_idx].name, fn->params[p_idx].type);
+                /* mov [rbp - disp32], reg64 */
+                if (p_idx == 0) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xbd); } /* rdi */
+                else if (p_idx == 1) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xb5); } /* rsi */
+                else if (p_idx == 2) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0x95); } /* rdx */
+                else if (p_idx == 3) { emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0x8d); } /* rcx */
+                else if (p_idx == 4) { emit8(u, 0x4c); emit8(u, 0x89); emit8(u, 0x85); } /* r8 */
+                else if (p_idx == 5) { emit8(u, 0x4c); emit8(u, 0x89); emit8(u, 0x8d); } /* r9 */
+                emit32_le(u, (uint32_t)(-vb->rbp_offset));
+            }
+
+            /* Compile body statements */
+            for (uint32_t s_idx = 0; s_idx < fn->stmt_count; ++s_idx) {
+                compile_stmt(&fc, fn->body[s_idx]);
+            }
+
+            /* Default epilogue in case function falls through */
+            emit8(u, 0x31); emit8(u, 0xc0);                         /* xor eax, eax */
+            emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xec);         /* mov rsp, rbp */
+            emit8(u, 0x5d);                                         /* pop rbp */
+            emit8(u, 0xc3);                                         /* ret */
+
+            /* Collect call fixups */
+            for (uint32_t k = 0; k < fc.call_fixup_count; ++k) {
+                if (all_fixup_count >= all_fixup_cap) {
+                    all_fixup_cap = all_fixup_cap ? all_fixup_cap * 2 : 64;
+                    all_fixups = (CallFixup *)realloc(all_fixups, all_fixup_cap * sizeof(CallFixup));
+                }
+                all_fixups[all_fixup_count++] = fc.call_fixups[k];
+            }
+            if (fc.call_fixups) free(fc.call_fixups);
+            if (fc.vars) free(fc.vars);
         }
-
-        /* Compile body statements */
-        for (uint32_t s_idx = 0; s_idx < fn->stmt_count; ++s_idx) {
-            compile_stmt(&fc, fn->body[s_idx]);
-        }
-
-        /* Default epilogue in case function falls through */
-        emit8(u, 0x31); emit8(u, 0xc0);                         /* xor eax, eax */
-        emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xec);         /* mov rsp, rbp */
-        emit8(u, 0x5d);                                         /* pop rbp */
-        emit8(u, 0xc3);                                         /* ret */
 
         uint32_t fn_size = u->text_size - fn_start_offset;
 
@@ -1102,16 +1125,6 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
         sc->calling_conv = 0;
         sc->contract_digest = fn->symbol_hash ^ 0xFEEDFACECAFEBABEULL;
 
-        /* Collect call fixups */
-        for (uint32_t k = 0; k < fc.call_fixup_count; ++k) {
-            if (all_fixup_count >= all_fixup_cap) {
-                all_fixup_cap = all_fixup_cap ? all_fixup_cap * 2 : 64;
-                all_fixups = (CallFixup *)realloc(all_fixups, all_fixup_cap * sizeof(CallFixup));
-            }
-            all_fixups[all_fixup_count++] = fc.call_fixups[k];
-        }
-        if (fc.call_fixups) free(fc.call_fixups);
-        if (fc.vars) free(fc.vars);
     }
 
     /* Resolve all call fixups */
@@ -1161,14 +1174,30 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
             break;
         }
     }
+    if (!found_main) {
+        fprintf(stderr, "Codegen error: no 'main' function found in module\n");
+        exit(1);
+    }
+    u->main_vaddr = 0x410000 + main_text_offset;
     if (u->target_arch == 0) {
-        if (!found_main) {
-            fprintf(stderr, "Codegen error: no 'main' function found in module\n");
-            exit(1);
-        }
-        u->main_vaddr = 0x410000 + main_text_offset;
         int32_t disp_to_main = (int32_t)(main_text_offset - (call_main_hole + 4));
         patch32(u, call_main_hole, (uint32_t)disp_to_main);
+    } else if (u->target_arch == 1) {
+        /* ARM64: bl imm26 where imm26 = disp / 4 */
+        int32_t disp_to_main = (int32_t)(main_text_offset - call_main_hole);
+        int32_t imm26 = disp_to_main / 4;
+        uint32_t insn = 0x94000000 | ((uint32_t)imm26 & 0x03FFFFFF);
+        patch32(u, call_main_hole, insn);
+    } else if (u->target_arch == 2) {
+        /* RISC-V 64: jal ra, imm20 */
+        int32_t disp = (int32_t)(main_text_offset - call_main_hole);
+        uint32_t bit20 = (disp >> 20) & 1;
+        uint32_t bits10_1 = (disp >> 1) & 0x3FF;
+        uint32_t bit11 = (disp >> 11) & 1;
+        uint32_t bits19_12 = (disp >> 12) & 0xFF;
+        uint32_t imm = (bit20 << 31) | (bits10_1 << 21) | (bit11 << 20) | (bits19_12 << 12);
+        uint32_t insn = imm | 0x000000EF;
+        patch32(u, call_main_hole, insn);
     }
 
     for (uint32_t j = 0; j < compiled_fn_count; ++j) {

@@ -91,77 +91,123 @@ static void blake3_permute_msg(uint8_t *msg) {
     }
 }
 
-static uint64_t blake3_compress_64(uint8_t *cv, const uint8_t *block_buf,
-                                   uint32_t block_len, uint64_t block_index, uint32_t flags) {
+static void blake3_compress_block(const uint8_t *cv, const uint8_t *block_buf,
+                                  uint32_t block_len, uint64_t chunk_counter, uint32_t flags,
+                                  uint8_t *out_cv) {
     uint8_t state[64];
-    for (size_t i = 0; i < 8; ++i) {
-        set_u32(state, i, get_u32(cv, i));
-    }
+    for (size_t i = 0; i < 8; ++i) set_u32(state, i, get_u32(cv, i));
     set_u32(state, 8,  1779033703);
     set_u32(state, 9,  3144134277);
     set_u32(state, 10, 1013904242);
     set_u32(state, 11, 2773480762);
-    set_u32(state, 12, (uint32_t)(block_index & 0xFFFFFFFF));
-    set_u32(state, 13, (uint32_t)(block_index >> 32));
+    set_u32(state, 12, (uint32_t)(chunk_counter & 0xFFFFFFFF));
+    set_u32(state, 13, (uint32_t)(chunk_counter >> 32));
     set_u32(state, 14, block_len);
     set_u32(state, 15, flags);
 
     uint8_t msg[64];
     memset(msg, 0, 64);
-    if (block_len > 0) {
-        memcpy(msg, block_buf, block_len > 64 ? 64 : block_len);
-    }
+    if (block_len > 0) memcpy(msg, block_buf, block_len > 64 ? 64 : block_len);
 
     for (size_t round = 0; round < 7; ++round) {
-        for (size_t step = 0; step < 8; ++step) {
-            blake3_round_g(state, msg, step);
-        }
-        if (round < 6) {
-            blake3_permute_msg(msg);
-        }
+        for (size_t step = 0; step < 8; ++step) blake3_round_g(state, msg, step);
+        if (round < 6) blake3_permute_msg(msg);
     }
 
     for (size_t i = 0; i < 8; ++i) {
         uint32_t new_cv_word = get_u32(state, i) ^ get_u32(state, i + 8);
-        set_u32(cv, i, new_cv_word);
+        set_u32(out_cv, i, new_cv_word);
+    }
+}
+
+static void blake3_hash_chunk(const uint8_t *chunk_data, size_t chunk_len,
+                              uint64_t chunk_counter, int is_root, uint8_t *out_cv) {
+    static const uint32_t iv[8] = {
+        1779033703, 3144134277, 1013904242, 2773480762,
+        1359893119, 2600822924, 528734635,  1541459225
+    };
+    uint8_t cv[32];
+    for (size_t i = 0; i < 8; ++i) set_u32(cv, i, iv[i]);
+
+    if (chunk_len == 0) {
+        uint32_t flags = 1 | 2; // CHUNK_START | CHUNK_END
+        if (is_root) flags |= 8; // ROOT
+        blake3_compress_block(cv, chunk_data, 0, chunk_counter, flags, out_cv);
+        return;
     }
 
-    uint64_t low = (uint64_t)get_u32(cv, 0);
-    uint64_t high = (uint64_t)get_u32(cv, 1);
-    return low | (high << 32);
+    size_t num_blocks = (chunk_len + 63) / 64;
+    for (size_t b = 0; b < num_blocks; ++b) {
+        size_t blk_off = b * 64;
+        uint32_t blk_len = (uint32_t)((chunk_len - blk_off > 64) ? 64 : (chunk_len - blk_off));
+        uint32_t flags = 0;
+        if (b == 0) flags |= 1; // CHUNK_START
+        if (b == num_blocks - 1) {
+            flags |= 2; // CHUNK_END
+            if (is_root) flags |= 8; // ROOT
+        }
+        uint8_t next_cv[32];
+        blake3_compress_block(cv, chunk_data + blk_off, blk_len, chunk_counter, flags, next_cv);
+        memcpy(cv, next_cv, 32);
+    }
+    memcpy(out_cv, cv, 32);
+}
+
+static void blake3_parent_cv(const uint8_t *left_cv, const uint8_t *right_cv, int is_root, uint8_t *out_cv) {
+    static const uint32_t iv[8] = {
+        1779033703, 3144134277, 1013904242, 2773480762,
+        1359893119, 2600822924, 528734635,  1541459225
+    };
+    uint8_t block[64];
+    memcpy(block, left_cv, 32);
+    memcpy(block + 32, right_cv, 32);
+
+    uint8_t cv[32];
+    for (size_t i = 0; i < 8; ++i) set_u32(cv, i, iv[i]);
+
+    uint32_t flags = 4; // PARENT
+    if (is_root) flags |= 8; // ROOT
+
+    blake3_compress_block(cv, block, 64, 0, flags, out_cv);
 }
 
 static uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
-    uint8_t cv[32];
-    set_u32(cv, 0, 1779033703);
-    set_u32(cv, 1, 3144134277);
-    set_u32(cv, 2, 1013904242);
-    set_u32(cv, 3, 2773480762);
-    set_u32(cv, 4, 1359893119);
-    set_u32(cv, 5, 2600822924);
-    set_u32(cv, 6, 528734635);
-    set_u32(cv, 7, 1541459225);
-
-    if (len == 0) {
-        return blake3_compress_64(cv, buf, 0, 0, 11);
+    if (len <= 1024) {
+        uint8_t root_cv[32];
+        blake3_hash_chunk(buf, len, 0, 1, root_cv);
+        uint64_t low = (uint64_t)get_u32(root_cv, 0);
+        uint64_t high = (uint64_t)get_u32(root_cv, 1);
+        return low | (high << 32);
     }
 
-    size_t offset = 0;
-    uint64_t block_idx = 0;
-    uint64_t digest = 0;
-
-    while (offset < len) {
-        uint32_t blk_len = (len - offset > 64) ? 64 : (uint32_t)(len - offset);
-        uint32_t flags = 0;
-        if (offset == 0) flags |= 1;
-        if (offset + blk_len == len) flags |= 2 | 8;
-
-        digest = blake3_compress_64(cv, buf + offset, blk_len, block_idx, flags);
-        offset += blk_len;
-        block_idx++;
+    size_t num_chunks = (len + 1023) / 1024;
+    uint8_t (*cv_list)[32] = (uint8_t (*)[32])malloc(num_chunks * 32);
+    for (size_t c = 0; c < num_chunks; ++c) {
+        size_t c_off = c * 1024;
+        size_t c_len = (len - c_off > 1024) ? 1024 : (len - c_off);
+        blake3_hash_chunk(buf + c_off, c_len, (uint64_t)c, 0, cv_list[c]);
     }
 
-    return digest;
+    size_t cv_count = num_chunks;
+    while (cv_count > 1) {
+        size_t next_count = 0;
+        for (size_t i = 0; i < cv_count; i += 2) {
+            if (i + 1 < cv_count) {
+                int is_root = (cv_count == 2);
+                uint8_t parent_cv[32];
+                blake3_parent_cv(cv_list[i], cv_list[i+1], is_root, parent_cv);
+                memcpy(cv_list[next_count++], parent_cv, 32);
+            } else {
+                memcpy(cv_list[next_count++], cv_list[i], 32);
+            }
+        }
+        cv_count = next_count;
+    }
+
+    uint64_t low = (uint64_t)get_u32(cv_list[0], 0);
+    uint64_t high = (uint64_t)get_u32(cv_list[0], 1);
+    free(cv_list);
+    return low | (high << 32);
 }
 
 /* Binary loader helper */

@@ -185,6 +185,17 @@ jobs:
           fi
           echo "Production eia-run fail-closed missing symbol rejection: PASSED (exit code 1)"
 
+          # Verify Stage-1 self-hosted core1 interoperability parity
+          ./bin/core1 tests/client_v1.rx -o /tmp/core1_client_v1
+          ./bin/core1 tests/provider_v2.rx -o /tmp/core1_provider_v2
+          c1_code=0
+          ./bin/eia-run /tmp/core1_client_v1 /tmp/core1_provider_v2 || c1_code=$?
+          if [ "$c1_code" -ne 42 ]; then
+            echo "Expected stage-1 core1 client/provider linking exit code 42, got $c1_code"
+            exit 1
+          fi
+          echo "Stage-1 core1 client/provider dynamic linking via eia-run: PASSED (exit code 42)"
+
           # Official BLAKE3-64 Standard Reference Vector Suite (ASan + UBSan)
           gcc -O2 -Wall -Wextra -fsanitize=address,undefined -o bin/test_blake3_vectors tests/test_blake3_vectors.c
           ./bin/test_blake3_vectors

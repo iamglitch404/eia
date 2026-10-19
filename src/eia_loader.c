@@ -99,16 +99,17 @@ static void blake3_permute_msg(uint8_t *msg) {
     }
 }
 
-static uint64_t blake3_compress_64(uint8_t *cv, const uint8_t *block_buf,
-                                   uint32_t block_len, uint64_t block_index, uint32_t flags) {
+static void blake3_compress_block(const uint8_t *cv, const uint8_t *block_buf,
+                                  uint32_t block_len, uint64_t chunk_counter, uint32_t flags,
+                                  uint8_t *out_cv) {
     uint8_t state[64];
     for (size_t i = 0; i < 8; ++i) set_u32(state, i, get_u32(cv, i));
     set_u32(state, 8,  1779033703);
     set_u32(state, 9,  3144134277);
     set_u32(state, 10, 1013904242);
     set_u32(state, 11, 2773480762);
-    set_u32(state, 12, (uint32_t)(block_index & 0xFFFFFFFF));
-    set_u32(state, 13, (uint32_t)(block_index >> 32));
+    set_u32(state, 12, (uint32_t)(chunk_counter & 0xFFFFFFFF));
+    set_u32(state, 13, (uint32_t)(chunk_counter >> 32));
     set_u32(state, 14, block_len);
     set_u32(state, 15, flags);
 
@@ -123,43 +124,98 @@ static uint64_t blake3_compress_64(uint8_t *cv, const uint8_t *block_buf,
 
     for (size_t i = 0; i < 8; ++i) {
         uint32_t new_cv_word = get_u32(state, i) ^ get_u32(state, i + 8);
-        set_u32(cv, i, new_cv_word);
+        set_u32(out_cv, i, new_cv_word);
+    }
+}
+
+static void blake3_hash_chunk(const uint8_t *chunk_data, size_t chunk_len,
+                              uint64_t chunk_counter, int is_root, uint8_t *out_cv) {
+    static const uint32_t iv[8] = {
+        1779033703, 3144134277, 1013904242, 2773480762,
+        1359893119, 2600822924, 528734635,  1541459225
+    };
+    uint8_t cv[32];
+    for (size_t i = 0; i < 8; ++i) set_u32(cv, i, iv[i]);
+
+    if (chunk_len == 0) {
+        uint32_t flags = 1 | 2; // CHUNK_START | CHUNK_END
+        if (is_root) flags |= 8; // ROOT
+        blake3_compress_block(cv, chunk_data, 0, chunk_counter, flags, out_cv);
+        return;
     }
 
-    uint64_t low = (uint64_t)get_u32(cv, 0);
-    uint64_t high = (uint64_t)get_u32(cv, 1);
-    return low | (high << 32);
+    size_t num_blocks = (chunk_len + 63) / 64;
+    for (size_t b = 0; b < num_blocks; ++b) {
+        size_t blk_off = b * 64;
+        uint32_t blk_len = (uint32_t)((chunk_len - blk_off > 64) ? 64 : (chunk_len - blk_off));
+        uint32_t flags = 0;
+        if (b == 0) flags |= 1; // CHUNK_START
+        if (b == num_blocks - 1) {
+            flags |= 2; // CHUNK_END
+            if (is_root) flags |= 8; // ROOT
+        }
+        uint8_t next_cv[32];
+        blake3_compress_block(cv, chunk_data + blk_off, blk_len, chunk_counter, flags, next_cv);
+        memcpy(cv, next_cv, 32);
+    }
+    memcpy(out_cv, cv, 32);
+}
+
+static void blake3_parent_cv(const uint8_t *left_cv, const uint8_t *right_cv, int is_root, uint8_t *out_cv) {
+    static const uint32_t iv[8] = {
+        1779033703, 3144134277, 1013904242, 2773480762,
+        1359893119, 2600822924, 528734635,  1541459225
+    };
+    uint8_t block[64];
+    memcpy(block, left_cv, 32);
+    memcpy(block + 32, right_cv, 32);
+
+    uint8_t cv[32];
+    for (size_t i = 0; i < 8; ++i) set_u32(cv, i, iv[i]);
+
+    uint32_t flags = 4; // PARENT
+    if (is_root) flags |= 8; // ROOT
+
+    blake3_compress_block(cv, block, 64, 0, flags, out_cv);
 }
 
 static uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
-    uint8_t cv[32];
-    set_u32(cv, 0, 1779033703);
-    set_u32(cv, 1, 3144134277);
-    set_u32(cv, 2, 1013904242);
-    set_u32(cv, 3, 2773480762);
-    set_u32(cv, 4, 1359893119);
-    set_u32(cv, 5, 2600822924);
-    set_u32(cv, 6, 528734635);
-    set_u32(cv, 7, 1541459225);
-
-    if (len == 0) return blake3_compress_64(cv, buf, 0, 0, 11);
-
-    size_t offset = 0;
-    uint64_t block_idx = 0;
-    uint64_t digest = 0;
-
-    while (offset < len) {
-        uint32_t blk_len = (len - offset > 64) ? 64 : (uint32_t)(len - offset);
-        uint32_t flags = 0;
-        if (offset == 0) flags |= 1;
-        if (offset + blk_len == len) flags |= 2 | 8;
-
-        digest = blake3_compress_64(cv, buf + offset, blk_len, block_idx, flags);
-        offset += blk_len;
-        block_idx++;
+    if (len <= 1024) {
+        uint8_t root_cv[32];
+        blake3_hash_chunk(buf, len, 0, 1, root_cv);
+        uint64_t low = (uint64_t)get_u32(root_cv, 0);
+        uint64_t high = (uint64_t)get_u32(root_cv, 1);
+        return low | (high << 32);
     }
 
-    return digest;
+    size_t num_chunks = (len + 1023) / 1024;
+    uint8_t (*cv_list)[32] = (uint8_t (*)[32])malloc(num_chunks * 32);
+    for (size_t c = 0; c < num_chunks; ++c) {
+        size_t c_off = c * 1024;
+        size_t c_len = (len - c_off > 1024) ? 1024 : (len - c_off);
+        blake3_hash_chunk(buf + c_off, c_len, (uint64_t)c, 0, cv_list[c]);
+    }
+
+    size_t cv_count = num_chunks;
+    while (cv_count > 1) {
+        size_t next_count = 0;
+        for (size_t i = 0; i < cv_count; i += 2) {
+            if (i + 1 < cv_count) {
+                int is_root = (cv_count == 2);
+                uint8_t parent_cv[32];
+                blake3_parent_cv(cv_list[i], cv_list[i+1], is_root, parent_cv);
+                memcpy(cv_list[next_count++], parent_cv, 32);
+            } else {
+                memcpy(cv_list[next_count++], cv_list[i], 32);
+            }
+        }
+        cv_count = next_count;
+    }
+
+    uint64_t low = (uint64_t)get_u32(cv_list[0], 0);
+    uint64_t high = (uint64_t)get_u32(cv_list[0], 1);
+    free(cv_list);
+    return low | (high << 32);
 }
 
 /* Binary artifact representation */
@@ -281,6 +337,31 @@ static inline void hasi_cache_sync(void) {
 #endif
 }
 
+/* Instruction shape validation: ensures patch site is an LEA or MOV memory disp32 */
+static int validate_field_insn_shape(const uint8_t *code, uint32_t insn_offset) {
+    if (insn_offset >= 3) {
+        uint8_t op = code[insn_offset - 2];
+        uint8_t modrm = code[insn_offset - 1];
+        if ((op == 0x8D || op == 0x8B || op == 0x89) && ((modrm & 0xC0) == 0x80)) {
+            return EIA_SUCCESS;
+        }
+    }
+    if (insn_offset >= 4) {
+        uint8_t op = code[insn_offset - 3];
+        uint8_t modrm = code[insn_offset - 2];
+        if ((op == 0x8D || op == 0x8B || op == 0x89) && ((modrm & 0xC0) == 0x80)) {
+            return EIA_SUCCESS;
+        }
+    }
+    return EIA_ERR_BAD_INSN;
+}
+
+static int cmp_u32(const void *a, const void *b) {
+    uint32_t ua = *(const uint32_t *)a;
+    uint32_t ub = *(const uint32_t *)b;
+    return (ua > ub) - (ua < ub);
+}
+
 /* Locate Universal Hologram Header dynamically */
 static const UniversalHologramHeader *find_hologram(const uint8_t *data, size_t size) {
     /* 1. Probe native ELF offset (0x80) */
@@ -312,6 +393,12 @@ static LoadedBinary *load_binary(const char *path) {
     size_t sz = ftell(f);
     fseek(f, 0, SEEK_SET);
 
+    if (sz < 0x80 + sizeof(UniversalHologramHeader)) {
+        fprintf(stderr, "[EIA ERROR] '%s' is too small to be a valid EIA binary\n", path);
+        fclose(f);
+        return NULL;
+    }
+
     uint8_t *data = (uint8_t *)malloc(sz);
     if (!data || fread(data, 1, sz, f) != sz) {
         fprintf(stderr, "[EIA ERROR] Failed to read '%s'\n", path);
@@ -328,15 +415,41 @@ static LoadedBinary *load_binary(const char *path) {
         return NULL;
     }
 
-    /* Verify cryptographic BLAKE3-64 integrity */
-    uint64_t tables_len = (holo->contracts_count * sizeof(SymbolContract)) +
-                          (holo->relocs_count * sizeof(EiaRelocHole)) +
-                          holo->type_graph_size;
+    /* Harden bounds & arithmetic overflow checks */
+    if (holo->contracts_count > 65536 || holo->relocs_count > 65536 || holo->type_graph_size > 16*1024*1024) {
+        fprintf(stderr, "[EIA ERROR] '%s': Hologram table counts or type graph size exceed limits\n", path);
+        free(data);
+        return NULL;
+    }
+    if (holo->contracts_offset > sz ||
+        holo->contracts_count > (sz - holo->contracts_offset) / sizeof(SymbolContract)) {
+        fprintf(stderr, "[EIA ERROR] '%s': Contracts table exceeds file bounds\n", path);
+        free(data);
+        return NULL;
+    }
+    if (holo->relocs_offset > sz ||
+        holo->relocs_count > (sz - holo->relocs_offset) / sizeof(EiaRelocHole)) {
+        fprintf(stderr, "[EIA ERROR] '%s': Relocations table exceeds file bounds\n", path);
+        free(data);
+        return NULL;
+    }
+    if (holo->type_graph_offset > sz ||
+        holo->type_graph_size > (sz - holo->type_graph_offset)) {
+        fprintf(stderr, "[EIA ERROR] '%s': Type graph exceeds file bounds\n", path);
+        free(data);
+        return NULL;
+    }
+
+    uint64_t c_bytes = holo->contracts_count * sizeof(SymbolContract);
+    uint64_t r_bytes = holo->relocs_count * sizeof(EiaRelocHole);
+    uint64_t tables_len = c_bytes + r_bytes + holo->type_graph_size;
     if (holo->contracts_offset + tables_len > sz) {
         fprintf(stderr, "[EIA ERROR] '%s': Hologram tables overflow file size\n", path);
         free(data);
         return NULL;
     }
+
+    /* Verify cryptographic BLAKE3-64 integrity */
     uint64_t computed_root = blake3_hash64(data + holo->contracts_offset, tables_len);
     if (computed_root != holo->blake3_root) {
         fprintf(stderr, "[EIA ERROR] '%s': Hologram cryptographic integrity mismatch!\n"
@@ -485,9 +598,18 @@ int main(int argc, char **argv) {
         }
     }
 
+    #define MAX_PROVIDERS 64
+    if (provider_count > MAX_PROVIDERS) {
+        fprintf(stderr, "[EIA ERROR] Too many provider artifacts specified (%d > %d)\n", provider_count, MAX_PROVIDERS);
+        free(client->file_data);
+        free(client);
+        return 1;
+    }
+
     /* 6. Validate and Patch Relocations across Client & Providers */
-    LoadedBinary *all_bins[32];
     int all_bin_count = 1 + provider_count;
+    LoadedBinary **all_bins = (LoadedBinary **)calloc(all_bin_count, sizeof(LoadedBinary *));
+    if (!all_bins) return 1;
     all_bins[0] = client;
     for (int i = 0; i < provider_count; ++i) all_bins[1 + i] = providers[i];
 
@@ -495,15 +617,33 @@ int main(int argc, char **argv) {
         LoadedBinary *curr = all_bins[b];
 
         /* Overlap validation */
-        for (size_t i = 0; i < curr->reloc_count; ++i) {
-            for (size_t j = i + 1; j < curr->reloc_count; ++j) {
-                int64_t diff = (int64_t)curr->relocs[i].insn_offset - (int64_t)curr->relocs[j].insn_offset;
-                if (diff >= -3 && diff <= 3) {
+        if (curr->reloc_count <= 64) {
+            for (size_t i = 0; i < curr->reloc_count; ++i) {
+                for (size_t j = i + 1; j < curr->reloc_count; ++j) {
+                    int64_t diff = (int64_t)curr->relocs[i].insn_offset - (int64_t)curr->relocs[j].insn_offset;
+                    if (diff >= -3 && diff <= 3) {
+                        fprintf(stderr, "[EIA ERROR] Relocation overlap at offset 0x%x in '%s'\n",
+                                curr->relocs[i].insn_offset, curr->path);
+                        free(all_bins);
+                        return 1;
+                    }
+                }
+            }
+        } else {
+            uint32_t *sorted_offs = (uint32_t *)malloc(curr->reloc_count * sizeof(uint32_t));
+            if (!sorted_offs) { free(all_bins); return 1; }
+            for (size_t i = 0; i < curr->reloc_count; ++i) sorted_offs[i] = curr->relocs[i].insn_offset;
+            qsort(sorted_offs, curr->reloc_count, sizeof(uint32_t), cmp_u32);
+            for (size_t i = 1; i < curr->reloc_count; ++i) {
+                if (sorted_offs[i] - sorted_offs[i-1] < 4) {
                     fprintf(stderr, "[EIA ERROR] Relocation overlap at offset 0x%x in '%s'\n",
-                            curr->relocs[i].insn_offset, curr->path);
+                            sorted_offs[i], curr->path);
+                    free(sorted_offs);
+                    free(all_bins);
                     return 1;
                 }
             }
+            free(sorted_offs);
         }
 
         for (size_t r = 0; r < curr->reloc_count; ++r) {
@@ -512,16 +652,25 @@ int main(int argc, char **argv) {
             if (hole->insn_offset + 4 > curr->text_size) {
                 fprintf(stderr, "[EIA ERROR] Relocation out of bounds in '%s' (insn_offset=0x%x)\n",
                         curr->path, hole->insn_offset);
+                free(all_bins);
                 return 1;
             }
 
             uint8_t *patch_site = v_write + curr->arena_offset + hole->insn_offset;
 
             if (hole->patch_kind == EIA_PATCH_FIELD_DISP32) {
+                if (validate_field_insn_shape(v_write + curr->arena_offset, hole->insn_offset) != EIA_SUCCESS) {
+                    fprintf(stderr, "[EIA ERROR] Invalid instruction shape for field displacement hole at 0x%x in '%s'\n",
+                            hole->insn_offset, curr->path);
+                    free(all_bins);
+                    return 1;
+                }
+
                 const TypeFieldHashEntry *f = lookup_type_field(field_table, hole->type_sig_hash, hole->field_or_sym_hash);
                 if (!f) {
                     fprintf(stderr, "[EIA ERROR] Field resolution failed for hash 0x%016lx in '%s'\n",
                             (unsigned long)hole->field_or_sym_hash, curr->path);
+                    free(all_bins);
                     return 1;
                 }
 
@@ -534,6 +683,7 @@ int main(int argc, char **argv) {
                             fprintf(stderr, "[EIA ERROR] Schema rejection: field narrowing unsupported for type 0x%016lx field 0x%016lx (expected %u bytes, provider has %u bytes)\n",
                                     (unsigned long)hole->type_sig_hash, (unsigned long)hole->field_or_sym_hash,
                                     expected_size, f->field_size);
+                            free(all_bins);
                             return 1;
                         }
                         break;
@@ -550,6 +700,7 @@ int main(int argc, char **argv) {
                 if (!s) {
                     fprintf(stderr, "[EIA ERROR] Unresolved external symbol: hash 0x%016lx in '%s'\n",
                             (unsigned long)hole->field_or_sym_hash, curr->path);
+                    free(all_bins);
                     return 1;
                 }
 
@@ -561,12 +712,14 @@ int main(int argc, char **argv) {
                             fprintf(stderr, "[EIA ERROR] Signature mismatch for symbol 0x%016lx: caller '%s' expects %u params, callee '%s' exports %u params\n",
                                     (unsigned long)hole->field_or_sym_hash, curr->path,
                                     curr->contracts[c].param_count, s->binary_name, s->param_count);
+                            free(all_bins);
                             return 1;
                         }
                         if (curr->contracts[c].calling_conv != s->calling_conv) {
                             fprintf(stderr, "[EIA ERROR] Calling convention mismatch for symbol 0x%016lx: caller '%s' conv %u, callee '%s' conv %u\n",
                                     (unsigned long)hole->field_or_sym_hash, curr->path,
                                     curr->contracts[c].calling_conv, s->binary_name, s->calling_conv);
+                            free(all_bins);
                             return 1;
                         }
                         break;
@@ -577,6 +730,7 @@ int main(int argc, char **argv) {
                 if (hole->insn_offset > 0 && patch_site[-1] != 0xE8) {
                     fprintf(stderr, "[EIA ERROR] Invalid instruction shape for symbol call at 0x%x in '%s' (expected 0xE8, got 0x%02x)\n",
                             hole->insn_offset, curr->path, patch_site[-1]);
+                    free(all_bins);
                     return 1;
                 }
 
@@ -585,6 +739,7 @@ int main(int argc, char **argv) {
                 int64_t rel_disp = (int64_t)target_exec_vaddr - (int64_t)(call_site_exec + 4);
                 if (rel_disp < -2147483648LL || rel_disp > 2147483647LL) {
                     fprintf(stderr, "[EIA ERROR] Inter-binary displacement exceeds 32-bit range\n");
+                    free(all_bins);
                     return 1;
                 }
 
@@ -596,6 +751,9 @@ int main(int argc, char **argv) {
             }
         }
     }
+
+    free(all_bins);
+    all_bins = NULL;
 
     /* 7. HASI Cache pipeline synchronization */
     hasi_cache_sync();

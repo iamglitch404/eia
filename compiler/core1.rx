@@ -126,6 +126,7 @@ fn classify_keyword(h: u64) -> u32 {
     if h == 5560783464435099345  { return 22; } // u32
     if h == 631772817358541784   { return 23; } // u8
     if h == 3563412735833858527  { return 24; } // void
+    if h == 417800907370030071   { return 25; } // extern
     return 1; // TOK_IDENT
 }
 
@@ -485,6 +486,26 @@ fn parse_expr_prec(p: *mut Parser, min_prec: u32) -> *mut AstNode {
             idx.child2 = parse_expr_prec(p, 0);
             parser_expect(p, 65);
             left = idx;
+        } else if p.cur_tok.kind == 60 { // '(' function call
+            parser_expect(p, 60);
+            let call_node: *mut AstNode = alloc_node(p, 113); // NODE_CALL
+            call_node.child1 = left;
+            call_node.hash = left.hash;
+            let mut last_arg: *mut AstNode = 0 as *mut AstNode;
+            while p.cur_tok.kind != 61 && p.cur_tok.kind != 0 {
+                let arg: *mut AstNode = parse_expr_prec(p, 0);
+                if last_arg == (0 as *mut AstNode) {
+                    call_node.child2 = arg;
+                } else {
+                    last_arg.next = arg;
+                }
+                last_arg = arg;
+                if p.cur_tok.kind == 72 { // ','
+                    parser_expect(p, 72);
+                }
+            }
+            parser_expect(p, 61); // ')'
+            left = call_node;
         } else {
             postfix_loop = 0;
         }
@@ -679,11 +700,27 @@ fn parse_fn(p: *mut Parser) -> *mut AstNode {
     parser_expect(p, 1);
     parser_expect(p, 60); // '('
 
+    let mut last_param: *mut AstNode = 0 as *mut AstNode;
     while p.cur_tok.kind != 61 && p.cur_tok.kind != 0 {
+        let pnode: *mut AstNode = alloc_node(p, 101); // NODE_PARAM
+        pnode.hash = p.cur_tok.hash;
         parser_expect(p, 1);
-        parser_expect(p, 70);
+        parser_expect(p, 70); // ':'
+        let mut is_ptr: u32 = 0;
+        if p.cur_tok.kind == 50 { parser_expect(p, 50); is_ptr = 1; } // '&'
+        if p.cur_tok.kind == 13 { parser_expect(p, 13); }             // 'mut'
+        if p.cur_tok.kind == 32 { parser_expect(p, 32); is_ptr = 1; } // '*'
+        if p.cur_tok.kind == 13 { parser_expect(p, 13); }             // 'mut'
+        pnode.val = p.cur_tok.hash;
+        pnode.is_mut = is_ptr;
         lex_next_token(p.lex, &mut p.cur_tok);
-        if p.cur_tok.kind == 72 {
+        if last_param == (0 as *mut AstNode) {
+            fnode.child2 = pnode;
+        } else {
+            last_param.next = pnode;
+        }
+        last_param = pnode;
+        if p.cur_tok.kind == 72 { // ','
             parser_expect(p, 72);
         }
     }
@@ -798,6 +835,15 @@ fn cg_add_reloc(cg: *mut CodeGen, insn_offset: u32, type_hash: u64, field_hash: 
     hole.patch_kind = 1; // EIA_PATCH_FIELD_DISP32
     hole.type_sig_hash = type_hash;
     hole.field_or_sym_hash = field_hash;
+    cg.reloc_count = cg.reloc_count + 1;
+}
+
+fn cg_add_reloc_ex(cg: *mut CodeGen, insn_offset: u32, patch_kind: u32, type_hash: u64, field_or_sym_hash: u64) {
+    let hole: *mut EiaRelocHole = ((cg.relocs as *mut u8) + ((cg.reloc_count as u64) * 24)) as *mut EiaRelocHole;
+    hole.insn_offset = insn_offset;
+    hole.patch_kind = patch_kind;
+    hole.type_sig_hash = type_hash;
+    hole.field_or_sym_hash = field_or_sym_hash;
     cg.reloc_count = cg.reloc_count + 1;
 }
 
@@ -1085,6 +1131,29 @@ fn compile_expr(cg: *mut CodeGen, node: *mut AstNode) {
                     cg_emit32(cg, 0 - lv.rbp_offset);
                     return;
                 }
+            } else if operand.kind == 115 { // &arr[idx]
+                compile_expr(cg, operand.child1); // base pointer in rax
+                cg_emit8(cg, 80);                 // push rax
+                compile_expr(cg, operand.child2); // index in rax
+                cg_emit8(cg, 91);                 // pop rbx (base)
+
+                let mut is_byte: u32 = 1;
+                if operand.child1.kind == 117 {
+                    let lv: *mut LocalVar = cg_find_local(cg, operand.child1.hash);
+                    if lv != (0 as *mut LocalVar) && lv.is_struct_ptr == 11 {
+                        is_byte = 0;
+                    }
+                }
+
+                if is_byte == 1 {
+                    cg_emit8(cg, 72); cg_emit8(cg, 1); cg_emit8(cg, 195); // add rbx, rax
+                } else {
+                    cg_emit8(cg, 72); cg_emit8(cg, 193); cg_emit8(cg, 224); cg_emit8(cg, 3); // shl rax, 3
+                    cg_emit8(cg, 72); cg_emit8(cg, 1); cg_emit8(cg, 195); // add rbx, rax
+                }
+                // Address in rbx -> mov rax, rbx
+                cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 216);
+                return;
             }
         }
         compile_expr(cg, operand);
@@ -1245,6 +1314,38 @@ fn compile_expr(cg: *mut CodeGen, node: *mut AstNode) {
             cg_emit8(cg, 15); cg_emit8(cg, 151); cg_emit8(cg, 192); // setae al
             cg_emit8(cg, 72); cg_emit8(cg, 15); cg_emit8(cg, 182); cg_emit8(cg, 192); // movzx rax, al
         }
+        return;
+    }
+
+    if node.kind == 113 { // NODE_CALL
+        // Evaluate and pass arguments
+        let mut cur_a: *mut AstNode = node.child2;
+        let mut a_cnt: u32 = 0;
+        while cur_a != (0 as *mut AstNode) && a_cnt < 6 {
+            compile_expr(cg, cur_a);
+            cg_emit8(cg, 80); // push rax
+            a_cnt = a_cnt + 1;
+            cur_a = cur_a.next;
+        }
+        // Pop in reverse order to SysV ABI argument registers
+        let mut pop_i: u32 = a_cnt;
+        while pop_i > 0 {
+            pop_i = pop_i - 1;
+            if pop_i == 5 { cg_emit8(cg, 65); cg_emit8(cg, 89); } // pop r9
+            else if pop_i == 4 { cg_emit8(cg, 65); cg_emit8(cg, 88); } // pop r8
+            else if pop_i == 3 { cg_emit8(cg, 89); } // pop rcx
+            else if pop_i == 2 { cg_emit8(cg, 90); } // pop rdx
+            else if pop_i == 1 { cg_emit8(cg, 94); } // pop rsi
+            else if pop_i == 0 { cg_emit8(cg, 95); } // pop rdi
+        }
+
+        // Emit call rel32 (E8 xx xx xx xx)
+        cg_emit8(cg, 232); // 0xE8
+        let hole_offset: u32 = cg.text_size;
+        cg_emit32(cg, 0);
+
+        // Register EIA_PATCH_SYM_REL32 relocation hole
+        cg_add_reloc_ex(cg, hole_offset, 2, node.hash, node.hash);
         return;
     }
 }
@@ -1450,6 +1551,32 @@ fn compile_fn(cg: *mut CodeGen, fnode: *mut AstNode) {
     cg.local_count = 0;
     cg.current_stack_offset = 0;
 
+    // Save incoming parameters from registers to stack frame slots
+    let mut p_idx: u32 = 0;
+    let mut p_cur: *mut AstNode = fnode.child2;
+    while p_cur != (0 as *mut AstNode) && p_idx < 6 {
+        cg.current_stack_offset = cg.current_stack_offset + 8;
+        let lv: *mut LocalVar = ((cg.locals as *mut u8) + ((cg.local_count as u64) * 32)) as *mut LocalVar;
+        lv.name_hash = p_cur.hash;
+        lv.rbp_offset = cg.current_stack_offset;
+        lv.size = 8;
+        lv.is_struct_ptr = p_cur.is_mut;
+        lv.is_struct_val = 0;
+        lv.struct_hash = p_cur.val;
+        cg.local_count = cg.local_count + 1;
+
+        if p_idx == 0 { cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 189); } // mov [rbp - disp], rdi
+        else if p_idx == 1 { cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 181); } // rsi
+        else if p_idx == 2 { cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 149); } // rdx
+        else if p_idx == 3 { cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 141); } // rcx
+        else if p_idx == 4 { cg_emit8(cg, 76); cg_emit8(cg, 137); cg_emit8(cg, 133); } // r8
+        else if p_idx == 5 { cg_emit8(cg, 76); cg_emit8(cg, 137); cg_emit8(cg, 141); } // r9
+        cg_emit32(cg, 0 - lv.rbp_offset);
+
+        p_idx = p_idx + 1;
+        p_cur = p_cur.next;
+    }
+
     let mut stmt: *mut AstNode = fnode.child1;
     while stmt != (0 as *mut AstNode) {
         compile_stmt(cg, stmt);
@@ -1470,7 +1597,7 @@ fn compile_fn(cg: *mut CodeGen, fnode: *mut AstNode) {
     sc.vaddr = fn_vaddr;
     sc.code_size = fn_code_size;
     sc.flags = 1;
-    sc.param_conv = 0;
+    sc.param_conv = p_idx;
     sc.contract_digest = fnode.hash;
     cg.contract_count = cg.contract_count + 1;
 
@@ -1741,24 +1868,25 @@ fn blake3_hash64(buf: *u8, len: u64) -> u64 {
     }
 
     let mut offset: u64 = 0;
-    let mut block_idx: u64 = 0;
     let mut digest64: u64 = 0;
+    let num_blocks: u64 = (len + 63) / 64;
+    let mut b: u64 = 0;
 
-    while offset < len {
+    while b < num_blocks {
         let mut blk_len: u32 = 64;
         if (offset + 64) > len {
             blk_len = (len - offset) as u32;
         }
         let mut flags: u32 = 0;
-        if offset == 0 {
-            flags = flags | 1;
+        if b == 0 {
+            flags = flags | 1; // CHUNK_START
         }
-        if (offset + (blk_len as u64)) == len {
-            flags = flags | 2 | 8;
+        if b == (num_blocks - 1) {
+            flags = flags | 2 | 8; // CHUNK_END | ROOT
         }
-        digest64 = blake3_compress_64(cv, buf + offset, blk_len, block_idx, flags);
+        digest64 = blake3_compress_64(cv, buf + offset, blk_len, 0, flags);
         offset = offset + (blk_len as u64);
-        block_idx = block_idx + 1;
+        b = b + 1;
     }
 
     return digest64;
@@ -2365,6 +2493,43 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
         } else if parser.cur_tok.kind == 11 { // TOK_FN
             let fnode: *mut AstNode = parse_fn(&mut parser);
             compile_fn(&mut cg, fnode);
+        } else if parser.cur_tok.kind == 25 { // TOK_EXTERN
+            parser_expect(&mut parser, 25);
+            parser_expect(&mut parser, 11); // fn
+            let ext_name_hash: u64 = parser.cur_tok.hash;
+            parser_expect(&mut parser, 1);  // ident
+            parser_expect(&mut parser, 60); // (
+            let mut param_cnt: u32 = 0;
+            while parser.cur_tok.kind != 61 && parser.cur_tok.kind != 0 {
+                parser_expect(&mut parser, 1);  // param name
+                parser_expect(&mut parser, 70); // :
+                if parser.cur_tok.kind == 50 { parser_expect(&mut parser, 50); } // &
+                if parser.cur_tok.kind == 13 { parser_expect(&mut parser, 13); } // mut
+                if parser.cur_tok.kind == 32 { parser_expect(&mut parser, 32); } // *
+                if parser.cur_tok.kind == 13 { parser_expect(&mut parser, 13); } // mut
+                lex_next_token(parser.lex, &mut parser.cur_tok); // type
+                param_cnt = param_cnt + 1;
+                if parser.cur_tok.kind == 72 { parser_expect(&mut parser, 72); } // ,
+            }
+            parser_expect(&mut parser, 61); // )
+            if parser.cur_tok.kind == 74 { // ->
+                parser_expect(&mut parser, 74);
+                lex_next_token(parser.lex, &mut parser.cur_tok);
+            }
+            if parser.cur_tok.kind == 71 { // ;
+                parser_expect(&mut parser, 71);
+            }
+
+            // Register SymbolContract (EIA_SYM_FLAG_IMPORT = 2)
+            let sc: *mut SymbolContract = ((cg.contracts as *mut u8) + ((cg.contract_count as u64) * 48)) as *mut SymbolContract;
+            sc.symbol_hash = ext_name_hash;
+            sc.type_sig_hash = ext_name_hash;
+            sc.vaddr = 0;
+            sc.code_size = 0;
+            sc.flags = 2; // EIA_SYM_FLAG_IMPORT
+            sc.param_conv = param_cnt;
+            sc.contract_digest = ext_name_hash;
+            cg.contract_count = cg.contract_count + 1;
         } else {
             lex_next_token(parser.lex, &mut parser.cur_tok);
         }

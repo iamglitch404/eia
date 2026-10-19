@@ -90,6 +90,22 @@ jobs:
           ./bin/spark0 compiler/frontend.rx -o bin/stage1_frontend
           echo "Stage-1 subsystems cross-compilation OK on ${{ matrix.os }}"
 
+      - name: Build and verify production eia-run dynamic loader across operating systems
+        run: |
+          gcc -O2 -Wall -Wextra -Iinclude -o bin/eia-run src/eia_loader.c
+          echo "Production eia-run loader compiled successfully on ${{ matrix.os }}"
+          ./bin/spark0 tests/client_v1.rx -o bin/client_v1
+          ./bin/spark0 tests/provider_v2.rx -o bin/provider_v2
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ] || [ "${{ matrix.os }}" = "windows-latest" ]; then
+            run_code=0
+            ./bin/eia-run bin/client_v1 bin/provider_v2 || run_code=$?
+            if [ "$run_code" -ne 42 ]; then
+              echo "Expected eia-run exit code 42, got $run_code"
+              exit 1
+            fi
+            echo "Production eia-run client v1 -> provider v2 linking PASSED on ${{ matrix.os }} (exit code 42)"
+          fi
+
   eia-5gate-ring:
     name: EIA 5-Gate Ring & Self-Hosting
     runs-on: ubuntu-latest
@@ -211,20 +227,24 @@ jobs:
           ./bin/test_eia_interop
           echo "EIA Independent Interoperability & Schema Evolution Matrix: 100% PASSED"
 
-      - name: Verify Multi-Architecture Emission & Execution (ARM64 and RISC-V 64 via QEMU)
+      - name: Verify Multi-Architecture Emission & Semantic Execution (ARM64 and RISC-V 64 via QEMU)
         run: |
           ./bin/spark0 tests/hello_eia.rx -o bin/hello_arm64 --target=arm64
           ./bin/spark0 tests/hello_eia.rx -o bin/hello_riscv64 --target=riscv64
           sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user || true
           if command -v qemu-aarch64 >/dev/null 2>&1; then
             arm_code=0
-            qemu-aarch64 bin/hello_arm64 || arm_code=$?
+            arm_out=$(qemu-aarch64 bin/hello_arm64) || arm_code=$?
+            echo "$arm_out"
             [ "$arm_code" -eq 42 ]
-            echo "ARM64 execution via QEMU: PASSED (exit code 42)"
+            echo "$arm_out" | grep -q "EIA HOLE PATCHED OK"
+            echo "ARM64 general semantic execution via QEMU: PASSED (verified semantic stdout and exit code 42)"
           fi
           if command -v qemu-riscv64 >/dev/null 2>&1; then
             riscv_code=0
-            qemu-riscv64 bin/hello_riscv64 || riscv_code=$?
+            riscv_out=$(qemu-riscv64 bin/hello_riscv64) || riscv_code=$?
+            echo "$riscv_out"
             [ "$riscv_code" -eq 42 ]
-            echo "RISC-V 64 execution via QEMU: PASSED (exit code 42)"
+            echo "$riscv_out" | grep -q "EIA HOLE PATCHED OK"
+            echo "RISC-V 64 general semantic execution via QEMU: PASSED (verified semantic stdout and exit code 42)"
           fi

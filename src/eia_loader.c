@@ -21,10 +21,17 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#else
 #include <unistd.h>
 #include <sys/mman.h>
+#if defined(__linux__)
 #include <sys/syscall.h>
+#endif
 #include <fcntl.h>
+#endif
 #include "spark0.h"
 
 /* Diagnostic error codes */
@@ -325,15 +332,22 @@ static const SymbolHashEntry *lookup_exported_symbol(const SymbolHashEntry *tabl
 }
 
 /* HASI cache synchronization */
-static inline void hasi_cache_sync(void) {
-#if defined(__x86_64__)
+static inline void hasi_cache_sync(void *addr, size_t size) {
+#if defined(_WIN32)
+    FlushInstructionCache(GetCurrentProcess(), addr, size);
+#elif defined(__x86_64__)
+    (void)addr; (void)size;
     unsigned int eax, ebx, ecx, edx;
     __asm__ __volatile__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0));
     __asm__ __volatile__("mfence" ::: "memory");
 #elif defined(__aarch64__)
+    (void)addr; (void)size;
     __asm__ __volatile__("dsb ish; isb" ::: "memory");
 #elif defined(__riscv)
+    (void)addr; (void)size;
     __asm__ __volatile__("fence.i" ::: "memory");
+#else
+    __builtin___clear_cache((char *)addr, (char *)addr + size);
 #endif
 }
 
@@ -525,12 +539,30 @@ int main(int argc, char **argv) {
     }
 
     /* 4. Allocate DVAM Dual Virtual Aliases (Strict W^X) */
+    uint8_t *v_write = NULL;
+    uint8_t *v_exec = NULL;
+#ifdef _WIN32
+    HANDLE hMap = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE, 0, (DWORD)total_code_size, NULL);
+    if (!hMap) {
+        fprintf(stderr, "[EIA ERROR] DVAM CreateFileMapping failed\n");
+        return 1;
+    }
+    v_write = (uint8_t *)MapViewOfFile(hMap, FILE_MAP_WRITE, 0, 0, total_code_size);
+    v_exec  = (uint8_t *)MapViewOfFile(hMap, FILE_MAP_READ | FILE_MAP_EXECUTE, 0, 0, total_code_size);
+    if (!v_write || !v_exec) {
+        fprintf(stderr, "[EIA ERROR] DVAM MapViewOfFile failed\n");
+        CloseHandle(hMap);
+        return 1;
+    }
+#else
     int memfd = -1;
-#if defined(__NR_memfd_create)
+#if defined(__linux__) && defined(__NR_memfd_create)
     memfd = syscall(__NR_memfd_create, "eia_runtime_dvam", 1 /* MFD_CLOEXEC */);
 #endif
     if (memfd < 0) {
-        char temp_path[] = "/tmp/eia_run_dvam_XXXXXX";
+        const char *tmp = getenv("TMPDIR");
+        char temp_path[512];
+        snprintf(temp_path, sizeof(temp_path), "%s/eia_run_dvam_XXXXXX", tmp ? tmp : "/tmp");
         memfd = mkstemp(temp_path);
         if (memfd >= 0) unlink(temp_path);
     }
@@ -539,12 +571,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    uint8_t *v_write = (uint8_t *)mmap(NULL, total_code_size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
-    uint8_t *v_exec  = (uint8_t *)mmap(NULL, total_code_size, PROT_READ | PROT_EXEC,  MAP_SHARED, memfd, 0);
+    v_write = (uint8_t *)mmap(NULL, total_code_size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+    v_exec  = (uint8_t *)mmap(NULL, total_code_size, PROT_READ | PROT_EXEC,  MAP_SHARED, memfd, 0);
     if (v_write == MAP_FAILED || v_exec == MAP_FAILED) {
         perror("DVAM mmap failed");
+        close(memfd);
         return 1;
     }
+#endif
 
     /* Copy client and provider code into writable alias */
     memcpy(v_write + client->arena_offset, client->text_data, client->text_size);
@@ -756,11 +790,16 @@ int main(int argc, char **argv) {
     all_bins = NULL;
 
     /* 7. HASI Cache pipeline synchronization */
-    hasi_cache_sync();
+    hasi_cache_sync(v_exec, total_code_size);
 
     /* 8. Writer alias permanent unmapping: strict W^X enforcement */
+#ifdef _WIN32
+    UnmapViewOfFile(v_write);
+    v_write = NULL;
+#else
     munmap(v_write, total_code_size);
     v_write = NULL;
+#endif
 
     /* 9. Locate client's entrypoint */
     uint32_t main_fn_offset = 0;
@@ -799,8 +838,13 @@ int main(int argc, char **argv) {
     int64_t exit_code = run_entry();
 
     /* Clean up */
+#ifdef _WIN32
+    UnmapViewOfFile(v_exec);
+    CloseHandle(hMap);
+#else
     munmap(v_exec, total_code_size);
     close(memfd);
+#endif
     free(client->file_data);
     free(client);
     if (providers) {

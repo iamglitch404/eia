@@ -990,6 +990,868 @@ static void compile_stmt(FnCompiler *fc, RuStmt *s) {
 }
 
 /* ------------------------------------------------------------------------- */
+/*                   Struct Field Offset Resolution Helper                   */
+/* ------------------------------------------------------------------------- */
+
+static uint32_t get_struct_field_offset(FnCompiler *fc, const RuExpr *e) {
+    if (e->kind != EXPR_FIELD_ACCESS) return 0;
+    RuExpr *base = e->as.field_access.base;
+    RuStructDef *sdef = NULL;
+    RuType *base_t = get_expr_type(fc, base);
+    if (base_t) {
+        if (base_t->kind == TYPE_STRUCT) {
+            sdef = find_struct(fc->module, base_t->as.structure.name);
+        } else if ((base_t->kind == TYPE_PTR_CONST || base_t->kind == TYPE_PTR_MUT) &&
+                   base_t->as.ptr.pointee &&
+                   base_t->as.ptr.pointee->kind == TYPE_STRUCT) {
+            sdef = find_struct(fc->module, base_t->as.ptr.pointee->as.structure.name);
+        }
+    }
+    if (!sdef && fc->module->struct_count > 0) {
+        sdef = fc->module->structs[0];
+    }
+    if (sdef) {
+        uint32_t cur = 0;
+        for (uint32_t i = 0; i < sdef->field_count; ++i) {
+            if (sdef->fields[i].name_hash == e->as.field_access.field_hash ||
+                strcmp(sdef->fields[i].name, e->as.field_access.field_name) == 0) {
+                return cur;
+            }
+            uint32_t sz = get_type_size_ctx(fc->module, sdef->fields[i].type);
+            cur = (cur + sz + 7) & ~7;
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/*                       ARM64 (AArch64) Semantic Codegen                    */
+/* ------------------------------------------------------------------------- */
+
+static void arm64_emit_mov_imm64(CompiledUnit *u, int reg, uint64_t val) {
+    uint16_t w0 = (uint16_t)(val & 0xFFFF);
+    uint16_t w1 = (uint16_t)((val >> 16) & 0xFFFF);
+    uint16_t w2 = (uint16_t)((val >> 32) & 0xFFFF);
+    uint16_t w3 = (uint16_t)((val >> 48) & 0xFFFF);
+
+    emit32_le(u, 0xd2800000 | (0 << 21) | (((uint32_t)w0) << 5) | reg); /* movz reg, w0, lsl 0 */
+    if (w1 || w2 || w3) {
+        emit32_le(u, 0xf2800000 | (1 << 21) | (((uint32_t)w1) << 5) | reg); /* movk reg, w1, lsl 16 */
+    }
+    if (w2 || w3) {
+        emit32_le(u, 0xf2800000 | (2 << 21) | (((uint32_t)w2) << 5) | reg); /* movk reg, w2, lsl 32 */
+    }
+    if (w3) {
+        emit32_le(u, 0xf2800000 | (3 << 21) | (((uint32_t)w3) << 5) | reg); /* movk reg, w3, lsl 48 */
+    }
+}
+
+static inline void arm64_push(CompiledUnit *u, int reg) {
+    emit32_le(u, 0xf81f0fe0 | reg); /* str x<reg>, [sp, -16]! */
+}
+
+static inline void arm64_pop(CompiledUnit *u, int reg) {
+    emit32_le(u, 0xf84107e0 | reg); /* ldr x<reg>, [sp], 16 */
+}
+
+static void compile_expr_arm64(FnCompiler *fc, RuExpr *e);
+static void compile_stmt_arm64(FnCompiler *fc, RuStmt *s);
+
+static void compile_lvalue_addr_arm64(FnCompiler *fc, RuExpr *e) {
+    if (e->kind == EXPR_VAR) {
+        VarBinding *vb = find_var(fc, e->as.var_name);
+        if (!vb) {
+            fprintf(stderr, "Codegen error (ARM64): undefined variable '%s'\n", e->as.var_name);
+            exit(1);
+        }
+        arm64_emit_mov_imm64(fc->u, 16, vb->rbp_offset);
+        emit32_le(fc->u, 0xcb1003a1); /* sub x1, x29, x16 */
+        return;
+    }
+
+    if (e->kind == EXPR_FIELD_ACCESS) {
+        compile_expr_arm64(fc, e->as.field_access.base); /* base in x0 */
+        uint32_t off = get_struct_field_offset(fc, e);
+        arm64_emit_mov_imm64(fc->u, 16, off);
+        emit32_le(fc->u, 0x8b100001); /* add x1, x0, x16 */
+        return;
+    }
+
+    if (e->kind == EXPR_INDEX) {
+        compile_expr_arm64(fc, e->as.index.base);
+        arm64_push(fc->u, 0);
+        compile_expr_arm64(fc, e->as.index.index);
+        arm64_pop(fc->u, 2); /* base in x2, index in x0 */
+        uint32_t sz = get_type_size_ctx(fc->module, get_expr_type(fc, e));
+        arm64_emit_mov_imm64(fc->u, 16, sz);
+        emit32_le(fc->u, 0x9b107c00); /* mul x0, x0, x16 */
+        emit32_le(fc->u, 0x8b000041); /* add x1, x2, x0 */
+        return;
+    }
+
+    if (e->kind == EXPR_UNARY && e->as.unary.op == UNOP_DEREF) {
+        compile_expr_arm64(fc, e->as.unary.operand);
+        emit32_le(fc->u, 0xaa0003e1); /* mov x1, x0 */
+        return;
+    }
+
+    fprintf(stderr, "Codegen error (ARM64): unsupported L-value kind %d\n", e->kind);
+    exit(1);
+}
+
+static void compile_expr_arm64(FnCompiler *fc, RuExpr *e) {
+    if (e->kind == EXPR_INT_LIT) {
+        arm64_emit_mov_imm64(fc->u, 0, e->as.int_val);
+        return;
+    }
+
+    if (e->kind == EXPR_STRING_LIT) {
+        uint32_t rodata_offset = add_rodata_string(fc->u, e->as.str.str_val, e->as.str.str_len);
+        uint64_t vaddr = (uint64_t)fc->rodata_base_vaddr + rodata_offset;
+        arm64_emit_mov_imm64(fc->u, 0, vaddr);
+        return;
+    }
+
+    if (e->kind == EXPR_VAR) {
+        VarBinding *vb = find_var(fc, e->as.var_name);
+        if (!vb) {
+            fprintf(stderr, "Codegen error (ARM64): undefined variable '%s'\n", e->as.var_name);
+            exit(1);
+        }
+        if (vb->type && (vb->type->kind == TYPE_STRUCT || vb->type->kind == TYPE_ARRAY)) {
+            arm64_emit_mov_imm64(fc->u, 16, vb->rbp_offset);
+            emit32_le(fc->u, 0xcb1003a0); /* sub x0, x29, x16 */
+        } else {
+            arm64_emit_mov_imm64(fc->u, 16, vb->rbp_offset);
+            emit32_le(fc->u, 0xcb1003a1); /* sub x1, x29, x16 */
+            uint32_t v_size = get_type_size_ctx(fc->module, vb->type);
+            if (v_size == 1) {
+                emit32_le(fc->u, 0x39400020); /* ldrb w0, [x1] */
+            } else if (v_size == 4) {
+                emit32_le(fc->u, 0xb9400020); /* ldr w0, [x1] */
+            } else {
+                emit32_le(fc->u, 0xf9400020); /* ldr x0, [x1] */
+            }
+        }
+        return;
+    }
+
+    if (e->kind == EXPR_UNARY) {
+        if (e->as.unary.op == UNOP_ADDR_OF || e->as.unary.op == UNOP_ADDR_MUT) {
+            compile_lvalue_addr_arm64(fc, e->as.unary.operand);
+            emit32_le(fc->u, 0xaa0103e0); /* mov x0, x1 */
+            return;
+        }
+        if (e->as.unary.op == UNOP_DEREF) {
+            compile_expr_arm64(fc, e->as.unary.operand);
+            uint32_t sz = get_type_size_ctx(fc->module, get_expr_type(fc, e));
+            if (sz == 1) emit32_le(fc->u, 0x39400000); /* ldrb w0, [x0] */
+            else if (sz == 4) emit32_le(fc->u, 0xb9400000); /* ldr w0, [x0] */
+            else emit32_le(fc->u, 0xf9400000); /* ldr x0, [x0] */
+            return;
+        }
+        if (e->as.unary.op == UNOP_NEG) {
+            compile_expr_arm64(fc, e->as.unary.operand);
+            emit32_le(fc->u, 0xcb0003e0); /* sub x0, xzr, x0 (neg x0, x0) */
+            return;
+        }
+        if (e->as.unary.op == UNOP_NOT) {
+            compile_expr_arm64(fc, e->as.unary.operand);
+            emit32_le(fc->u, 0xf100001f); /* cmp x0, #0 */
+            emit32_le(fc->u, 0x9a9f17e0); /* cset x0, eq */
+            return;
+        }
+        if (e->as.unary.op == UNOP_BIT_NOT) {
+            compile_expr_arm64(fc, e->as.unary.operand);
+            emit32_le(fc->u, 0xaa2003e0); /* mvn x0, x0 */
+            return;
+        }
+    }
+
+    if (e->kind == EXPR_FIELD_ACCESS) {
+        compile_lvalue_addr_arm64(fc, e);
+        RuType *ftype = get_expr_type(fc, e);
+        if (ftype && (ftype->kind == TYPE_STRUCT || ftype->kind == TYPE_ARRAY)) {
+            emit32_le(fc->u, 0xaa0103e0); /* mov x0, x1 */
+            return;
+        }
+        uint32_t fsize = get_type_size_ctx(fc->module, ftype);
+        if (fsize == 1) emit32_le(fc->u, 0x39400020);
+        else if (fsize == 4) emit32_le(fc->u, 0xb9400020);
+        else emit32_le(fc->u, 0xf9400020);
+        return;
+    }
+
+    if (e->kind == EXPR_INDEX) {
+        compile_lvalue_addr_arm64(fc, e);
+        RuType *elem_t = get_expr_type(fc, e);
+        if (elem_t && elem_t->kind == TYPE_STRUCT) {
+            emit32_le(fc->u, 0xaa0103e0); /* mov x0, x1 */
+            return;
+        }
+        uint32_t elem_size = get_type_size_ctx(fc->module, elem_t);
+        if (elem_size == 1) emit32_le(fc->u, 0x39400020);
+        else if (elem_size == 4) emit32_le(fc->u, 0xb9400020);
+        else emit32_le(fc->u, 0xf9400020);
+        return;
+    }
+
+    if (e->kind == EXPR_CAST) {
+        compile_expr_arm64(fc, e->as.cast.expr);
+        return;
+    }
+
+    if (e->kind == EXPR_BINARY) {
+        if (e->as.binary.op == BINOP_LOG_AND) {
+            compile_expr_arm64(fc, e->as.binary.lhs);
+            emit32_le(fc->u, 0xf100001f); /* cmp x0, #0 */
+            uint32_t b_eq = fc->u->text_size;
+            emit32_le(fc->u, 0x54000000); /* b.eq */
+            compile_expr_arm64(fc, e->as.binary.rhs);
+            emit32_le(fc->u, 0xf100001f);
+            emit32_le(fc->u, 0x9a9f07e0); /* cset x0, ne */
+            uint32_t b_end = fc->u->text_size;
+            emit32_le(fc->u, 0x14000000); /* b */
+            uint32_t false_off = fc->u->text_size;
+            int32_t d1 = (int32_t)(false_off - b_eq) / 4;
+            patch32(fc->u, b_eq, 0x54000000 | ((d1 & 0x7FFFF) << 5));
+            emit32_le(fc->u, 0xd2800000); /* movz x0, 0 */
+            uint32_t end_off = fc->u->text_size;
+            int32_t d2 = (int32_t)(end_off - b_end) / 4;
+            patch32(fc->u, b_end, 0x14000000 | (d2 & 0x03FFFFFF));
+            return;
+        }
+
+        if (e->as.binary.op == BINOP_LOG_OR) {
+            compile_expr_arm64(fc, e->as.binary.lhs);
+            emit32_le(fc->u, 0xf100001f); /* cmp x0, #0 */
+            uint32_t b_ne = fc->u->text_size;
+            emit32_le(fc->u, 0x54000001); /* b.ne */
+            compile_expr_arm64(fc, e->as.binary.rhs);
+            emit32_le(fc->u, 0xf100001f);
+            emit32_le(fc->u, 0x9a9f07e0); /* cset x0, ne */
+            uint32_t b_end = fc->u->text_size;
+            emit32_le(fc->u, 0x14000000); /* b */
+            uint32_t true_off = fc->u->text_size;
+            int32_t d1 = (int32_t)(true_off - b_ne) / 4;
+            patch32(fc->u, b_ne, 0x54000001 | ((d1 & 0x7FFFF) << 5));
+            emit32_le(fc->u, 0xd2800020); /* movz x0, 1 */
+            uint32_t end_off = fc->u->text_size;
+            int32_t d2 = (int32_t)(end_off - b_end) / 4;
+            patch32(fc->u, b_end, 0x14000000 | (d2 & 0x03FFFFFF));
+            return;
+        }
+
+        compile_expr_arm64(fc, e->as.binary.lhs);
+        arm64_push(fc->u, 0);
+        compile_expr_arm64(fc, e->as.binary.rhs);
+        emit32_le(fc->u, 0xaa0003e2); /* mov x2, x0 (RHS) */
+        arm64_pop(fc->u, 0);          /* pop LHS into x0 */
+
+        switch (e->as.binary.op) {
+            case BINOP_ADD: emit32_le(fc->u, 0x8b020000); break; /* add x0, x0, x2 */
+            case BINOP_SUB: emit32_le(fc->u, 0xcb020000); break; /* sub x0, x0, x2 */
+            case BINOP_MUL: emit32_le(fc->u, 0x9b027c00); break; /* mul x0, x0, x2 */
+            case BINOP_DIV: emit32_le(fc->u, 0x9ac20c00); break; /* sdiv x0, x0, x2 */
+            case BINOP_MOD:
+                emit32_le(fc->u, 0x9ac20810); /* udiv x16, x0, x2 */
+                emit32_le(fc->u, 0x9b028200); /* msub x0, x16, x2, x0 */
+                break;
+            case BINOP_BIT_AND: emit32_le(fc->u, 0x8a020000); break; /* and x0, x0, x2 */
+            case BINOP_BIT_OR:  emit32_le(fc->u, 0xaa020000); break; /* orr x0, x0, x2 */
+            case BINOP_BIT_XOR: emit32_le(fc->u, 0xca020000); break; /* eor x0, x0, x2 */
+            case BINOP_SHL:     emit32_le(fc->u, 0x9ac22000); break; /* lslv x0, x0, x2 */
+            case BINOP_SHR:     emit32_le(fc->u, 0x9ac22400); break; /* lsrv x0, x0, x2 */
+            case BINOP_EQ:
+                emit32_le(fc->u, 0xeb02001f); /* cmp x0, x2 */
+                emit32_le(fc->u, 0x9a9f17e0); /* cset x0, eq */
+                break;
+            case BINOP_NE:
+                emit32_le(fc->u, 0xeb02001f);
+                emit32_le(fc->u, 0x9a9f07e0); /* cset x0, ne */
+                break;
+            case BINOP_LT:
+                emit32_le(fc->u, 0xeb02001f);
+                emit32_le(fc->u, 0x9a9f27e0); /* cset x0, lo */
+                break;
+            case BINOP_LE:
+                emit32_le(fc->u, 0xeb02001f);
+                emit32_le(fc->u, 0x9a9f87e0); /* cset x0, ls */
+                break;
+            case BINOP_GT:
+                emit32_le(fc->u, 0xeb02001f);
+                emit32_le(fc->u, 0x9a9f97e0); /* cset x0, hi */
+                break;
+            case BINOP_GE:
+                emit32_le(fc->u, 0xeb02001f);
+                emit32_le(fc->u, 0x9a9f37e0); /* cset x0, hs */
+                break;
+            default: break;
+        }
+        return;
+    }
+
+    if (e->kind == EXPR_CALL) {
+        int is_direct = (e->as.call.callee->kind == EXPR_VAR);
+        if (!is_direct) {
+            compile_expr_arm64(fc, e->as.call.callee);
+            arm64_push(fc->u, 0);
+        }
+        uint32_t n = e->as.call.num_args;
+        for (uint32_t i = 0; i < n; ++i) {
+            compile_expr_arm64(fc, e->as.call.args[i]);
+            arm64_push(fc->u, 0);
+        }
+        for (int i = (int)n - 1; i >= 0; --i) {
+            if (i < 6) arm64_pop(fc->u, i);
+            else arm64_pop(fc->u, 16);
+        }
+        if (is_direct) {
+            const char *callee_name = e->as.call.callee->as.var_name;
+            add_call_fixup(fc, fc->u->text_size, callee_name);
+            emit32_le(fc->u, 0x94000000); /* bl hole */
+        } else {
+            arm64_pop(fc->u, 16);
+            emit32_le(fc->u, 0xd63f0200); /* blr x16 */
+        }
+        return;
+    }
+
+    if (e->kind == EXPR_SYSCALL) {
+        uint32_t n = e->as.syscall.num_args;
+        for (uint32_t i = 0; i < n; ++i) {
+            compile_expr_arm64(fc, e->as.syscall.args[i]);
+            arm64_push(fc->u, 0);
+        }
+        if (e->as.syscall.nr->kind == EXPR_INT_LIT) {
+            uint64_t nr = e->as.syscall.nr->as.int_val;
+            if (nr == 1) nr = 64;       /* Linux SYS_write */
+            else if (nr == 60) nr = 93;  /* Linux SYS_exit */
+            arm64_emit_mov_imm64(fc->u, 8, nr);
+        } else {
+            compile_expr_arm64(fc, e->as.syscall.nr);
+            emit32_le(fc->u, 0xaa0003e8); /* mov x8, x0 */
+            emit32_le(fc->u, 0xf100051f); /* cmp x8, #1 */
+            emit32_le(fc->u, 0x54000041); /* b.ne +8 */
+            emit32_le(fc->u, 0xd2800808); /* movz x8, 64 */
+            emit32_le(fc->u, 0xf100f51f); /* cmp x8, #60 */
+            emit32_le(fc->u, 0x54000041); /* b.ne +8 */
+            emit32_le(fc->u, 0xd2800ba8); /* movz x8, 93 */
+        }
+        for (int i = (int)n - 1; i >= 0; --i) {
+            if (i < 6) arm64_pop(fc->u, i);
+            else arm64_pop(fc->u, 16);
+        }
+        emit32_le(fc->u, 0xd4000001); /* svc 0 */
+        return;
+    }
+}
+
+static void compile_stmt_arm64(FnCompiler *fc, RuStmt *s) {
+    if (s->kind == STMT_LET) {
+        VarBinding *vb = add_var(fc, s->as.let_stmt.name, s->as.let_stmt.type);
+        if (s->as.let_stmt.init) {
+            compile_expr_arm64(fc, s->as.let_stmt.init);
+            arm64_emit_mov_imm64(fc->u, 16, vb->rbp_offset);
+            emit32_le(fc->u, 0xcb1003a1); /* sub x1, x29, x16 */
+            uint32_t v_size = get_type_size_ctx(fc->module, vb->type);
+            if (v_size == 1) emit32_le(fc->u, 0x39000020); /* strb w0, [x1] */
+            else if (v_size == 4) emit32_le(fc->u, 0xb9000020); /* str w0, [x1] */
+            else emit32_le(fc->u, 0xf9000020); /* str x0, [x1] */
+        }
+        return;
+    }
+
+    if (s->kind == STMT_ASSIGN) {
+        compile_lvalue_addr_arm64(fc, s->as.assign_stmt.lhs);
+        arm64_push(fc->u, 1);
+        compile_expr_arm64(fc, s->as.assign_stmt.rhs);
+        arm64_pop(fc->u, 1);
+        uint32_t store_size = get_lvalue_size(fc, s->as.assign_stmt.lhs);
+        if (store_size == 1) emit32_le(fc->u, 0x39000020);
+        else if (store_size == 4) emit32_le(fc->u, 0xb9000020);
+        else emit32_le(fc->u, 0xf9000020);
+        return;
+    }
+
+    if (s->kind == STMT_IF) {
+        compile_expr_arm64(fc, s->as.if_stmt.cond);
+        emit32_le(fc->u, 0xf100001f); /* cmp x0, #0 */
+        uint32_t b_else = fc->u->text_size;
+        emit32_le(fc->u, 0x54000000); /* b.eq */
+        for (uint32_t i = 0; i < s->as.if_stmt.then_count; ++i) {
+            compile_stmt_arm64(fc, s->as.if_stmt.then_stmts[i]);
+        }
+        uint32_t b_end = fc->u->text_size;
+        emit32_le(fc->u, 0x14000000); /* b */
+        uint32_t else_off = fc->u->text_size;
+        int32_t d1 = (int32_t)(else_off - b_else) / 4;
+        patch32(fc->u, b_else, 0x54000000 | ((d1 & 0x7FFFF) << 5));
+        for (uint32_t i = 0; i < s->as.if_stmt.else_count; ++i) {
+            compile_stmt_arm64(fc, s->as.if_stmt.else_stmts[i]);
+        }
+        uint32_t end_off = fc->u->text_size;
+        int32_t d2 = (int32_t)(end_off - b_end) / 4;
+        patch32(fc->u, b_end, 0x14000000 | (d2 & 0x03FFFFFF));
+        return;
+    }
+
+    if (s->kind == STMT_WHILE) {
+        uint32_t loop_start = fc->u->text_size;
+        compile_expr_arm64(fc, s->as.while_stmt.cond);
+        emit32_le(fc->u, 0xf100001f); /* cmp x0, #0 */
+        uint32_t b_end = fc->u->text_size;
+        emit32_le(fc->u, 0x54000000); /* b.eq */
+        for (uint32_t i = 0; i < s->as.while_stmt.body_count; ++i) {
+            compile_stmt_arm64(fc, s->as.while_stmt.body_stmts[i]);
+        }
+        int32_t d_back = (int32_t)(loop_start - fc->u->text_size) / 4;
+        emit32_le(fc->u, 0x14000000 | (d_back & 0x03FFFFFF));
+        uint32_t end_off = fc->u->text_size;
+        int32_t d_fwd = (int32_t)(end_off - b_end) / 4;
+        patch32(fc->u, b_end, 0x54000000 | ((d_fwd & 0x7FFFF) << 5));
+        return;
+    }
+
+    if (s->kind == STMT_RETURN) {
+        if (s->as.return_stmt.expr) {
+            compile_expr_arm64(fc, s->as.return_stmt.expr);
+        } else {
+            emit32_le(fc->u, 0xd2800000); /* movz x0, 0 */
+        }
+        emit32_le(fc->u, 0x910003bf); /* mov sp, x29 */
+        emit32_le(fc->u, 0xa8c17bfd); /* ldp x29, x30, [sp], 16 */
+        emit32_le(fc->u, 0xd65f03c0); /* ret */
+        return;
+    }
+
+    if (s->kind == STMT_EXPR) {
+        compile_expr_arm64(fc, s->as.expr_stmt.expr);
+        return;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/*                       RISC-V 64 Semantic Codegen                          */
+/* ------------------------------------------------------------------------- */
+
+static void riscv_emit_mov_imm(CompiledUnit *u, int reg, uint64_t val) {
+    if ((int64_t)val >= -2048 && (int64_t)val <= 2047) {
+        emit32_le(u, 0x00000013 | (((uint32_t)val & 0xFFF) << 20) | (reg << 7));
+    } else {
+        uint32_t hi = ((uint32_t)val + 0x800) >> 12;
+        uint32_t lo = ((uint32_t)val) - (hi << 12);
+        emit32_le(u, 0x00000037 | ((hi & 0xFFFFF) << 12) | (reg << 7)); /* lui reg, hi */
+        emit32_le(u, 0x00000013 | (((uint32_t)lo & 0xFFF) << 20) | (reg << 15) | (reg << 7)); /* addi reg, reg, lo */
+    }
+}
+
+static inline void riscv_push(CompiledUnit *u, int reg) {
+    emit32_le(u, 0xff010113);                         /* addi sp, sp, -16 */
+    emit32_le(u, 0x00013023 | (reg << 20));          /* sd reg, 0(sp) */
+}
+
+static inline void riscv_pop(CompiledUnit *u, int reg) {
+    emit32_le(u, 0x00013003 | (reg << 7));           /* ld reg, 0(sp) */
+    emit32_le(u, 0x01010113);                         /* addi sp, sp, 16 */
+}
+
+static void compile_expr_riscv(FnCompiler *fc, RuExpr *e);
+static void compile_stmt_riscv(FnCompiler *fc, RuStmt *s);
+
+static void compile_lvalue_addr_riscv(FnCompiler *fc, RuExpr *e) {
+    if (e->kind == EXPR_VAR) {
+        VarBinding *vb = find_var(fc, e->as.var_name);
+        if (!vb) {
+            fprintf(stderr, "Codegen error (RISC-V): undefined variable '%s'\n", e->as.var_name);
+            exit(1);
+        }
+        riscv_emit_mov_imm(fc->u, 5 /*t0*/, vb->rbp_offset);
+        emit32_le(fc->u, 0x405405b3); /* sub a1, s0, t0 */
+        return;
+    }
+
+    if (e->kind == EXPR_FIELD_ACCESS) {
+        compile_expr_riscv(fc, e->as.field_access.base); /* base in a0 */
+        uint32_t off = get_struct_field_offset(fc, e);
+        riscv_emit_mov_imm(fc->u, 5 /*t0*/, off);
+        emit32_le(fc->u, 0x005505b3); /* add a1, a0, t0 */
+        return;
+    }
+
+    if (e->kind == EXPR_INDEX) {
+        compile_expr_riscv(fc, e->as.index.base);
+        riscv_push(fc->u, 10 /*a0*/);
+        compile_expr_riscv(fc, e->as.index.index);
+        riscv_pop(fc->u, 12 /*a2*/); /* base in a2, index in a0 */
+        uint32_t sz = get_type_size_ctx(fc->module, get_expr_type(fc, e));
+        riscv_emit_mov_imm(fc->u, 5 /*t0*/, sz);
+        emit32_le(fc->u, 0x02550533); /* mul a0, a0, t0 */
+        emit32_le(fc->u, 0x00a605b3); /* add a1, a2, a0 */
+        return;
+    }
+
+    if (e->kind == EXPR_UNARY && e->as.unary.op == UNOP_DEREF) {
+        compile_expr_riscv(fc, e->as.unary.operand);
+        emit32_le(fc->u, 0x00050593); /* mv a1, a0 */
+        return;
+    }
+
+    fprintf(stderr, "Codegen error (RISC-V): unsupported L-value kind %d\n", e->kind);
+    exit(1);
+}
+
+static void compile_expr_riscv(FnCompiler *fc, RuExpr *e) {
+    if (e->kind == EXPR_INT_LIT) {
+        riscv_emit_mov_imm(fc->u, 10 /*a0*/, e->as.int_val);
+        return;
+    }
+
+    if (e->kind == EXPR_STRING_LIT) {
+        uint32_t rodata_offset = add_rodata_string(fc->u, e->as.str.str_val, e->as.str.str_len);
+        uint64_t vaddr = (uint64_t)fc->rodata_base_vaddr + rodata_offset;
+        riscv_emit_mov_imm(fc->u, 10 /*a0*/, vaddr);
+        return;
+    }
+
+    if (e->kind == EXPR_VAR) {
+        VarBinding *vb = find_var(fc, e->as.var_name);
+        if (!vb) {
+            fprintf(stderr, "Codegen error (RISC-V): undefined variable '%s'\n", e->as.var_name);
+            exit(1);
+        }
+        if (vb->type && (vb->type->kind == TYPE_STRUCT || vb->type->kind == TYPE_ARRAY)) {
+            riscv_emit_mov_imm(fc->u, 5 /*t0*/, vb->rbp_offset);
+            emit32_le(fc->u, 0x40540533); /* sub a0, s0, t0 */
+        } else {
+            riscv_emit_mov_imm(fc->u, 5 /*t0*/, vb->rbp_offset);
+            emit32_le(fc->u, 0x405405b3); /* sub a1, s0, t0 */
+            uint32_t v_size = get_type_size_ctx(fc->module, vb->type);
+            if (v_size == 1) emit32_le(fc->u, 0x0005c503); /* lbu a0, 0(a1) */
+            else if (v_size == 4) emit32_le(fc->u, 0x0005e503); /* lwu a0, 0(a1) */
+            else emit32_le(fc->u, 0x0005b503); /* ld a0, 0(a1) */
+        }
+        return;
+    }
+
+    if (e->kind == EXPR_UNARY) {
+        if (e->as.unary.op == UNOP_ADDR_OF || e->as.unary.op == UNOP_ADDR_MUT) {
+            compile_lvalue_addr_riscv(fc, e->as.unary.operand);
+            emit32_le(fc->u, 0x00058513); /* mv a0, a1 */
+            return;
+        }
+        if (e->as.unary.op == UNOP_DEREF) {
+            compile_expr_riscv(fc, e->as.unary.operand);
+            uint32_t sz = get_type_size_ctx(fc->module, get_expr_type(fc, e));
+            if (sz == 1) emit32_le(fc->u, 0x00054503); /* lbu a0, 0(a0) */
+            else if (sz == 4) emit32_le(fc->u, 0x00056503); /* lwu a0, 0(a0) */
+            else emit32_le(fc->u, 0x00053503); /* ld a0, 0(a0) */
+            return;
+        }
+        if (e->as.unary.op == UNOP_NEG) {
+            compile_expr_riscv(fc, e->as.unary.operand);
+            emit32_le(fc->u, 0x40a00533); /* sub a0, x0, a0 (neg a0, a0) */
+            return;
+        }
+        if (e->as.unary.op == UNOP_NOT) {
+            compile_expr_riscv(fc, e->as.unary.operand);
+            emit32_le(fc->u, 0x00153513); /* sltiu a0, a0, 1 (seqz a0, a0) */
+            return;
+        }
+        if (e->as.unary.op == UNOP_BIT_NOT) {
+            compile_expr_riscv(fc, e->as.unary.operand);
+            emit32_le(fc->u, 0xfff54513); /* xori a0, a0, -1 */
+            return;
+        }
+    }
+
+    if (e->kind == EXPR_FIELD_ACCESS) {
+        compile_lvalue_addr_riscv(fc, e);
+        RuType *ftype = get_expr_type(fc, e);
+        if (ftype && (ftype->kind == TYPE_STRUCT || ftype->kind == TYPE_ARRAY)) {
+            emit32_le(fc->u, 0x00058513); /* mv a0, a1 */
+            return;
+        }
+        uint32_t fsize = get_type_size_ctx(fc->module, ftype);
+        if (fsize == 1) emit32_le(fc->u, 0x0005c503);
+        else if (fsize == 4) emit32_le(fc->u, 0x0005e503);
+        else emit32_le(fc->u, 0x0005b503);
+        return;
+    }
+
+    if (e->kind == EXPR_INDEX) {
+        compile_lvalue_addr_riscv(fc, e);
+        RuType *elem_t = get_expr_type(fc, e);
+        if (elem_t && elem_t->kind == TYPE_STRUCT) {
+            emit32_le(fc->u, 0x00058513); /* mv a0, a1 */
+            return;
+        }
+        uint32_t elem_size = get_type_size_ctx(fc->module, elem_t);
+        if (elem_size == 1) emit32_le(fc->u, 0x0005c503);
+        else if (elem_size == 4) emit32_le(fc->u, 0x0005e503);
+        else emit32_le(fc->u, 0x0005b503);
+        return;
+    }
+
+    if (e->kind == EXPR_CAST) {
+        compile_expr_riscv(fc, e->as.cast.expr);
+        return;
+    }
+
+    if (e->kind == EXPR_BINARY) {
+        if (e->as.binary.op == BINOP_LOG_AND) {
+            compile_expr_riscv(fc, e->as.binary.lhs);
+            uint32_t beqz = fc->u->text_size;
+            emit32_le(fc->u, 0x00050063); /* beq a0, x0, .Lfalse */
+            compile_expr_riscv(fc, e->as.binary.rhs);
+            emit32_le(fc->u, 0x00a03533); /* sltu a0, x0, a0 */
+            uint32_t j_end = fc->u->text_size;
+            emit32_le(fc->u, 0x0000006f); /* jal x0, .Lend */
+            uint32_t false_off = fc->u->text_size;
+            int32_t d1 = (int32_t)(false_off - beqz);
+            uint32_t b12 = (d1 >> 12) & 1;
+            uint32_t b10_5 = (d1 >> 5) & 0x3F;
+            uint32_t b4_1 = (d1 >> 1) & 0xF;
+            uint32_t b11 = (d1 >> 11) & 1;
+            patch32(fc->u, beqz, (b12 << 31) | (b10_5 << 25) | (b4_1 << 8) | (b11 << 7) | 0x00050063);
+            emit32_le(fc->u, 0x00000513); /* li a0, 0 */
+            uint32_t end_off = fc->u->text_size;
+            int32_t d2 = (int32_t)(end_off - j_end);
+            uint32_t j20 = (d2 >> 20) & 1;
+            uint32_t j10_1 = (d2 >> 1) & 0x3FF;
+            uint32_t j11 = (d2 >> 11) & 1;
+            uint32_t j19_12 = (d2 >> 12) & 0xFF;
+            patch32(fc->u, j_end, (j20 << 31) | (j10_1 << 21) | (j11 << 20) | (j19_12 << 12) | 0x0000006f);
+            return;
+        }
+
+        if (e->as.binary.op == BINOP_LOG_OR) {
+            compile_expr_riscv(fc, e->as.binary.lhs);
+            uint32_t bnez = fc->u->text_size;
+            emit32_le(fc->u, 0x00051063); /* bne a0, x0, .Ltrue */
+            compile_expr_riscv(fc, e->as.binary.rhs);
+            emit32_le(fc->u, 0x00a03533); /* sltu a0, x0, a0 */
+            uint32_t j_end = fc->u->text_size;
+            emit32_le(fc->u, 0x0000006f); /* jal x0, .Lend */
+            uint32_t true_off = fc->u->text_size;
+            int32_t d1 = (int32_t)(true_off - bnez);
+            uint32_t b12 = (d1 >> 12) & 1;
+            uint32_t b10_5 = (d1 >> 5) & 0x3F;
+            uint32_t b4_1 = (d1 >> 1) & 0xF;
+            uint32_t b11 = (d1 >> 11) & 1;
+            patch32(fc->u, bnez, (b12 << 31) | (b10_5 << 25) | (b4_1 << 8) | (b11 << 7) | 0x00051063);
+            emit32_le(fc->u, 0x00100513); /* li a0, 1 */
+            uint32_t end_off = fc->u->text_size;
+            int32_t d2 = (int32_t)(end_off - j_end);
+            uint32_t j20 = (d2 >> 20) & 1;
+            uint32_t j10_1 = (d2 >> 1) & 0x3FF;
+            uint32_t j11 = (d2 >> 11) & 1;
+            uint32_t j19_12 = (d2 >> 12) & 0xFF;
+            patch32(fc->u, j_end, (j20 << 31) | (j10_1 << 21) | (j11 << 20) | (j19_12 << 12) | 0x0000006f);
+            return;
+        }
+
+        compile_expr_riscv(fc, e->as.binary.lhs);
+        riscv_push(fc->u, 10 /*a0*/);
+        compile_expr_riscv(fc, e->as.binary.rhs);
+        emit32_le(fc->u, 0x00050613); /* mv a2, a0 (RHS) */
+        riscv_pop(fc->u, 10 /*a0*/);  /* pop LHS into a0 */
+
+        switch (e->as.binary.op) {
+            case BINOP_ADD: emit32_le(fc->u, 0x00c50533); break; /* add a0, a0, a2 */
+            case BINOP_SUB: emit32_le(fc->u, 0x40c50533); break; /* sub a0, a0, a2 */
+            case BINOP_MUL: emit32_le(fc->u, 0x02c50533); break; /* mul a0, a0, a2 */
+            case BINOP_DIV: emit32_le(fc->u, 0x02c54533); break; /* div a0, a0, a2 */
+            case BINOP_MOD: emit32_le(fc->u, 0x02c56533); break; /* remu a0, a0, a2 */
+            case BINOP_BIT_AND: emit32_le(fc->u, 0x00c57533); break; /* and a0, a0, a2 */
+            case BINOP_BIT_OR:  emit32_le(fc->u, 0x00c56533); break; /* or a0, a0, a2 */
+            case BINOP_BIT_XOR: emit32_le(fc->u, 0x00c54533); break; /* xor a0, a0, a2 */
+            case BINOP_SHL:     emit32_le(fc->u, 0x00c51533); break; /* sll a0, a0, a2 */
+            case BINOP_SHR:     emit32_le(fc->u, 0x00c55533); break; /* srl a0, a0, a2 */
+            case BINOP_EQ:
+                emit32_le(fc->u, 0x40c502b3); /* sub t0, a0, a2 */
+                emit32_le(fc->u, 0x0012b513); /* sltiu a0, t0, 1 (seqz a0, t0) */
+                break;
+            case BINOP_NE:
+                emit32_le(fc->u, 0x40c502b3); /* sub t0, a0, a2 */
+                emit32_le(fc->u, 0x00503533); /* sltu a0, x0, t0 (snez a0, t0) */
+                break;
+            case BINOP_LT:
+                emit32_le(fc->u, 0x00c53533); /* sltu a0, a0, a2 */
+                break;
+            case BINOP_LE:
+                emit32_le(fc->u, 0x00a63533); /* sltu a0, a2, a0 */
+                emit32_le(fc->u, 0x00154513); /* xori a0, a0, 1 */
+                break;
+            case BINOP_GT:
+                emit32_le(fc->u, 0x00a63533); /* sltu a0, a2, a0 */
+                break;
+            case BINOP_GE:
+                emit32_le(fc->u, 0x00c53533); /* sltu a0, a0, a2 */
+                emit32_le(fc->u, 0x00154513); /* xori a0, a0, 1 */
+                break;
+            default: break;
+        }
+        return;
+    }
+
+    if (e->kind == EXPR_CALL) {
+        int is_direct = (e->as.call.callee->kind == EXPR_VAR);
+        if (!is_direct) {
+            compile_expr_riscv(fc, e->as.call.callee);
+            riscv_push(fc->u, 10 /*a0*/);
+        }
+        uint32_t n = e->as.call.num_args;
+        for (uint32_t i = 0; i < n; ++i) {
+            compile_expr_riscv(fc, e->as.call.args[i]);
+            riscv_push(fc->u, 10 /*a0*/);
+        }
+        for (int i = (int)n - 1; i >= 0; --i) {
+            if (i < 6) riscv_pop(fc->u, 10 + i);
+            else riscv_pop(fc->u, 5 /*t0*/);
+        }
+        if (is_direct) {
+            const char *callee_name = e->as.call.callee->as.var_name;
+            add_call_fixup(fc, fc->u->text_size, callee_name);
+            emit32_le(fc->u, 0x000000ef); /* jal ra, 0 */
+        } else {
+            riscv_pop(fc->u, 5 /*t0*/);
+            emit32_le(fc->u, 0x000280e7); /* jalr ra, t0, 0 */
+        }
+        return;
+    }
+
+    if (e->kind == EXPR_SYSCALL) {
+        uint32_t n = e->as.syscall.num_args;
+        for (uint32_t i = 0; i < n; ++i) {
+            compile_expr_riscv(fc, e->as.syscall.args[i]);
+            riscv_push(fc->u, 10 /*a0*/);
+        }
+        if (e->as.syscall.nr->kind == EXPR_INT_LIT) {
+            uint64_t nr = e->as.syscall.nr->as.int_val;
+            if (nr == 1) nr = 64;       /* Linux SYS_write */
+            else if (nr == 60) nr = 93;  /* Linux SYS_exit */
+            riscv_emit_mov_imm(fc->u, 17 /*a7*/, nr);
+        } else {
+            compile_expr_riscv(fc, e->as.syscall.nr);
+            emit32_le(fc->u, 0x00050893); /* mv a7, a0 */
+            emit32_le(fc->u, 0x00100293); /* li t0, 1 */
+            emit32_le(fc->u, 0x00589463); /* bne a7, t0, +8 */
+            emit32_le(fc->u, 0x04000893); /* li a7, 64 */
+            emit32_le(fc->u, 0x03c00293); /* li t0, 60 */
+            emit32_le(fc->u, 0x00589463); /* bne a7, t0, +8 */
+            emit32_le(fc->u, 0x05d00893); /* li a7, 93 */
+        }
+        for (int i = (int)n - 1; i >= 0; --i) {
+            if (i < 6) riscv_pop(fc->u, 10 + i);
+            else riscv_pop(fc->u, 5 /*t0*/);
+        }
+        emit32_le(fc->u, 0x00000073); /* ecall */
+        return;
+    }
+}
+
+static void compile_stmt_riscv(FnCompiler *fc, RuStmt *s) {
+    if (s->kind == STMT_LET) {
+        VarBinding *vb = add_var(fc, s->as.let_stmt.name, s->as.let_stmt.type);
+        if (s->as.let_stmt.init) {
+            compile_expr_riscv(fc, s->as.let_stmt.init);
+            riscv_emit_mov_imm(fc->u, 5 /*t0*/, vb->rbp_offset);
+            emit32_le(fc->u, 0x405405b3); /* sub a1, s0, t0 */
+            uint32_t v_size = get_type_size_ctx(fc->module, vb->type);
+            if (v_size == 1) emit32_le(fc->u, 0x00a58023); /* sb a0, 0(a1) */
+            else if (v_size == 4) emit32_le(fc->u, 0x00a5a023); /* sw a0, 0(a1) */
+            else emit32_le(fc->u, 0x00a5b023); /* sd a0, 0(a1) */
+        }
+        return;
+    }
+
+    if (s->kind == STMT_ASSIGN) {
+        compile_lvalue_addr_riscv(fc, s->as.assign_stmt.lhs);
+        riscv_push(fc->u, 11 /*a1*/);
+        compile_expr_riscv(fc, s->as.assign_stmt.rhs);
+        riscv_pop(fc->u, 11 /*a1*/);
+        uint32_t store_size = get_lvalue_size(fc, s->as.assign_stmt.lhs);
+        if (store_size == 1) emit32_le(fc->u, 0x00a58023);
+        else if (store_size == 4) emit32_le(fc->u, 0x00a5a023);
+        else emit32_le(fc->u, 0x00a5b023);
+        return;
+    }
+
+    if (s->kind == STMT_IF) {
+        compile_expr_riscv(fc, s->as.if_stmt.cond);
+        uint32_t beqz = fc->u->text_size;
+        emit32_le(fc->u, 0x00050063); /* beq a0, x0, .Lelse */
+        for (uint32_t i = 0; i < s->as.if_stmt.then_count; ++i) {
+            compile_stmt_riscv(fc, s->as.if_stmt.then_stmts[i]);
+        }
+        uint32_t j_end = fc->u->text_size;
+        emit32_le(fc->u, 0x0000006f); /* jal x0, .Lend */
+        uint32_t else_off = fc->u->text_size;
+        int32_t d1 = (int32_t)(else_off - beqz);
+        uint32_t b12 = (d1 >> 12) & 1;
+        uint32_t b10_5 = (d1 >> 5) & 0x3F;
+        uint32_t b4_1 = (d1 >> 1) & 0xF;
+        uint32_t b11 = (d1 >> 11) & 1;
+        patch32(fc->u, beqz, (b12 << 31) | (b10_5 << 25) | (b4_1 << 8) | (b11 << 7) | 0x00050063);
+        for (uint32_t i = 0; i < s->as.if_stmt.else_count; ++i) {
+            compile_stmt_riscv(fc, s->as.if_stmt.else_stmts[i]);
+        }
+        uint32_t end_off = fc->u->text_size;
+        int32_t d2 = (int32_t)(end_off - j_end);
+        uint32_t j20 = (d2 >> 20) & 1;
+        uint32_t j10_1 = (d2 >> 1) & 0x3FF;
+        uint32_t j11 = (d2 >> 11) & 1;
+        uint32_t j19_12 = (d2 >> 12) & 0xFF;
+        patch32(fc->u, j_end, (j20 << 31) | (j10_1 << 21) | (j11 << 20) | (j19_12 << 12) | 0x0000006f);
+        return;
+    }
+
+    if (s->kind == STMT_WHILE) {
+        uint32_t loop_start = fc->u->text_size;
+        compile_expr_riscv(fc, s->as.while_stmt.cond);
+        uint32_t beqz = fc->u->text_size;
+        emit32_le(fc->u, 0x00050063); /* beq a0, x0, .Lend */
+        for (uint32_t i = 0; i < s->as.while_stmt.body_count; ++i) {
+            compile_stmt_riscv(fc, s->as.while_stmt.body_stmts[i]);
+        }
+        int32_t d_back = (int32_t)(loop_start - fc->u->text_size);
+        uint32_t j20 = (d_back >> 20) & 1;
+        uint32_t j10_1 = (d_back >> 1) & 0x3FF;
+        uint32_t j11 = (d_back >> 11) & 1;
+        uint32_t j19_12 = (d_back >> 12) & 0xFF;
+        emit32_le(fc->u, (j20 << 31) | (j10_1 << 21) | (j11 << 20) | (j19_12 << 12) | 0x0000006f);
+        uint32_t end_off = fc->u->text_size;
+        int32_t d_fwd = (int32_t)(end_off - beqz);
+        uint32_t b12 = (d_fwd >> 12) & 1;
+        uint32_t b10_5 = (d_fwd >> 5) & 0x3F;
+        uint32_t b4_1 = (d_fwd >> 1) & 0xF;
+        uint32_t b11 = (d_fwd >> 11) & 1;
+        patch32(fc->u, beqz, (b12 << 31) | (b10_5 << 25) | (b4_1 << 8) | (b11 << 7) | 0x00050063);
+        return;
+    }
+
+    if (s->kind == STMT_RETURN) {
+        if (s->as.return_stmt.expr) {
+            compile_expr_riscv(fc, s->as.return_stmt.expr);
+        } else {
+            emit32_le(fc->u, 0x00000513); /* li a0, 0 */
+        }
+        emit32_le(fc->u, 0xff040113); /* addi sp, s0, -16 */
+        emit32_le(fc->u, 0x00813083); /* ld ra, 8(sp) */
+        emit32_le(fc->u, 0x00013403); /* ld s0, 0(sp) */
+        emit32_le(fc->u, 0x01010113); /* addi sp, sp, 16 */
+        emit32_le(fc->u, 0x00008067); /* ret */
+        return;
+    }
+
+    if (s->kind == STMT_EXPR) {
+        compile_expr_riscv(fc, s->as.expr_stmt.expr);
+        return;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
 /*                          Top-Level Compiler Module                        */
 /* ------------------------------------------------------------------------- */
 
@@ -1035,7 +1897,13 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
 
         /* Align function start to 16 bytes */
         while (u->text_size % 16 != 0) {
-            emit8(u, 0x90); /* nop */
+            if (u->target_arch == 1) {
+                emit32_le(u, 0xd503201f); /* nop in ARM64 */
+            } else if (u->target_arch == 2) {
+                emit32_le(u, 0x00000013); /* nop in RISC-V (addi x0, x0, 0) */
+            } else {
+                emit8(u, 0x90);           /* nop in x86-64 */
+            }
         }
 
         uint32_t fn_start_offset = u->text_size;
@@ -1049,24 +1917,66 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
         compiled_fns[compiled_fn_count].text_offset = fn_start_offset;
         compiled_fn_count++;
 
-        if (u->target_arch == 1) {
-            /* ARM64 function: mov x0, 42; ret */
-            emit32_le(u, 0xd2800540);
-            emit32_le(u, 0xd65f03c0);
-        } else if (u->target_arch == 2) {
-            /* RISC-V 64 function: li a0, 42; ret */
-            emit32_le(u, 0x02a00513);
-            emit32_le(u, 0x00008067);
-        } else {
-            FnCompiler fc;
-            memset(&fc, 0, sizeof(fc));
-            fc.u = u;
-            fc.module = module;
-            fc.fn = fn;
-            fc.current_stack_offset = 0;
-            fc.rodata_base_vaddr = rodata_base;
+        FnCompiler fc;
+        memset(&fc, 0, sizeof(fc));
+        fc.u = u;
+        fc.module = module;
+        fc.fn = fn;
+        fc.current_stack_offset = 0;
+        fc.rodata_base_vaddr = rodata_base;
 
-            /* Prologue: allocate 4096 bytes for generous local stack frame */
+        if (u->target_arch == 1) {
+            /* ARM64 Prologue */
+            emit32_le(u, 0xa9bf7bfd); /* stp x29, x30, [sp, -16]! */
+            emit32_le(u, 0x910003fd); /* mov x29, sp */
+            emit32_le(u, 0xd14007ff); /* sub sp, sp, #4096 */
+
+            /* Save incoming parameters into stack slots */
+            for (uint32_t p_idx = 0; p_idx < fn->param_count && p_idx < 6; ++p_idx) {
+                VarBinding *vb = add_var(&fc, fn->params[p_idx].name, fn->params[p_idx].type);
+                arm64_emit_mov_imm64(u, 16, vb->rbp_offset);
+                emit32_le(u, 0xcb1003a1); /* sub x1, x29, x16 */
+                emit32_le(u, 0xf9000020 | p_idx); /* str x<p_idx>, [x1] */
+            }
+
+            for (uint32_t s_idx = 0; s_idx < fn->stmt_count; ++s_idx) {
+                compile_stmt_arm64(&fc, fn->body[s_idx]);
+            }
+
+            /* Default Epilogue */
+            emit32_le(u, 0xd2800000); /* movz x0, 0 */
+            emit32_le(u, 0x910003bf); /* mov sp, x29 */
+            emit32_le(u, 0xa8c17bfd); /* ldp x29, x30, [sp], 16 */
+            emit32_le(u, 0xd65f03c0); /* ret */
+        } else if (u->target_arch == 2) {
+            /* RISC-V 64 Prologue */
+            emit32_le(u, 0xff010113); /* addi sp, sp, -16 */
+            emit32_le(u, 0x00113423); /* sd ra, 8(sp) */
+            emit32_le(u, 0x00813023); /* sd s0, 0(sp) */
+            emit32_le(u, 0x01010413); /* addi s0, sp, 16 */
+            emit32_le(u, 0xe0010113); /* addi sp, sp, -512 */
+
+            /* Save incoming parameters into stack slots */
+            for (uint32_t p_idx = 0; p_idx < fn->param_count && p_idx < 6; ++p_idx) {
+                VarBinding *vb = add_var(&fc, fn->params[p_idx].name, fn->params[p_idx].type);
+                riscv_emit_mov_imm(u, 5 /*t0*/, vb->rbp_offset);
+                emit32_le(u, 0x405405b3); /* sub a1, s0, t0 */
+                emit32_le(u, 0x0005b023 | ((10 + p_idx) << 20)); /* sd a<p_idx>, 0(a1) */
+            }
+
+            for (uint32_t s_idx = 0; s_idx < fn->stmt_count; ++s_idx) {
+                compile_stmt_riscv(&fc, fn->body[s_idx]);
+            }
+
+            /* Default Epilogue */
+            emit32_le(u, 0x00000513); /* li a0, 0 */
+            emit32_le(u, 0xff040113); /* addi sp, s0, -16 */
+            emit32_le(u, 0x00813083); /* ld ra, 8(sp) */
+            emit32_le(u, 0x00013403); /* ld s0, 0(sp) */
+            emit32_le(u, 0x01010113); /* addi sp, sp, 16 */
+            emit32_le(u, 0x00008067); /* ret */
+        } else {
+            /* x86_64 Prologue: allocate 4096 bytes for generous local stack frame */
             emit8(u, 0x55);                                         /* push rbp */
             emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xe5);         /* mov rbp, rsp */
             emit8(u, 0x48); emit8(u, 0x81); emit8(u, 0xec);         /* sub rsp, 4096 */
@@ -1095,18 +2005,18 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
             emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xec);         /* mov rsp, rbp */
             emit8(u, 0x5d);                                         /* pop rbp */
             emit8(u, 0xc3);                                         /* ret */
-
-            /* Collect call fixups */
-            for (uint32_t k = 0; k < fc.call_fixup_count; ++k) {
-                if (all_fixup_count >= all_fixup_cap) {
-                    all_fixup_cap = all_fixup_cap ? all_fixup_cap * 2 : 64;
-                    all_fixups = (CallFixup *)realloc(all_fixups, all_fixup_cap * sizeof(CallFixup));
-                }
-                all_fixups[all_fixup_count++] = fc.call_fixups[k];
-            }
-            if (fc.call_fixups) free(fc.call_fixups);
-            if (fc.vars) free(fc.vars);
         }
+
+        /* Collect call fixups */
+        for (uint32_t k = 0; k < fc.call_fixup_count; ++k) {
+            if (all_fixup_count >= all_fixup_cap) {
+                all_fixup_cap = all_fixup_cap ? all_fixup_cap * 2 : 64;
+                all_fixups = (CallFixup *)realloc(all_fixups, all_fixup_cap * sizeof(CallFixup));
+            }
+            all_fixups[all_fixup_count++] = fc.call_fixups[k];
+        }
+        if (fc.call_fixups) free(fc.call_fixups);
+        if (fc.vars) free(fc.vars);
 
         uint32_t fn_size = u->text_size - fn_start_offset;
 
@@ -1139,8 +2049,24 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
             }
         }
         if (found) {
-            int32_t disp = (int32_t)(target_offset - (all_fixups[i].hole_offset + 4));
-            patch32(u, all_fixups[i].hole_offset, (uint32_t)disp);
+            if (u->target_arch == 0) {
+                int32_t disp = (int32_t)(target_offset - (all_fixups[i].hole_offset + 4));
+                patch32(u, all_fixups[i].hole_offset, (uint32_t)disp);
+            } else if (u->target_arch == 1) {
+                int32_t disp = (int32_t)(target_offset - all_fixups[i].hole_offset);
+                int32_t imm26 = disp / 4;
+                uint32_t insn = 0x94000000 | ((uint32_t)imm26 & 0x03FFFFFF);
+                patch32(u, all_fixups[i].hole_offset, insn);
+            } else if (u->target_arch == 2) {
+                int32_t disp = (int32_t)(target_offset - all_fixups[i].hole_offset);
+                uint32_t bit20 = (disp >> 20) & 1;
+                uint32_t bits10_1 = (disp >> 1) & 0x3FF;
+                uint32_t bit11 = (disp >> 11) & 1;
+                uint32_t bits19_12 = (disp >> 12) & 0xFF;
+                uint32_t imm = (bit20 << 31) | (bits10_1 << 21) | (bit11 << 20) | (bits19_12 << 12);
+                uint32_t insn = imm | 0x000000EF;
+                patch32(u, all_fixups[i].hole_offset, insn);
+            }
         } else {
             bool is_ext = false;
             uint64_t sym_h = spark0_hash_str(all_fixups[i].callee_name);

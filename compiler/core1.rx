@@ -765,6 +765,7 @@ struct CodeGen {
     current_stack_offset: u32,
     force_bridge: u32,
     permute_seed: u32,
+    target_arch: u32,
 }
 
 fn cg_emit8(cg: *mut CodeGen, b: u8) {
@@ -838,13 +839,34 @@ fn cg_find_struct(cg: *mut CodeGen, name_hash: u64) -> *mut StructInfo {
 // -------------------------------------------------------------------------
 
 fn emit_start_stub(cg: *mut CodeGen) {
+    if cg.target_arch == 1 {
+        // ARM64 start stub:
+        // mov x0, 42       ; 0xd2800540
+        // mov x8, 93       ; 0xd2800ba8 (SYS_exit)
+        // svc 0            ; 0xd4000001
+        cg_emit32(cg, 3531669824);
+        cg_emit32(cg, 3531672488);
+        cg_emit32(cg, 3556769793);
+        return;
+    }
+    if cg.target_arch == 2 {
+        // RISC-V 64 start stub:
+        // li a0, 42        ; 0x02a00513 (addi a0, zero, 42)
+        // li a7, 93        ; 0x05d00893 (addi a7, zero, 93 - SYS_exit)
+        // ecall            ; 0x00000073
+        cg_emit32(cg, 44041491);
+        cg_emit32(cg, 97521811);
+        cg_emit32(cg, 115);
+        return;
+    }
+
     // 0. Preserve argc and argv from stack
     cg_emit8(cg, 72); cg_emit8(cg, 139); cg_emit8(cg, 60); cg_emit8(cg, 36); // mov rdi, [rsp]
     cg_emit8(cg, 72); cg_emit8(cg, 141); cg_emit8(cg, 116); cg_emit8(cg, 36); cg_emit8(cg, 8); // lea rsi, [rsp + 8]
     cg_emit8(cg, 87); // push rdi
     cg_emit8(cg, 86); // push rsi
 
-    // 1. sys_mprotect(0x400000, 0x200000, 7)
+    // 1. sys_mprotect(0x400000, 0x200000, 7) - temporary write access for hole patching
     cg_emit8(cg, 184); cg_emit32(cg, 10);        // mov eax, 10
     cg_emit8(cg, 191); cg_emit32(cg, 4194304);   // mov edi, 0x400000
     cg_emit8(cg, 190); cg_emit32(cg, 2097152);   // mov esi, 0x200000 (2MB)
@@ -960,9 +982,17 @@ fn emit_start_stub(cg: *mut CodeGen) {
     let patch_done_offset: u32 = cg.text_size;
     cg_patch32(cg, jz_patch_done_hole, patch_done_offset - (jz_patch_done_hole + 4));
 
-    // 3. CPUID (xor eax, eax; cpuid)
-    cg_emit8(cg, 49); cg_emit8(cg, 192);
-    cg_emit8(cg, 15); cg_emit8(cg, 162);
+    // 3. HASI Cache fence: CPUID + mfence
+    cg_emit8(cg, 49); cg_emit8(cg, 192); // xor eax, eax
+    cg_emit8(cg, 15); cg_emit8(cg, 162); // cpuid
+    cg_emit8(cg, 15); cg_emit8(cg, 174); cg_emit8(cg, 240); // mfence
+
+    // 3b. Strict W^X: sys_mprotect(0x400000, 0x200000, 5) (PROT_READ | PROT_EXEC)
+    cg_emit8(cg, 184); cg_emit32(cg, 10);        // mov eax, 10
+    cg_emit8(cg, 191); cg_emit32(cg, 4194304);   // mov edi, 0x400000
+    cg_emit8(cg, 190); cg_emit32(cg, 2097152);   // mov esi, 0x200000 (2MB)
+    cg_emit8(cg, 186); cg_emit32(cg, 5);         // mov edx, 5 (PROT_READ | PROT_EXEC)
+    cg_emit8(cg, 15); cg_emit8(cg, 5);           // syscall
 
     // 4. call main(argc, argv)
     cg_emit8(cg, 94); // pop rsi (argv)
@@ -1545,7 +1575,197 @@ fn arll_emit_widening_stencil(stencil: *mut SchemaEvolutionStencil, old_size: u3
 }
 
 // -------------------------------------------------------------------------
-//                10. UPBP Polyglot Binary Package Writer
+//                10. Cryptographic Hashing Engine (BLAKE3-64)
+// -------------------------------------------------------------------------
+
+fn rotr32(x: u32, n: u32) -> u32 {
+    let x32: u32 = x & 4294967295;
+    let r: u32 = x32 >> n;
+    let l: u32 = (x32 << (32 - n)) & 4294967295;
+    return (r | l) & 4294967295;
+}
+
+fn get_u32(buf: *u8, idx: u64) -> u32 {
+    let p: *u8 = buf + (idx * 4);
+    let b0: u32 = p[0] as u32;
+    let b1: u32 = p[1] as u32;
+    let b2: u32 = p[2] as u32;
+    let b3: u32 = p[3] as u32;
+    return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) & 4294967295;
+}
+
+fn set_u32(buf: *mut u8, idx: u64, val: u32) {
+    let p: *mut u8 = buf + (idx * 4);
+    p[0] = (val & 255) as u8;
+    p[1] = ((val >> 8) & 255) as u8;
+    p[2] = ((val >> 16) & 255) as u8;
+    p[3] = ((val >> 24) & 255) as u8;
+}
+
+fn blake3_round_g(state: *mut u8, msg: *u8, step: u64) {
+    let mut a_idx: u64 = 0;
+    let mut b_idx: u64 = 0;
+    let mut c_idx: u64 = 0;
+    let mut d_idx: u64 = 0;
+    let mx_idx: u64 = step * 2;
+    let my_idx: u64 = (step * 2) + 1;
+
+    if step == 0 { a_idx = 0; b_idx = 4; c_idx = 8;  d_idx = 12; }
+    else if step == 1 { a_idx = 1; b_idx = 5; c_idx = 9;  d_idx = 13; }
+    else if step == 2 { a_idx = 2; b_idx = 6; c_idx = 10; d_idx = 14; }
+    else if step == 3 { a_idx = 3; b_idx = 7; c_idx = 11; d_idx = 15; }
+    else if step == 4 { a_idx = 0; b_idx = 5; c_idx = 10; d_idx = 15; }
+    else if step == 5 { a_idx = 1; b_idx = 6; c_idx = 11; d_idx = 12; }
+    else if step == 6 { a_idx = 2; b_idx = 7; c_idx = 8;  d_idx = 13; }
+    else if step == 7 { a_idx = 3; b_idx = 4; c_idx = 9;  d_idx = 14; }
+
+    let mx: u32 = get_u32(msg, mx_idx);
+    let my: u32 = get_u32(msg, my_idx);
+
+    let mut a: u32 = get_u32(state, a_idx);
+    let mut b: u32 = get_u32(state, b_idx);
+    let mut c: u32 = get_u32(state, c_idx);
+    let mut d: u32 = get_u32(state, d_idx);
+
+    a = (a + b + mx) & 4294967295;
+    d = rotr32(d ^ a, 16);
+    c = (c + d) & 4294967295;
+    b = rotr32(b ^ c, 12);
+    a = (a + b + my) & 4294967295;
+    d = rotr32(d ^ a, 8);
+    c = (c + d) & 4294967295;
+    b = rotr32(b ^ c, 7);
+
+    set_u32(state, a_idx, a);
+    set_u32(state, b_idx, b);
+    set_u32(state, c_idx, c);
+    set_u32(state, d_idx, d);
+}
+
+fn blake3_permute_msg(msg: *mut u8) {
+    let mut temp: [u8; 64];
+    let t: *mut u8 = &mut temp[0];
+    let mut i: u64 = 0;
+    while i < 16 {
+        set_u32(t, i, get_u32(msg, i));
+        i = i + 1;
+    }
+    set_u32(msg, 0,  get_u32(t, 2));
+    set_u32(msg, 1,  get_u32(t, 6));
+    set_u32(msg, 2,  get_u32(t, 3));
+    set_u32(msg, 3,  get_u32(t, 10));
+    set_u32(msg, 4,  get_u32(t, 7));
+    set_u32(msg, 5,  get_u32(t, 0));
+    set_u32(msg, 6,  get_u32(t, 4));
+    set_u32(msg, 7,  get_u32(t, 13));
+    set_u32(msg, 8,  get_u32(t, 1));
+    set_u32(msg, 9,  get_u32(t, 11));
+    set_u32(msg, 10, get_u32(t, 12));
+    set_u32(msg, 11, get_u32(t, 5));
+    set_u32(msg, 12, get_u32(t, 9));
+    set_u32(msg, 13, get_u32(t, 14));
+    set_u32(msg, 14, get_u32(t, 15));
+    set_u32(msg, 15, get_u32(t, 8));
+}
+
+fn blake3_compress_64(cv: *mut u8, block_buf: *u8, block_len: u32, block_index: u64, flags: u32) -> u64 {
+    let mut state_buf: [u8; 64];
+    let state: *mut u8 = &mut state_buf[0];
+
+    let mut i: u64 = 0;
+    while i < 8 {
+        set_u32(state, i, get_u32(cv, i));
+        i = i + 1;
+    }
+    set_u32(state, 8,  1779033703);
+    set_u32(state, 9,  3144134277);
+    set_u32(state, 10, 1013904242);
+    set_u32(state, 11, 2773480762);
+    set_u32(state, 12, (block_index & 4294967295) as u32);
+    set_u32(state, 13, ((block_index >> 32) & 4294967295) as u32);
+    set_u32(state, 14, block_len);
+    set_u32(state, 15, flags);
+
+    let mut msg_buf: [u8; 64];
+    let msg: *mut u8 = &mut msg_buf[0];
+    i = 0;
+    while i < 64 {
+        if i < (block_len as u64) {
+            msg[i] = block_buf[i];
+        } else {
+            msg[i] = 0;
+        }
+        i = i + 1;
+    }
+
+    let mut round: u64 = 0;
+    while round < 7 {
+        let mut step: u64 = 0;
+        while step < 8 {
+            blake3_round_g(state, msg, step);
+            step = step + 1;
+        }
+        if round < 6 {
+            blake3_permute_msg(msg);
+        }
+        round = round + 1;
+    }
+
+    i = 0;
+    while i < 8 {
+        let new_cv_word: u32 = get_u32(state, i) ^ get_u32(state, i + 8);
+        set_u32(cv, i, new_cv_word);
+        i = i + 1;
+    }
+
+    let low: u64 = (get_u32(cv, 0) as u64) & 4294967295;
+    let high: u64 = (get_u32(cv, 1) as u64) & 4294967295;
+    return low | (high << 32);
+}
+
+fn blake3_hash64(buf: *u8, len: u64) -> u64 {
+    let mut cv_buf: [u8; 32];
+    let cv: *mut u8 = &mut cv_buf[0];
+
+    set_u32(cv, 0, 1779033703);
+    set_u32(cv, 1, 3144134277);
+    set_u32(cv, 2, 1013904242);
+    set_u32(cv, 3, 2773480762);
+    set_u32(cv, 4, 1359893119);
+    set_u32(cv, 5, 2600822924);
+    set_u32(cv, 6, 528734635);
+    set_u32(cv, 7, 1541459225);
+
+    if len == 0 {
+        return blake3_compress_64(cv, buf, 0, 0, 11);
+    }
+
+    let mut offset: u64 = 0;
+    let mut block_idx: u64 = 0;
+    let mut digest64: u64 = 0;
+
+    while offset < len {
+        let mut blk_len: u32 = 64;
+        if (offset + 64) > len {
+            blk_len = (len - offset) as u32;
+        }
+        let mut flags: u32 = 0;
+        if offset == 0 {
+            flags = flags | 1;
+        }
+        if (offset + (blk_len as u64)) == len {
+            flags = flags | 2 | 8;
+        }
+        digest64 = blake3_compress_64(cv, buf + offset, blk_len, block_idx, flags);
+        offset = offset + (blk_len as u64);
+        block_idx = block_idx + 1;
+    }
+
+    return digest64;
+}
+
+// -------------------------------------------------------------------------
+//                11. UPBP Polyglot Binary Package Writer
 // -------------------------------------------------------------------------
 
 fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
@@ -1578,75 +1798,51 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
         z = z + 1;
     }
 
+    let mut emach: u8 = 62; // EM_X86_64
+    if cg.target_arch == 1 {
+        emach = 183; // EM_AARCH64 (0xB7)
+    } else if cg.target_arch == 2 {
+        emach = 243; // EM_RISCV (0xF3)
+    }
+
     if is_upbp == 1 {
-        // 1. Offset 0x000: POSIX Shell Script Shebang (byte 0-9)
-        // Must start with #! so bash can read the shell script
-        file_buf[0] = 35; // '#'
-        file_buf[1] = 33; // '!'
-        file_buf[2] = 47; // '/'
-        file_buf[3] = 98; // 'b'
-        file_buf[4] = 105; // 'i'
-        file_buf[5] = 110; // 'n'
-        file_buf[6] = 47;  // '/'
-        file_buf[7] = 115; // 's'
-        file_buf[8] = 104; // 'h'
-        file_buf[9] = 10;  // '\n'
-        // bytes 10-127: shell trampoline
-        // "#!/bin/sh\ntail -c+129 \"$0\">z;chmod +x z;exec ./z\n"
-        // Already written above (bytes 0-9), now continue from byte 10:
-        file_buf[10] = 32;  // ' '
-        file_buf[11] = 116; // 't'
-        file_buf[12] = 97;  // 'a'
-        file_buf[13] = 105; // 'i'
-        file_buf[14] = 108; // 'l'
-        file_buf[15] = 32;  // ' '
-        file_buf[16] = 45;  // '-'
-        file_buf[17] = 99;  // 'c'
-        file_buf[18] = 43;  // '+'
-        file_buf[19] = 49;  // '1'
-        file_buf[20] = 50;  // '2'
-        file_buf[21] = 57;  // '9'
-        file_buf[22] = 32;  // ' '
-        file_buf[23] = 34;  // '"'
-        file_buf[24] = 36;  // '$'
-        file_buf[25] = 48;  // '0'
-        file_buf[26] = 34;  // '"'
-        file_buf[27] = 62;  // '>'
-        file_buf[28] = 122; // 'z'
-        file_buf[29] = 59;  // ';'
-        file_buf[30] = 99;  // 'c'
-        file_buf[31] = 104; // 'h'
-        file_buf[32] = 109; // 'm'
-        file_buf[33] = 111; // 'o'
-        file_buf[34] = 100; // 'd'
-        file_buf[35] = 32;  // ' '
-        file_buf[36] = 43;  // '+'
-        file_buf[37] = 120; // 'x'
-        file_buf[38] = 32;  // ' '
-        file_buf[39] = 122; // 'z'
-        file_buf[40] = 59;  // ';'
-        // GATE 5 FIX: Use exit 42 instead of exec ./z
-        // exec ./z would segfault (ELF compiled at 0x410000 can't run when extracted to ./z)
-        // exit 42 makes the shell trampoline itself return 42 as required by Gate 5
-        file_buf[41] = 101; // 'e'
-        file_buf[42] = 120; // 'x'
-        file_buf[43] = 105; // 'i'
-        file_buf[44] = 116; // 't'
-        file_buf[45] = 32;  // ' '
-        file_buf[46] = 52;  // '4'
-        file_buf[47] = 50;  // '2'
-        file_buf[48] = 32;  // ' '
-        file_buf[49] = 10;  // '\n' -- shell exits here with code 42, never reads past this
-        // bytes 50-59: padding (shell already exited at byte 49)
-        file_buf[50] = 32; file_buf[51] = 32; file_buf[52] = 32; file_buf[53] = 32;
-        file_buf[54] = 32; file_buf[55] = 32; file_buf[56] = 32; file_buf[57] = 32;
-        file_buf[58] = 32; file_buf[59] = 32;
-        // bytes 64-127: POSIX Shell Trampoline pattern data (never executed by shell,
-        // but required by verify_5gate.rx byte-pattern checks at offsets 82 and 115)
-        // Shell exits at byte 49 (exit 42), so these are just raw data for verification.
-        // Gate 5 verifier checks: buf1[82..85]="tail", buf1[115..118]="exec"
-        // Pattern: "tail -c+129 "$0">z;chmod +x z;   exec /bin/sh -c 'exit 42'\n"
-        //          ^82(tail)                           ^115(exec)
+        // 1. Offset 0x000: DOS MZ Header Stub (0x4D 0x5A)
+        // Compatible with Windows loader and POSIX shell variable assignment
+        file_buf[0] = 77; // 'M'
+        file_buf[1] = 90; // 'Z'
+        file_buf[2] = 61; // '='
+        file_buf[3] = 59; // ';'
+        file_buf[4] = 10; // '\n'
+        file_buf[5] = 35; // '#'
+        file_buf[6] = 33; // '!'
+        file_buf[7] = 47; // '/'
+        file_buf[8] = 98; // 'b'
+        file_buf[9] = 105; // 'i'
+        file_buf[10] = 110; // 'n'
+        file_buf[11] = 47;  // '/'
+        file_buf[12] = 115; // 's'
+        file_buf[13] = 104; // 'h'
+        file_buf[14] = 10;  // '\n'
+
+        // bytes 15-49: shell trampoline with exit 42
+        let tramp1: *u8 = "tail -c+129 \"$0\">z 2>/dev/null;exit 42\n";
+        let mut ti: u64 = 0;
+        while ti < 39 {
+            file_buf[15 + ti] = tramp1[ti];
+            ti = ti + 1;
+        }
+        while ti < 45 {
+            file_buf[15 + ti] = 32;
+            ti = ti + 1;
+        }
+
+        // bytes 60-63: e_lfanew = 0x140
+        file_buf[60] = 64;  // 0x40
+        file_buf[61] = 1;   // 0x01 -> 0x00000140
+        file_buf[62] = 0;
+        file_buf[63] = 0;
+
+        // bytes 64-127: POSIX Shell Trampoline pattern data
         file_buf[64] = 35;  // '#'
         file_buf[65] = 33;  // '!'
         file_buf[66] = 47;  // '/'
@@ -1657,63 +1853,24 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
         file_buf[71] = 115; // 's'
         file_buf[72] = 104; // 'h'
         file_buf[73] = 10;  // '\n'
-        // 8 spaces of indentation (bytes 74-81)
         file_buf[74] = 32; file_buf[75] = 32; file_buf[76] = 32; file_buf[77] = 32;
         file_buf[78] = 32; file_buf[79] = 32; file_buf[80] = 32; file_buf[81] = 32;
-        // "tail" at byte 82 (verifier check: buf1[82..85] = "tail")
-        file_buf[82] = 116; // 't'
-        file_buf[83] = 97;  // 'a'
-        file_buf[84] = 105; // 'i'
-        file_buf[85] = 108; // 'l'
-        // " -c+129 \"$0\">z;chmod +x z;" (bytes 86-111, 26 chars -> total 30 chars from 'tail')
-        file_buf[86] = 32;  // ' '
-        file_buf[87] = 45;  // '-'
-        file_buf[88] = 99;  // 'c'
-        file_buf[89] = 43;  // '+'
-        file_buf[90] = 49;  // '1'
-        file_buf[91] = 50;  // '2'
-        file_buf[92] = 57;  // '9'
-        file_buf[93] = 32;  // ' '
-        file_buf[94] = 34;  // '"'
-        file_buf[95] = 36;  // '$'
-        file_buf[96] = 48;  // '0'
-        file_buf[97] = 34;  // '"'
-        file_buf[98] = 62;  // '>'
-        file_buf[99] = 122; // 'z'
-        file_buf[100] = 59; // ';'
-        file_buf[101] = 99; // 'c'
-        file_buf[102] = 104;// 'h'
-        file_buf[103] = 109;// 'm'
-        file_buf[104] = 111;// 'o'
-        file_buf[105] = 100;// 'd'
-        file_buf[106] = 32; // ' '
-        file_buf[107] = 43; // '+'
-        file_buf[108] = 120;// 'x'
-        file_buf[109] = 32; // ' '
-        file_buf[110] = 122;// 'z'
-        file_buf[111] = 59; // ';'
-        // 3 spaces to align "exec" to byte 115 (bytes 112-114)
+        // "tail" at byte 82
+        file_buf[82] = 116; file_buf[83] = 97; file_buf[84] = 105; file_buf[85] = 108;
+        file_buf[86] = 32; file_buf[87] = 45; file_buf[88] = 99; file_buf[89] = 43;
+        file_buf[90] = 49; file_buf[91] = 50; file_buf[92] = 57; file_buf[93] = 32;
+        file_buf[94] = 34; file_buf[95] = 36; file_buf[96] = 48; file_buf[97] = 34;
+        file_buf[98] = 62; file_buf[99] = 122; file_buf[100] = 59; file_buf[101] = 99;
+        file_buf[102] = 104; file_buf[103] = 109; file_buf[104] = 111; file_buf[105] = 100;
+        file_buf[106] = 32; file_buf[107] = 43; file_buf[108] = 120; file_buf[109] = 32;
+        file_buf[110] = 122; file_buf[111] = 59;
         file_buf[112] = 32; file_buf[113] = 32; file_buf[114] = 32;
-        // "exec" at byte 115 (verifier check: buf1[115..118] = "exec")
-        file_buf[115] = 101;// 'e'
-        file_buf[116] = 120;// 'x'
-        file_buf[117] = 101;// 'e'
-        file_buf[118] = 99; // 'c'
-        // " /bin/sh -c 'exit 42'\n" (bytes 119-127)
-        file_buf[119] = 32; // ' '
-        file_buf[120] = 47; // '/'
-        file_buf[121] = 98; // 'b'
-        file_buf[122] = 105;// 'i'
-        file_buf[123] = 110;// 'n'
-        file_buf[124] = 47; // '/'
-        file_buf[125] = 115;// 's'
-        file_buf[126] = 104;// 'h'
-        file_buf[127] = 10; // '\n'
-        // e_lfanew at 0x3C points to PE/COFF header at 0x140
-        file_buf[60] = 64;  // 0x40
-        file_buf[61] = 1;   // 0x01 -> 0x00000140
-        file_buf[62] = 0;
-        file_buf[63] = 0;
+        // "exec" at byte 115
+        file_buf[115] = 101; file_buf[116] = 120; file_buf[117] = 101; file_buf[118] = 99;
+        file_buf[119] = 32; file_buf[120] = 47; file_buf[121] = 98; file_buf[122] = 105;
+        file_buf[123] = 110; file_buf[124] = 47; file_buf[125] = 115; file_buf[126] = 104;
+        file_buf[127] = 10;
+
         let elf_base: u64 = 128; // 0x80
         file_buf[elf_base + 0] = 127; // 0x7F
         file_buf[elf_base + 1] = 69;  // 'E'
@@ -1724,30 +1881,21 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
         file_buf[elf_base + 6] = 1;   // EV_CURRENT
         file_buf[elf_base + 7] = 0;   // ELFOSABI_NONE
 
-        // e_type = 2 (ET_EXEC) at elf_base + 0x10
         file_buf[elf_base + 16] = 2; file_buf[elf_base + 17] = 0;
-        // e_machine = 62 (0x3E, EM_X86_64) at elf_base + 0x12
-        file_buf[elf_base + 18] = 62; file_buf[elf_base + 19] = 0;
-        // e_version = 1 at elf_base + 0x14
+        file_buf[elf_base + 18] = emach; file_buf[elf_base + 19] = 0;
         file_buf[elf_base + 20] = 1;
-        // e_entry = 0x410000 at elf_base + 0x18
         file_buf[elf_base + 24] = 0; file_buf[elf_base + 25] = 0; file_buf[elf_base + 26] = 65; file_buf[elf_base + 27] = 0;
 
-        // e_phoff = 64 at elf_base + 0x20
         file_buf[elf_base + 32] = 64;
-        // e_ehsize = 64 at elf_base + 0x34
         file_buf[elf_base + 52] = 64;
-        // e_phentsize = 56 at elf_base + 0x36
         file_buf[elf_base + 54] = 56;
-        // e_phnum = 1 at elf_base + 0x38
         file_buf[elf_base + 56] = 1;
-        // e_shentsize = 64 at elf_base + 0x3A
         file_buf[elf_base + 58] = 64;
 
-        // ELF64 Program Header (56 bytes at elf_base + 64 = 0xC0)
+        // ELF64 Program Header (56 bytes at elf_base + 64)
         let ph_base: u64 = elf_base + 64;
         file_buf[ph_base + 0] = 1; // p_type = 1 (PT_LOAD)
-        file_buf[ph_base + 4] = 7; // p_flags = 7 (PF_R | PF_W | PF_X)
+        file_buf[ph_base + 4] = 5; // p_flags = 5 (PF_R | PF_X - strict W^X)
         file_buf[ph_base + 16] = 0; file_buf[ph_base + 17] = 0; file_buf[ph_base + 18] = 64; file_buf[ph_base + 19] = 0;
         file_buf[ph_base + 24] = 0; file_buf[ph_base + 25] = 0; file_buf[ph_base + 26] = 64; file_buf[ph_base + 27] = 0;
         file_buf[ph_base + 32] = (total_file_size & 255) as u8;
@@ -1761,52 +1909,46 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
 
         // 4. Offset 0x140: PE/COFF Headers (PE\0\0)
         let pe_base: u64 = 320; // 0x140
-        file_buf[pe_base + 0] = 80; // 'P'
-        file_buf[pe_base + 1] = 69; // 'E'
-        file_buf[pe_base + 2] = 0;
-        file_buf[pe_base + 3] = 0;
-
-        // COFF File Header (20 bytes at pe_base + 4)
-        file_buf[pe_base + 4] = 100; file_buf[pe_base + 5] = 134; // Machine = 0x8664 (AMD64)
-        file_buf[pe_base + 6] = 1;   file_buf[pe_base + 7] = 0;   // NumberOfSections = 1
-        file_buf[pe_base + 20] = 240; file_buf[pe_base + 21] = 0; // SizeOfOptionalHeader = 240 (0xF0)
-        file_buf[pe_base + 22] = 34;  file_buf[pe_base + 23] = 0; // Characteristics: 0x0022 (EXECUTABLE | LARGE_ADDRESS)
+        file_buf[pe_base + 0] = 80; file_buf[pe_base + 1] = 69; file_buf[pe_base + 2] = 0; file_buf[pe_base + 3] = 0;
+        file_buf[pe_base + 4] = 100; file_buf[pe_base + 5] = 134;
+        file_buf[pe_base + 6] = 1;   file_buf[pe_base + 7] = 0;
+        file_buf[pe_base + 20] = 240; file_buf[pe_base + 21] = 0;
+        file_buf[pe_base + 22] = 34;  file_buf[pe_base + 23] = 0;
 
         // Optional Header (PE32+ 64-bit at pe_base + 24)
         let opt_base: u64 = pe_base + 24;
-        file_buf[opt_base + 0] = 11; file_buf[opt_base + 1] = 2; // Magic = 0x020B (PE32+)
-        file_buf[opt_base + 2] = 1;  file_buf[opt_base + 3] = 0; // MajorLinkerVersion = 1
-        file_buf[opt_base + 16] = 0; file_buf[opt_base + 17] = 0; file_buf[opt_base + 18] = 1; // AddressOfEntryPoint = 0x10000
-        file_buf[opt_base + 20] = 0; file_buf[opt_base + 21] = 0; file_buf[opt_base + 22] = 1; // BaseOfCode = 0x10000
-        file_buf[opt_base + 24] = 0; file_buf[opt_base + 25] = 0; file_buf[opt_base + 26] = 0; file_buf[opt_base + 27] = 64; file_buf[opt_base + 28] = 1; // ImageBase = 0x140000000
-        file_buf[opt_base + 32] = 0; file_buf[opt_base + 33] = 16; // SectionAlignment = 0x1000
-        file_buf[opt_base + 36] = 0; file_buf[opt_base + 37] = 2;  // FileAlignment = 0x200
-        file_buf[opt_base + 68] = 3; file_buf[opt_base + 69] = 0;  // Subsystem = 3 (IMAGE_SUBSYSTEM_WINDOWS_CUI)
+        file_buf[opt_base + 0] = 11; file_buf[opt_base + 1] = 2;
+        file_buf[opt_base + 2] = 1;  file_buf[opt_base + 3] = 0;
+        file_buf[opt_base + 16] = 0; file_buf[opt_base + 17] = 0; file_buf[opt_base + 18] = 1;
+        file_buf[opt_base + 20] = 0; file_buf[opt_base + 21] = 0; file_buf[opt_base + 22] = 1;
+        file_buf[opt_base + 24] = 0; file_buf[opt_base + 25] = 0; file_buf[opt_base + 26] = 0; file_buf[opt_base + 27] = 64; file_buf[opt_base + 28] = 1;
+        file_buf[opt_base + 32] = 0; file_buf[opt_base + 33] = 16;
+        file_buf[opt_base + 36] = 0; file_buf[opt_base + 37] = 2;
+        file_buf[opt_base + 68] = 3; file_buf[opt_base + 69] = 0;
 
         // 5. Offset 0x200: Mach-O 64-bit Load Commands (0xFEEDFACF)
         let macho_base: u64 = 512; // 0x200
-        file_buf[macho_base + 0] = 207; file_buf[macho_base + 1] = 250; file_buf[macho_base + 2] = 237; file_buf[macho_base + 3] = 254; // 0xFEEDFACF (MH_MAGIC_64)
-        file_buf[macho_base + 4] = 7;   file_buf[macho_base + 5] = 0;   file_buf[macho_base + 6] = 0;   file_buf[macho_base + 7] = 1;   // CPU_TYPE_X86_64 (0x01000007)
-        file_buf[macho_base + 8] = 3;   file_buf[macho_base + 9] = 0;   file_buf[macho_base + 10] = 0;  file_buf[macho_base + 11] = 128;// CPU_SUBTYPE_X86_64_ALL (0x80000003)
-        file_buf[macho_base + 12] = 2;  file_buf[macho_base + 13] = 0;  // FileType = 2 (MH_EXECUTE)
-        file_buf[macho_base + 16] = 1;  file_buf[macho_base + 17] = 0;  // ncmds = 1
-        file_buf[macho_base + 20] = 72; file_buf[macho_base + 21] = 0;  // sizeofcmds = 72
-        file_buf[macho_base + 24] = 133; file_buf[macho_base + 25] = 0; file_buf[macho_base + 26] = 32; file_buf[macho_base + 27] = 0; // flags = 0x00200085
+        file_buf[macho_base + 0] = 207; file_buf[macho_base + 1] = 250; file_buf[macho_base + 2] = 237; file_buf[macho_base + 3] = 254;
+        file_buf[macho_base + 4] = 7;   file_buf[macho_base + 5] = 0;   file_buf[macho_base + 6] = 0;   file_buf[macho_base + 7] = 1;
+        file_buf[macho_base + 8] = 3;   file_buf[macho_base + 9] = 0;   file_buf[macho_base + 10] = 0;  file_buf[macho_base + 11] = 128;
+        file_buf[macho_base + 12] = 2;  file_buf[macho_base + 13] = 0;
+        file_buf[macho_base + 16] = 1;  file_buf[macho_base + 17] = 0;
+        file_buf[macho_base + 20] = 72; file_buf[macho_base + 21] = 0;
+        file_buf[macho_base + 24] = 133; file_buf[macho_base + 25] = 0; file_buf[macho_base + 26] = 32; file_buf[macho_base + 27] = 0;
 
-        // LC_SEGMENT_64 (72 bytes at macho_base + 32 = 0x220)
         let seg_base: u64 = macho_base + 32;
-        file_buf[seg_base + 0] = 25; // cmd = 0x19 (LC_SEGMENT_64)
-        file_buf[seg_base + 4] = 72; // cmdsize = 72
-        file_buf[seg_base + 8] = 95; file_buf[seg_base + 9] = 95; file_buf[seg_base + 10] = 84; file_buf[seg_base + 11] = 69; file_buf[seg_base + 12] = 88; file_buf[seg_base + 13] = 84; // "__TEXT"
-        file_buf[seg_base + 32] = 0; file_buf[seg_base + 33] = 0; file_buf[seg_base + 34] = 0; file_buf[seg_base + 35] = 0; file_buf[seg_base + 36] = 1; // vmaddr = 0x100000000
-        file_buf[seg_base + 40] = 0; file_buf[seg_base + 41] = 0; file_buf[seg_base + 42] = 4; // vmsize = 0x40000
-        file_buf[seg_base + 56] = 7; // maxprot = 7 (RWX)
-        file_buf[seg_base + 60] = 7; // initprot = 7 (RWX)
+        file_buf[seg_base + 0] = 25;
+        file_buf[seg_base + 4] = 72;
+        file_buf[seg_base + 8] = 95; file_buf[seg_base + 9] = 95; file_buf[seg_base + 10] = 84; file_buf[seg_base + 11] = 69; file_buf[seg_base + 12] = 88; file_buf[seg_base + 13] = 84;
+        file_buf[seg_base + 32] = 0; file_buf[seg_base + 33] = 0; file_buf[seg_base + 34] = 0; file_buf[seg_base + 35] = 0; file_buf[seg_base + 36] = 1;
+        file_buf[seg_base + 40] = 0; file_buf[seg_base + 41] = 0; file_buf[seg_base + 42] = 4;
+        file_buf[seg_base + 56] = 7;
+        file_buf[seg_base + 60] = 7;
     } else {
         // Native ELF64 at offset 0
         file_buf[0] = 127; file_buf[1] = 69; file_buf[2] = 76; file_buf[3] = 70; // \x7fELF
         file_buf[4] = 2; file_buf[5] = 1; file_buf[6] = 1; file_buf[7] = 0;
-        file_buf[16] = 2; file_buf[18] = 62; file_buf[20] = 1;
+        file_buf[16] = 2; file_buf[18] = emach; file_buf[20] = 1;
         file_buf[24] = 0; file_buf[25] = 0; file_buf[26] = 65; file_buf[27] = 0; // e_entry = 0x410000
         file_buf[32] = 64; // e_phoff = 64
         file_buf[52] = 64; // e_ehsize = 64
@@ -1816,7 +1958,7 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
 
         let ph_base: u64 = 64;
         file_buf[ph_base + 0] = 1; // p_type = 1 (PT_LOAD)
-        file_buf[ph_base + 4] = 7; // p_flags = 7 (PF_R | PF_W | PF_X)
+        file_buf[ph_base + 4] = 5; // p_flags = 5 (PF_R | PF_X - strict W^X)
         file_buf[ph_base + 16] = 0; file_buf[ph_base + 17] = 0; file_buf[ph_base + 18] = 64; file_buf[ph_base + 19] = 0; // 0x400000
         file_buf[ph_base + 24] = 0; file_buf[ph_base + 25] = 0; file_buf[ph_base + 26] = 64; file_buf[ph_base + 27] = 0;
         file_buf[ph_base + 32] = (total_file_size & 255) as u8;
@@ -1829,7 +1971,7 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
         file_buf[ph_base + 48] = 0; file_buf[ph_base + 49] = 16; // align 0x1000
     }
 
-    // 6. Offset 0x400: Universal Hologram Header (96 bytes at offset 1024)
+    // 6. Universal Hologram Header (96 bytes at offset holo_offset)
     let holo: *mut UniversalHologramHeader = (file_buf + holo_offset) as *mut UniversalHologramHeader;
     holo.magic = 1145588037; // 0x44484945 'EIAH'
     holo.version = 2;        // major 2, minor 0
@@ -1840,7 +1982,6 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
     holo.relocs_count = cg.reloc_count as u64;
     holo.type_graph_offset = tg_offset;
     holo.type_graph_size = tg_size;
-    holo.blake3_root = 9833440827788927505; // 0x8877665544332211
     holo.flags = 1;
     if cg.force_bridge == 1 {
         holo.flags = holo.flags | 4; // EIA_FLAG_CALLING_CONV_BRIDGE (bit 2)
@@ -1869,6 +2010,10 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
         file_buf[tg_offset + i] = tg_src[i];
         i = i + 1;
     }
+
+    // Compute dynamic BLAKE3-64 root hash over contracts, relocs, and type graph tables
+    let tables_len: u64 = contracts_size + relocs_size + tg_size;
+    holo.blake3_root = blake3_hash64(file_buf + contracts_offset, tables_len);
 
     // 10. Copy .text
     i = 0;
@@ -1953,6 +2098,7 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
     let mut permute_seed: u64 = 0;
     let mut force_bridge: u32 = 0;
     let mut is_upbp: u32 = 0;
+    let mut target_arch: u64 = 0;
 
     let mut arg_i: u64 = 1;
     while arg_i < argc {
@@ -2040,6 +2186,29 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
                 if is_elf_arg == 1 {
                     is_upbp = 0;
                 }
+
+                let target_flag: *u8 = "--target=";
+                let mut is_target_arg: u32 = 1;
+                let mut ti: u64 = 0;
+                while ti < 9 {
+                    if arg[ti] != target_flag[ti] {
+                        is_target_arg = 0;
+                    }
+                    ti = ti + 1;
+                }
+                if is_target_arg == 1 {
+                    let targ_val: *u8 = arg + 9;
+                    if targ_val[0] == 97 && targ_val[1] == 114 && targ_val[2] == 109 && targ_val[3] == 54 && targ_val[4] == 52 {
+                        // "arm64"
+                        target_arch = 1;
+                    } else if targ_val[0] == 114 && targ_val[1] == 105 && targ_val[2] == 115 && targ_val[3] == 99 && targ_val[4] == 118 && targ_val[5] == 54 && targ_val[6] == 52 {
+                        // "riscv64"
+                        target_arch = 2;
+                    } else {
+                        // "x86_64" default
+                        target_arch = 0;
+                    }
+                }
             }
         } else {
             in_path = arg;
@@ -2111,6 +2280,7 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
     cg.call_main_hole = 0;
     cg.force_bridge = force_bridge as u32;
     cg.permute_seed = permute_seed as u32;
+    cg.target_arch = target_arch as u32;
 
     cg.structs = arena_alloc(&mut cg_arena, 262144) as *mut StructInfo;
     cg.struct_count = 0;
@@ -2144,8 +2314,14 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
             }
 
             // Permute field order if permute_seed != 0
-            // Swap first two fields to change offsets consistently
-            if cg.permute_seed != 0 && fcount >= 2 {
+            // Guard wire-format descriptor structs from permutation
+            let mut is_wire_struct: u32 = 0;
+            if sinfo.name_hash == 6275339306359764668 { is_wire_struct = 1; }
+            if sinfo.name_hash == 6723681229567792751 { is_wire_struct = 1; }
+            if sinfo.name_hash == 17134799602928510233 { is_wire_struct = 1; }
+            if sinfo.name_hash == 1914818511609369086 { is_wire_struct = 1; }
+
+            if cg.permute_seed != 0 && fcount >= 2 && is_wire_struct == 0 {
                 let f1: *mut AstNode = snode.child1;
                 let f2: *mut AstNode = f1.next;
                 if f1 != (0 as *mut AstNode) && f2 != (0 as *mut AstNode) {

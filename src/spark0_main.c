@@ -52,6 +52,8 @@ int main(int argc, char **argv) {
     const char *output_path = NULL;
     int is_upbp = 0;
 
+    int target_arch = 0; /* 0=x86_64, 1=arm64, 2=riscv64 */
+
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 < argc) {
@@ -63,7 +65,17 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--upbp") == 0) {
             is_upbp = 1;
         } else if (strncmp(argv[i], "--target=", 9) == 0) {
-            /* Handled / allowed flag */
+            const char *t = argv[i] + 9;
+            if (strcmp(t, "x86_64") == 0) {
+                target_arch = 0;
+            } else if (strcmp(t, "arm64") == 0 || strcmp(t, "aarch64") == 0) {
+                target_arch = 1;
+            } else if (strcmp(t, "riscv64") == 0) {
+                target_arch = 2;
+            } else {
+                fprintf(stderr, "Error: unsupported target architecture '%s'\n", t);
+                return 1;
+            }
         } else if (argv[i][0] != '-') {
             if (!input_path) {
                 input_path = argv[i];
@@ -89,7 +101,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int rc = spark0_compile_to_elf(module, output_path, is_upbp);
+    int rc = spark0_compile_to_elf(module, output_path, is_upbp, target_arch);
     if (rc != 0) {
         fprintf(stderr, "Error: compilation failed for '%s'\n", output_path);
         free(src);

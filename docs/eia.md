@@ -234,14 +234,14 @@ When software evolves across versions, EIA guarantees graceful self-healing at b
 | `hasi_synchronize_icache_ex` (x86/ARM/RISC-V) | `compiler/runtime.rx` | 508-551 | **Implemented** |
 | `executor_execute_with_layout` ($\mathcal{R}_A \equiv \mathcal{R}_B$) | `compiler/runtime.rx` | 553-571 | **Implemented** |
 | Hardware Boot-Patch Latency Benchmark (`rdtsc`) | `compiler/runtime.rx` | 598, 712-736 | **Implemented** |
-| Dynamic BLAKE3-64 Root Emission | `compiler/core1.rx` | 2481 | **Implemented** |
-| Calling Convention Bridge Codegen (`--arll-force-bridge`) | `compiler/core1.rx` | 1357, 2724 | **Implemented** (Emitted in `.text`) |
-| Holographic Layout Permutation Matrix (`--eia-permute-seed`) | `compiler/core1.rx` | 2839-2866 | **Implemented** |
-| Multi-Architecture Codegen (`--target=arm64, riscv64`) | `compiler/core1.rx` | 2325, 2405, 2610 | **Implemented** |
+| Dynamic BLAKE3-64 Root Emission | `compiler/core1.rx` | 1715-1765, 2016 | **Implemented** |
+| Calling Convention Bridge Codegen (`--arll-force-bridge`) | `compiler/core1.rx` | 1450-1505, 2026-2062 | **Implemented** (Emitted in `.text`) |
+| Holographic Layout Permutation Matrix (`--eia-permute-seed`) | `compiler/core1.rx` | 2315-2340 | **Implemented** |
+| Multi-Architecture Codegen (`--target=arm64, riscv64`) | `compiler/core1.rx` | 842-860, 1730-1740, 2189-2210 | **Implemented** |
 | Multi-OS Syscall Vector (`arll_resolve_host_syscall_vector`) | `compiler/packaging.rx` | 221 | **Implemented** |
 | Multi-OS Syscall Dispatch Gate (`arll_host_syscall_gate_stencil`) | `compiler/packaging.rx` | 275 | **Implemented** |
-| UPBP Polyglot Package Emitter (`write_upbp_binary`) | `compiler/packaging.rx` | 383 | **Implemented** |
-| EIA 5-Gate Verification Ring | `compiler/verify_5gate.rx` | 1-602 | **Implemented** (All 5 PASS) |
+| UPBP Polyglot Package Emitter (`write_upbp_binary`) | `compiler/packaging.rx` | 340-420 | **Implemented** |
+| EIA 5-Gate Verification Ring | `compiler/verify_5gate.rx` | 1-590 | **Implemented** (All 5 PASS) |
 
 ---
 

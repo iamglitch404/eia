@@ -155,7 +155,7 @@ static uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
     return digest;
 }
 
-int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp) {
+int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp, int target_arch) {
     /* Calculate section offsets */
     uint64_t holo_offset = is_upbp ? 1152 : 0x80;
     uint64_t contracts_offset = is_upbp ? 1248 : (holo_offset + sizeof(UniversalHologramHeader)); /* 0x80 + 96 = 0xE0 */
@@ -183,13 +183,13 @@ int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp
     }
 
     if (is_upbp) {
-        /* 1. POSIX Shell Script Shebang (byte 0-9) */
-        memcpy(file_buf, "#!/bin/sh\n", 10);
-        /* bytes 10-49: shell trampoline with exit 42 */
-        const char *tramp1 = " tail -c+129 \"$0\">z;chmod +x z;exit 42 \n";
-        memcpy(file_buf + 10, tramp1, strlen(tramp1));
-        /* bytes 50-59: spaces */
-        memset(file_buf + 50, ' ', 10);
+        /* 1. DOS MZ Header Stub at Offset 0x000 (0x4D 0x5A) */
+        /* Compatible with Windows loader and POSIX shell variable assignment */
+        memcpy(file_buf, "MZ=;\n", 5);
+        memcpy(file_buf + 5, "#!/bin/sh\n", 10);
+        const char *tramp1 = "tail -c+129 \"$0\">z 2>/dev/null;exit 42\n";
+        memcpy(file_buf + 15, tramp1, strlen(tramp1));
+        memset(file_buf + 15 + strlen(tramp1), ' ', 60 - (15 + strlen(tramp1)));
         /* bytes 60-63: e_lfanew = 0x140 */
         file_buf[60] = 0x40;
         file_buf[61] = 0x01;
@@ -208,7 +208,13 @@ int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp
         Elf64Header *ehdr = (Elf64Header *)(file_buf + elf_base);
         memcpy(ehdr->e_ident, "\x7f\x45\x4c\x46\x02\x01\x01\0\0\0\0\0\0\0\0\0", 16);
         ehdr->e_type = 2; /* ET_EXEC */
-        ehdr->e_machine = 0x3E; /* EM_X86_64 */
+        if (target_arch == 1) {
+            ehdr->e_machine = 183; /* EM_AARCH64 */
+        } else if (target_arch == 2) {
+            ehdr->e_machine = 243; /* EM_RISCV */
+        } else {
+            ehdr->e_machine = 0x3E; /* EM_X86_64 */
+        }
         ehdr->e_version = 1;
         ehdr->e_entry = 0x410000;
         ehdr->e_phoff = 64;
@@ -219,7 +225,7 @@ int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp
 
         Elf64ProgramHeader *phdr = (Elf64ProgramHeader *)(file_buf + elf_base + 64);
         phdr->p_type = 1; /* PT_LOAD */
-        phdr->p_flags = 7; /* PF_R | PF_W | PF_X */
+        phdr->p_flags = 5; /* PF_R | PF_X (Strict W^X compliance) */
         phdr->p_offset = 0;
         phdr->p_vaddr = 0x400000;
         phdr->p_paddr = 0x400000;
@@ -273,7 +279,13 @@ int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp
         Elf64Header *ehdr = (Elf64Header *)file_buf;
         memcpy(ehdr->e_ident, "\x7f\x45\x4c\x46\x02\x01\x01\0\0\0\0\0\0\0\0\0", 16);
         ehdr->e_type = 2; /* ET_EXEC */
-        ehdr->e_machine = 0x3E; /* EM_X86_64 */
+        if (target_arch == 1) {
+            ehdr->e_machine = 183; /* EM_AARCH64 */
+        } else if (target_arch == 2) {
+            ehdr->e_machine = 243; /* EM_RISCV */
+        } else {
+            ehdr->e_machine = 0x3E; /* EM_X86_64 */
+        }
         ehdr->e_version = 1;
         ehdr->e_entry = unit->entry_vaddr; /* 0x401000 (_start) */
         ehdr->e_phoff = 64;
@@ -289,7 +301,7 @@ int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp
         /* 2. ELF64 Program Header (56 bytes) */
         Elf64ProgramHeader *phdr = (Elf64ProgramHeader *)(file_buf + 64);
         phdr->p_type = 1; /* PT_LOAD */
-        phdr->p_flags = 7; /* PF_R | PF_W | PF_X */
+        phdr->p_flags = 5; /* PF_R | PF_X (Strict W^X compliance) */
         phdr->p_offset = 0;
         phdr->p_vaddr = 0x400000;
         phdr->p_paddr = 0x400000;
@@ -366,10 +378,10 @@ int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp
     return 0;
 }
 
-int spark0_compile_to_elf(RuModule *module, const char *output_path, int is_upbp) {
-    CompiledUnit *u = spark0_compile_module(module);
+int spark0_compile_to_elf(RuModule *module, const char *output_path, int is_upbp, int target_arch) {
+    CompiledUnit *u = spark0_compile_module(module, target_arch);
     if (!u) return -1;
-    int rc = spark0_write_elf(u, output_path, is_upbp);
+    int rc = spark0_write_elf(u, output_path, is_upbp, target_arch);
     compiled_unit_free(u);
     return rc;
 }

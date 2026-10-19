@@ -455,10 +455,13 @@ fn main() -> i64 {
         syscall(60, 502);
     }
 
-    // 1. Container Offset 0x000: Shell script shebang (0x23 0x21)
-    if buf1[0] != 35 || buf1[1] != 33 {
-        let err5_mz: *u8 = "FAIL: Gate 5 invalid shell shebang magic at offset 0x000\n";
-        syscall(1, 2, err5_mz, 56);
+    // 1. Container Offset 0x000: DOS MZ Header / POSIX Shell shebang
+    let mut valid_magic: u32 = 0;
+    if buf1[0] == 77 && buf1[1] == 90 { valid_magic = 1; }
+    if buf1[0] == 35 && buf1[1] == 33 { valid_magic = 1; }
+    if valid_magic == 0 {
+        let err5_mz: *u8 = "FAIL: Gate 5 invalid MZ/shell magic at offset 0x000\n";
+        syscall(1, 2, err5_mz, 52);
         syscall(60, 503);
     }
     if buf1[60] != 64 || buf1[61] != 1 { // e_lfanew points to 0x140

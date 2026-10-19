@@ -53,16 +53,34 @@ jobs:
           python3 -c "
           with open('bin/hello_upbp', 'rb') as f:
               b = f.read()
-          assert b[0:2] == b'#!', 'Missing shebang magic'
+          assert b[0:2] in (b'MZ', b'#!'), 'Missing MZ or shebang magic'
           assert b[60:62] == b'\x40\x01', 'Invalid e_lfanew offset to PE header'
           assert b[82:86] == b'tail', 'Missing tail trampoline directive'
           assert b[115:119] == b'exec', 'Missing exec trampoline directive'
           assert b[128:132] == b'\x7fELF', 'Missing ELF64 header'
+          assert b[196] == 5, 'ELF program header must enforce strict W^X (PF_R | PF_X = 5)'
           assert b[320:324] == b'PE\x00\x00', 'Missing PE/COFF header'
           assert b[512:516] == b'\xcf\xfa\xed\xfe', 'Missing Mach-O 64 header'
           assert b[1152:1156] == bytes([69, 73, 72, 68]), 'Missing Universal Hologram Header (EIAH)'
           assert b[1156] == 2, 'Invalid Hologram version'
           print('All UPBP multi-OS container headers verified on ${{ matrix.os }}')
+          "
+
+      - name: Verify Multi-Architecture compilation targets (ARM64 & RISC-V 64)
+        run: |
+          ./bin/spark0 tests/hello_eia.rx -o bin/hello_arm64 --target=arm64
+          ./bin/spark0 tests/hello_eia.rx -o bin/hello_riscv64 --target=riscv64
+          python3 -c "
+          with open('bin/hello_arm64', 'rb') as f:
+              b_arm = f.read()
+          assert b_arm[18] == 183, 'Invalid EM_AARCH64 (183) machine header'
+          assert b_arm[68] == 5, 'ARM64 ELF segment must be strict W^X (PF_R | PF_X = 5)'
+
+          with open('bin/hello_riscv64', 'rb') as f:
+              b_rv = f.read()
+          assert b_rv[18] == 243, 'Invalid EM_RISCV (243) machine header'
+          assert b_rv[68] == 5, 'RISC-V 64 ELF segment must be strict W^X (PF_R | PF_X = 5)'
+          print('Multi-architecture targets (EM_AARCH64 & EM_RISCV) verified on ${{ matrix.os }}')
           "
 
       - name: Stage-1 compiler subsystems cross-compilation

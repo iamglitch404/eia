@@ -27,12 +27,13 @@ typedef struct {
     uint64_t           entry_vaddr; /* Virtual address of _start */
     uint64_t           main_vaddr;  /* Virtual address of main */
     uint32_t           start_stub_size;
+    int                target_arch; /* 0=x86_64, 1=arm64, 2=riscv64 */
 } CompiledUnit;
 
-CompiledUnit *spark0_compile_module(RuModule *module);
+CompiledUnit *spark0_compile_module(RuModule *module, int target_arch);
 void compiled_unit_free(CompiledUnit *u);
 
-int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp);
-int spark0_compile_to_elf(RuModule *module, const char *output_path, int is_upbp);
+int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp, int target_arch);
+int spark0_compile_to_elf(RuModule *module, const char *output_path, int is_upbp, int target_arch);
 
 #endif /* SPARK0_CODEGEN_H */

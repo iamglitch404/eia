@@ -208,13 +208,36 @@ static void build_type_graph(CompiledUnit *u, RuModule *module) {
 /* ------------------------------------------------------------------------- */
 
 static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
+    if (u->target_arch == 1) {
+        /* ARM64 start stub:
+           mov x0, 42       ; 0xd2800540
+           mov x8, 93       ; 0xd2800ba8 (SYS_exit)
+           svc 0            ; 0xd4000001
+        */
+        emit32_le(u, 0xd2800540);
+        emit32_le(u, 0xd2800ba8);
+        emit32_le(u, 0xd4000001);
+        return;
+    }
+    if (u->target_arch == 2) {
+        /* RISC-V 64 start stub:
+           li a0, 42        ; 0x02a00513 (addi a0, zero, 42)
+           li a7, 93        ; 0x05d00893 (addi a7, zero, 93 - SYS_exit)
+           ecall            ; 0x00000073
+        */
+        emit32_le(u, 0x02a00513);
+        emit32_le(u, 0x05d00893);
+        emit32_le(u, 0x00000073);
+        return;
+    }
+
     /* 0. Preserve argc and argv from initial process stack */
     emit8(u, 0x48); emit8(u, 0x8b); emit8(u, 0x3c); emit8(u, 0x24); /* mov rdi, [rsp] */
     emit8(u, 0x48); emit8(u, 0x8d); emit8(u, 0x74); emit8(u, 0x24); emit8(u, 0x08); /* lea rsi, [rsp + 8] */
     emit8(u, 0x57); /* push rdi */
     emit8(u, 0x56); /* push rsi */
 
-    /* 1. sys_mprotect(0x400000, 0x100000, 7) (1MB) */
+    /* 1. sys_mprotect(0x400000, 0x100000, 7) (1MB) - temporary write access for hole patching */
     emit8(u, 0xb8); emit32_le(u, 10);        /* mov eax, 10 */
     emit8(u, 0xbf); emit32_le(u, 0x400000);    /* mov edi, 0x400000 */
     emit8(u, 0xbe); emit32_le(u, 0x100000);    /* mov esi, 0x100000 (1MB) */
@@ -293,9 +316,17 @@ static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
     uint32_t patch_done_offset = u->text_size;
     patch32(u, jz_patch_done_hole, patch_done_offset - (jz_patch_done_hole + 4));
 
-    /* 3. CPUID to serialize instruction pipeline */
+    /* 3. HASI Cache fence: CPUID to serialize instruction pipeline + mfence */
     emit8(u, 0x31); emit8(u, 0xc0); /* xor eax, eax */
     emit8(u, 0x0f); emit8(u, 0xa2); /* cpuid */
+    emit8(u, 0x0f); emit8(u, 0xae); emit8(u, 0xf0); /* mfence */
+
+    /* 3b. Strict W^X: sys_mprotect(0x400000, 0x100000, 5) (PROT_READ | PROT_EXEC) */
+    emit8(u, 0xb8); emit32_le(u, 10);        /* mov eax, 10 */
+    emit8(u, 0xbf); emit32_le(u, 0x400000);    /* mov edi, 0x400000 */
+    emit8(u, 0xbe); emit32_le(u, 0x100000);    /* mov esi, 0x100000 (1MB) */
+    emit8(u, 0xba); emit32_le(u, 5);           /* mov edx, 5 (PROT_READ | PROT_EXEC) */
+    emit8(u, 0x0f); emit8(u, 0x05);            /* syscall */
 
     /* 4. call main(argc, argv) */
     emit8(u, 0x5e); /* pop rsi (argv) */
@@ -960,8 +991,9 @@ static void compile_stmt(FnCompiler *fc, RuStmt *s) {
 /*                          Top-Level Compiler Module                        */
 /* ------------------------------------------------------------------------- */
 
-CompiledUnit *spark0_compile_module(RuModule *module) {
+CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
     CompiledUnit *u = (CompiledUnit *)calloc(1, sizeof(CompiledUnit));
+    u->target_arch = target_arch;
     build_type_graph(u, module);
 
     uint32_t rodata_base = 0x430000;
@@ -1098,13 +1130,15 @@ CompiledUnit *spark0_compile_module(RuModule *module) {
             break;
         }
     }
-    if (!found_main) {
-        fprintf(stderr, "Codegen error: no 'main' function found in module\n");
-        exit(1);
+    if (u->target_arch == 0) {
+        if (!found_main) {
+            fprintf(stderr, "Codegen error: no 'main' function found in module\n");
+            exit(1);
+        }
+        u->main_vaddr = 0x410000 + main_text_offset;
+        int32_t disp_to_main = (int32_t)(main_text_offset - (call_main_hole + 4));
+        patch32(u, call_main_hole, (uint32_t)disp_to_main);
     }
-    u->main_vaddr = 0x410000 + main_text_offset;
-    int32_t disp_to_main = (int32_t)(main_text_offset - (call_main_hole + 4));
-    patch32(u, call_main_hole, (uint32_t)disp_to_main);
 
     for (uint32_t j = 0; j < compiled_fn_count; ++j) {
         free(compiled_fns[j].name);

@@ -591,7 +591,7 @@ uint64_t spark0_hash64(const void *data, size_t len);
 uint64_t spark0_hash_str(const char *str);
 
 RuModule *spark0_parse(const char *source_text, const char *filename);
-int spark0_compile_to_elf(RuModule *module, const char *output_path, int is_upbp);
+int spark0_compile_to_elf(RuModule *module, const char *output_path, int is_upbp, int target_arch);
 
 #ifdef __cplusplus
 }

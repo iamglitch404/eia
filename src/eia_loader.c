@@ -653,6 +653,10 @@ int main(int argc, char **argv) {
         total_code_size += (providers[i]->text_size + 0xFFF) & ~0xFFFULL;
     }
 
+    size_t thunk_arena_offset = total_code_size;
+    size_t thunk_used = 0;
+    total_code_size += 4096; /* 4KB page reserved for ABI bridges and widening adapter thunks */
+
     /* 4. Allocate DVAM Dual Virtual Aliases (Strict W^X) */
     uint8_t *v_write = NULL;
     uint8_t *v_exec = NULL;
@@ -823,17 +827,33 @@ int main(int argc, char **argv) {
                     return 1;
                 }
 
-                /* Check schema narrowing rule */
+                /* Check schema narrowing rule & inject widening adapter if safe */
                 for (size_t t = 0; t < curr->type_graph_count; ++t) {
                     if (curr->type_graph[t].type_sig_hash == hole->type_sig_hash &&
                         curr->type_graph[t].field_hash == hole->field_or_sym_hash) {
                         uint32_t expected_size = curr->type_graph[t].field_size;
                         if (f->field_size < expected_size) {
-                            fprintf(stderr, "[EIA ERROR] Schema rejection: field narrowing unsupported for type 0x%016lx field 0x%016lx (expected %u bytes, provider has %u bytes)\n",
-                                    (unsigned long)hole->type_sig_hash, (unsigned long)hole->field_or_sym_hash,
-                                    expected_size, f->field_size);
-                            free(all_bins);
-                            return 1;
+                            bool adapted = false;
+                            /* On x86-64: adapt u32 load (48 8b 07) to zero-extending u32 load (8b 07 90) */
+                            if (curr->target_arch == 0 && expected_size == 8 && f->field_size == 4) {
+                                uint8_t *next_code = patch_site + 4;
+                                if (hole->insn_offset + 7 <= curr->text_size &&
+                                    next_code[0] == 0x48 && next_code[1] == 0x8b && next_code[2] == 0x07) {
+                                    next_code[0] = 0x8b; /* mov eax, [rdi] (zero-extends into rax) */
+                                    next_code[1] = 0x07;
+                                    next_code[2] = 0x90; /* nop */
+                                    adapted = true;
+                                    printf("[EIA LINK] Injected widening adapter (u32 -> u64 zero-extension) at 0x%x in '%s'\n",
+                                           hole->insn_offset, curr->path);
+                                }
+                            }
+                            if (!adapted) {
+                                fprintf(stderr, "[EIA ERROR] Schema rejection: field narrowing unsupported for type 0x%016lx field 0x%016lx (expected %u bytes, provider has %u bytes)\n",
+                                        (unsigned long)hole->type_sig_hash, (unsigned long)hole->field_or_sym_hash,
+                                        expected_size, f->field_size);
+                                free(all_bins);
+                                return 1;
+                            }
                         }
                         break;
                     }
@@ -870,6 +890,8 @@ int main(int argc, char **argv) {
                     return 1;
                 }
 
+                uint64_t target_exec_vaddr = s->target_vaddr;
+
                 /* Verify calling contract signature, structural types, and parameter count */
                 for (size_t c = 0; c < curr->contract_count; ++c) {
                     if (curr->contracts[c].symbol_hash == hole->field_or_sym_hash &&
@@ -882,11 +904,58 @@ int main(int argc, char **argv) {
                             return 1;
                         }
                         if (curr->contracts[c].calling_conv != s->calling_conv) {
-                            fprintf(stderr, "[EIA ERROR] Calling convention mismatch for symbol 0x%016lx: caller '%s' conv %u, callee '%s' conv %u\n",
-                                    (unsigned long)hole->field_or_sym_hash, curr->path,
-                                    curr->contracts[c].calling_conv, s->binary_name, s->calling_conv);
-                            free(all_bins);
-                            return 1;
+                            uint32_t caller_conv = curr->contracts[c].calling_conv;
+                            uint32_t callee_conv = s->calling_conv;
+                            bool bridged = false;
+                            if (curr->target_arch == 0 && thunk_used + 64 <= 4096) {
+                                uint32_t thunk_off = (uint32_t)(thunk_arena_offset + thunk_used);
+                                uint8_t *thunk_ptr = v_write + thunk_off;
+                                if (caller_conv == 0 && callee_conv == 1) {
+                                    /* SysV AMD64 caller -> Win64 callee bridge */
+                                    size_t b_idx = 0;
+                                    thunk_ptr[b_idx++] = 0x49; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xc9; // mov r9, rcx
+                                    thunk_ptr[b_idx++] = 0x49; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xd0; // mov r8, rdx
+                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xf2; // mov rdx, rsi
+                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xf9; // mov rcx, rdi
+                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x83; thunk_ptr[b_idx++] = 0xec; thunk_ptr[b_idx++] = 0x28; // sub rsp, 40
+                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0xb8; // mov rax, imm64
+                                    uint64_t callee_addr = s->target_vaddr;
+                                    memcpy(thunk_ptr + b_idx, &callee_addr, 8);
+                                    b_idx += 8;
+                                    thunk_ptr[b_idx++] = 0xff; thunk_ptr[b_idx++] = 0xd0; // call rax
+                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x83; thunk_ptr[b_idx++] = 0xc4; thunk_ptr[b_idx++] = 0x28; // add rsp, 40
+                                    thunk_ptr[b_idx++] = 0xc3; // ret
+                                    thunk_used += 64;
+                                    target_exec_vaddr = (uint64_t)(v_exec + thunk_off);
+                                    bridged = true;
+                                    printf("[EIA LINK] Injected SysV AMD64 -> Win64 ABI bridge thunk for symbol 0x%016lx\n",
+                                           (unsigned long)hole->field_or_sym_hash);
+                                } else if (caller_conv == 1 && callee_conv == 0) {
+                                    /* Win64 caller -> SysV AMD64 callee bridge */
+                                    size_t b_idx = 0;
+                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xcf; // mov rdi, rcx
+                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xd6; // mov rsi, rdx
+                                    thunk_ptr[b_idx++] = 0x4c; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xc2; // mov rdx, r8
+                                    thunk_ptr[b_idx++] = 0x4c; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xc9; // mov rcx, r9
+                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0xb8; // mov rax, imm64
+                                    uint64_t callee_addr = s->target_vaddr;
+                                    memcpy(thunk_ptr + b_idx, &callee_addr, 8);
+                                    b_idx += 8;
+                                    thunk_ptr[b_idx++] = 0xff; thunk_ptr[b_idx++] = 0xe0; // jmp rax
+                                    thunk_used += 64;
+                                    target_exec_vaddr = (uint64_t)(v_exec + thunk_off);
+                                    bridged = true;
+                                    printf("[EIA LINK] Injected Win64 -> SysV AMD64 ABI bridge thunk for symbol 0x%016lx\n",
+                                           (unsigned long)hole->field_or_sym_hash);
+                                }
+                            }
+                            if (!bridged) {
+                                fprintf(stderr, "[EIA ERROR] Calling convention mismatch for symbol 0x%016lx: caller '%s' conv %u, callee '%s' conv %u (no bridge available)\n",
+                                        (unsigned long)hole->field_or_sym_hash, curr->path,
+                                        caller_conv, s->binary_name, callee_conv);
+                                free(all_bins);
+                                return 1;
+                            }
                         }
                         if (curr->contracts[c].type_sig_hash != 0 && s->type_sig_hash != 0 &&
                             curr->contracts[c].type_sig_hash != s->type_sig_hash) {
@@ -908,7 +977,7 @@ int main(int argc, char **argv) {
                         free(all_bins);
                         return 1;
                     }
-                    int64_t rel_disp = (int64_t)s->target_vaddr - (int64_t)(v_exec + curr->arena_offset + hole->insn_offset);
+                    int64_t rel_disp = (int64_t)target_exec_vaddr - (int64_t)(v_exec + curr->arena_offset + hole->insn_offset);
                     uint32_t imm26 = (uint32_t)((rel_disp >> 2) & 0x03ffffff);
                     uint32_t bl = 0x94000000 | imm26;
                     memcpy(patch_site, &bl, 4);
@@ -921,7 +990,7 @@ int main(int argc, char **argv) {
                         free(all_bins);
                         return 1;
                     }
-                    int64_t rel_disp = (int64_t)s->target_vaddr - (int64_t)(v_exec + curr->arena_offset + hole->insn_offset);
+                    int64_t rel_disp = (int64_t)target_exec_vaddr - (int64_t)(v_exec + curr->arena_offset + hole->insn_offset);
                     uint32_t imm20 = (uint32_t)rel_disp;
                     uint32_t b20 = (imm20 >> 20) & 1;
                     uint32_t b10_1 = (imm20 >> 1) & 0x3ff;
@@ -938,7 +1007,6 @@ int main(int argc, char **argv) {
                         return 1;
                     }
 
-                    uint64_t target_exec_vaddr = s->target_vaddr;
                     uint64_t call_site_exec = (uint64_t)(v_exec + curr->arena_offset + hole->insn_offset);
                     int64_t rel_disp = (int64_t)target_exec_vaddr - (int64_t)(call_site_exec + 4);
                     if (rel_disp < -2147483648LL || rel_disp > 2147483647LL) {
@@ -1063,12 +1131,14 @@ int main(int argc, char **argv) {
             }
         }
         if (!emu_executed) {
-            printf("[EIA RUN] Cross-architecture dynamic linking & DVAM verification: OK (arch=%u)\n", client->target_arch);
-            exit_code = 42;
+            fprintf(stderr, "[EIA ERROR] Unsupported execution environment: target architecture %u cannot be executed natively on host and emulator '%s' is unavailable\n",
+                    client->target_arch, emu ? emu : "unknown");
+            return 1;
         }
 #else
-        printf("[EIA RUN] Cross-architecture dynamic linking & DVAM verification: OK (arch=%u)\n", client->target_arch);
-        exit_code = 42;
+        fprintf(stderr, "[EIA ERROR] Unsupported execution environment: target architecture %u cannot be executed on Windows host\n",
+                client->target_arch);
+        return 1;
 #endif
     }
 

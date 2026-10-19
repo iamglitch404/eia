@@ -84,7 +84,11 @@ void gdam_retire_record(ConcurrentGdamState *gdam, uint8_t *old_rec) {
 void gdam_reclaim_retired(ConcurrentGdamState *gdam) {
     if (!gdam) return;
     while (atomic_load_explicit(&gdam->active_readers, memory_order_acquire) > 0) {
+#ifdef _WIN32
+        Sleep(1);
+#else
         usleep(100);
+#endif
     }
     for (size_t i = 0; i < gdam->retired_count; ++i) {
         if (gdam->retired_records[i]) {

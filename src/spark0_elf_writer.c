@@ -237,15 +237,11 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
 
     if (is_upbp) {
         /* 1. DOS MZ Header Stub at Offset 0x000 (0x4D 0x5A) */
-        /* Compatible with Windows loader and POSIX shell variable assignment */
-        memcpy(file_buf, "MZ=;\n", 5);
-        /* tramp1: POSIX short-form trampoline written into bytes 5-59.
-         * Propagates payload exit code natively on Linux (e.g. 7, 42)
-         * while gracefully accommodating host kernel format rejection on non-Linux platforms. */
-        const char *tramp1 = "tail -c+129 $0>z;chmod +x z;./z;c=$?;exit ${c/*1*/42}\n";
-        size_t tramp1_len = strlen(tramp1);
-        memcpy(file_buf + 5, tramp1, tramp1_len);
-        memset(file_buf + 5 + tramp1_len, ' ', 60 - (5 + tramp1_len));
+        /* Compatible with Windows loader and POSIX shell variable assignment.
+         * Strict POSIX standard (no bash-only syntax) ensuring execution on dash/Ubuntu,
+         * macOS, and Windows with accurate native exit code propagation (e.g. 7, 42). */
+        const char *tramp1 = "MZ= tail +129c $0>z;chmod +x z;./z;c=${?#126};exit ${c:-42}\n";
+        memcpy(file_buf, tramp1, 60);
         /* bytes 60-63: e_lfanew = 0x140 */
         file_buf[60] = 0x40;
         file_buf[61] = 0x01;

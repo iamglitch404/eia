@@ -462,7 +462,9 @@ int eia_ed25519_verify_detached(const uint8_t sig[64], const uint8_t *msg, size_
   if (!sm) return -1;
 
   memcpy(sm, sig, 64);
-  memcpy(sm + 64, msg, msg_len);
+  if (msg_len > 0 && msg) {
+    memcpy(sm + 64, msg, msg_len);
+  }
 
   u8 *m = (u8 *)malloc(total_len);
   if (!m) { free(sm); return -1; }
@@ -475,26 +477,191 @@ int eia_ed25519_verify_detached(const uint8_t sig[64], const uint8_t *msg, size_
   return (rc == 0 ? 0 : -1);
 }
 
+/* =========================================================================
+ * EIA Production Trust Store
+ *
+ * Supports multiple concurrent public keys, key rotation (new slots), and
+ * revocation (EIA_KEYSTORE_FLAG_REVOKED).  The verifier iterates all
+ * non-revoked entries that match the presented pubkey_id.  The signer picks
+ * keys via EIA_SIGNING_KEY_FILE (binary 32-byte seed), EIA_SIGNING_KEY (raw
+ * 32-byte env string), or the compiled-in root seed as a last resort.
+ * =========================================================================*/
+
+
 /*
- * Sovereign EIA Trusted Public Keys (stored in the loader / trust store).
- * Public key derived via Curve25519: A = s * B.
+ * EIA Root Public Key (slot 0 – derived from the compiled root seed).
+ * Additional keys can be added at runtime via eia_trust_store_add().
  */
-static const uint8_t EIA_TRUSTED_PUBKEY[32] = {
+static const uint8_t EIA_ROOT_PUBKEY[32] = {
     0xd8, 0x54, 0xd5, 0xa4, 0xa6, 0x90, 0x82, 0x89,
     0x75, 0xe0, 0x20, 0xe8, 0xa5, 0xc5, 0xf8, 0xce,
     0x23, 0xbe, 0xe0, 0x30, 0x63, 0xbb, 0x93, 0x10,
     0x05, 0xb3, 0x7b, 0x35, 0x5a, 0x5a, 0xc1, 0x53
 };
 
+uint64_t eia_key_id_of(const uint8_t pk[32]) {
+    /* FNV-1a 64-bit over the 32 public key bytes */
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (int i = 0; i < 32; ++i) {
+        h ^= (uint64_t)pk[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static EiaTrustEntry g_trust_store[EIA_KEYSTORE_MAX];
+static int           g_trust_store_count = 0;
+static int           g_trust_store_init  = 0;
+
+static void eia_trust_store_ensure_init(void) {
+    if (g_trust_store_init) return;
+    g_trust_store_init = 1;
+    memset(g_trust_store, 0, sizeof(g_trust_store));
+    /* Slot 0: built-in EIA root key */
+    g_trust_store[0].key_id           = eia_key_id_of(EIA_ROOT_PUBKEY);
+    memcpy(g_trust_store[0].pubkey, EIA_ROOT_PUBKEY, 32);
+    g_trust_store[0].introduced_epoch = 0;
+    g_trust_store[0].revoked_epoch    = 0;
+    g_trust_store[0].flags            = EIA_KEYSTORE_FLAG_ACTIVE;
+    g_trust_store_count = 1;
+
+    /* Check for external trust store file (list of raw 32-byte public keys) */
+    const char *ts_file = getenv("EIA_TRUST_STORE");
+    if (!ts_file) ts_file = getenv("EIA_TRUSTED_KEYS_FILE");
+    if (ts_file) {
+        FILE *f = fopen(ts_file, "rb");
+        if (f) {
+            uint8_t pk[32];
+            while (fread(pk, 1, 32, f) == 32) {
+                eia_trust_store_add(pk, 0);
+            }
+            fclose(f);
+        }
+    }
+
+    /* Check for additional hex or binary trusted key in environment */
+    const char *env_pk = getenv("EIA_TRUSTED_PUBKEY");
+    if (env_pk) {
+        if (strlen(env_pk) >= 64) {
+            uint8_t pk[32];
+            bool hex_ok = true;
+            for (int i = 0; i < 32; ++i) {
+                unsigned int byte_val = 0;
+                if (sscanf(env_pk + (i * 2), "%02x", &byte_val) != 1) {
+                    hex_ok = false;
+                    break;
+                }
+                pk[i] = (uint8_t)byte_val;
+            }
+            if (hex_ok) {
+                eia_trust_store_add(pk, 0);
+            }
+        } else if (strlen(env_pk) >= 32) {
+            eia_trust_store_add((const uint8_t *)env_pk, 0);
+        }
+    }
+
+    /* Check for revocation list in environment: EIA_REVOKED_KEY_IDS */
+    const char *revoked_env = getenv("EIA_REVOKED_KEY_IDS");
+    if (revoked_env) {
+        char *copy = strdup(revoked_env);
+        if (copy) {
+            char *tok = strtok(copy, ", \t\n");
+            while (tok) {
+                uint64_t kid = (uint64_t)strtoull(tok, NULL, 0);
+                if (kid != 0) {
+                    eia_trust_store_revoke(kid, 0);
+                }
+                tok = strtok(NULL, ", \t\n");
+            }
+            free(copy);
+        }
+    }
+}
+
+void eia_trust_store_reset(void) {
+    g_trust_store_init = 0;
+    g_trust_store_count = 0;
+    eia_trust_store_ensure_init();
+}
+
+/* Public API – add a new trusted public key.  Returns slot index or -1 if full. */
+int eia_trust_store_add(const uint8_t pk[32], uint16_t introduced_epoch) {
+    eia_trust_store_ensure_init();
+    if (g_trust_store_count >= EIA_KEYSTORE_MAX) return -1;
+    int slot = g_trust_store_count++;
+    g_trust_store[slot].key_id           = eia_key_id_of(pk);
+    memcpy(g_trust_store[slot].pubkey, pk, 32);
+    g_trust_store[slot].introduced_epoch = introduced_epoch;
+    g_trust_store[slot].revoked_epoch    = 0;
+    g_trust_store[slot].flags            = EIA_KEYSTORE_FLAG_ACTIVE;
+    return slot;
+}
+
+/* Public API – revoke a key by its key_id starting at revoked_epoch. */
+int eia_trust_store_revoke(uint64_t key_id, uint16_t revoked_epoch) {
+    eia_trust_store_ensure_init();
+    for (int i = 0; i < g_trust_store_count; ++i) {
+        if (g_trust_store[i].key_id == key_id) {
+            g_trust_store[i].flags        |= EIA_KEYSTORE_FLAG_REVOKED;
+            g_trust_store[i].revoked_epoch = revoked_epoch;
+            return 0;
+        }
+    }
+    return -1; /* not found */
+}
+
+/* Public API – look up a trust entry by key_id (returns NULL if absent/revoked). */
+const EiaTrustEntry *eia_trust_store_lookup(uint64_t key_id, uint16_t for_epoch) {
+    eia_trust_store_ensure_init();
+    for (int i = 0; i < g_trust_store_count; ++i) {
+        const EiaTrustEntry *e = &g_trust_store[i];
+        if (!(e->flags & EIA_KEYSTORE_FLAG_ACTIVE)) continue;
+        if (e->key_id != key_id && !(i == 0 && key_id == EIA_TRUSTED_PUBKEY_ID)) continue;
+        if (for_epoch < e->introduced_epoch) continue;
+        if (e->flags & EIA_KEYSTORE_FLAG_REVOKED) {
+            if (for_epoch >= e->revoked_epoch) continue;
+        }
+        return e;
+    }
+    return NULL;
+}
+
+/*
+ * eia_ed25519_keypair_from_seed – RFC 8032 §5.1.5 deterministic key expansion.
+ * Derives the Ed25519 (pk, sk) pair from the given 32-byte seed.
+ * sk[0..31]  = seed, sk[32..63] = pk  (standard NaCl 64-byte layout).
+ */
+int eia_ed25519_keypair_from_seed(uint8_t pk[32], uint8_t sk[64], const uint8_t seed[32]) {
+    u8 d[64];
+    gf p[4];
+    u64 i;
+
+    FOR(i, 32) sk[i] = seed[i];
+    crypto_hash(d, sk, 32);
+    d[0] &= 248;
+    d[31] &= 127;
+    d[31] |= 64;
+
+    scalarbase(p, d);
+    pack(pk, p);
+
+    FOR(i, 32) sk[32 + i] = pk[i];
+    return 0;
+}
+
 bool eia_verify_digest(const uint8_t digest[32], uint16_t key_epoch, uint64_t pubkey_id, const uint8_t sig[64]) {
-    if (pubkey_id != EIA_TRUSTED_PUBKEY_ID) return false;
+    eia_trust_store_ensure_init();
     uint8_t payload[34];
     memcpy(payload, digest, 32);
     payload[32] = (uint8_t)(key_epoch & 0xFF);
     payload[33] = (uint8_t)((key_epoch >> 8) & 0xFF);
 
-    int rc = eia_ed25519_verify_detached(sig, payload, sizeof(payload), EIA_TRUSTED_PUBKEY);
-    return (rc == 0);
+    /* Accept any non-revoked trust-store entry whose key_id matches */
+    const EiaTrustEntry *entry = eia_trust_store_lookup(pubkey_id, key_epoch);
+    if (!entry) return false;
+
+    return (eia_ed25519_verify_detached(sig, payload, sizeof(payload), entry->pubkey) == 0);
 }
 
 bool spark0_verify_signature(const uint8_t digest[32], uint16_t key_epoch, uint64_t pubkey_id, const uint8_t sig[64]) {
@@ -503,24 +670,6 @@ bool spark0_verify_signature(const uint8_t digest[32], uint16_t key_epoch, uint6
 
 #ifdef EIA_SIGNER_ENABLED
 
-static int crypto_sign_keypair(u8 *pk, u8 *sk, const u8 *seed)
-{
-  u8 d[64];
-  gf p[4];
-  u64 i;
-
-  FOR(i,32) sk[i] = seed[i];
-  crypto_hash(d, sk, 32);
-  d[0] &= 248;
-  d[31] &= 127;
-  d[31] |= 64;
-
-  scalarbase(p,d);
-  pack(pk,p);
-
-  FOR(i,32) sk[32 + i] = pk[i];
-  return 0;
-}
 
 static int crypto_sign(u8 *sm,u64 *smlen,const u8 *m,u64 n,const u8 *sk)
 {
@@ -569,34 +718,143 @@ int eia_ed25519_sign_detached(uint8_t sig[64], const uint8_t *msg, size_t msg_le
 }
 
 /*
- * Sovereign EIA Root Private Seed (used ONLY for signing by the compiler).
- * Never linked into or readable by the standalone loader/runtime!
+ * EIA Root Private Seed – used ONLY during compilation (signer path).
+ * NEVER compiled into standalone loaders or runtimes.
+ *
+ * Key selection priority (highest first):
+ *   1. EIA_SIGNING_KEY_FILE – path to a 32-byte binary seed file
+ *   2. EIA_SIGNING_KEY      – first 32 bytes of the env-var string
+ *   3. EIA_ROOT_SEED        – compiled-in fallback
  */
+#ifdef EIA_ALLOW_DEV_FALLBACK_KEY
+/* Development fallback key only enabled when explicitly compiled with -DEIA_ALLOW_DEV_FALLBACK_KEY */
 static const uint8_t EIA_ROOT_SEED[32] = {
-    0x53, 0x4f, 0x56, 0x45, 0x52, 0x45, 0x49, 0x47, 
+    0x53, 0x4f, 0x56, 0x45, 0x52, 0x45, 0x49, 0x47,
     0x4e, 0x5f, 0x45, 0x49, 0x41, 0x5f, 0x52, 0x4f,
-    0x4f, 0x54, 0x5f, 0x4b, 0x45, 0x59, 0x5f, 0x32, 
+    0x4f, 0x54, 0x5f, 0x4b, 0x45, 0x59, 0x5f, 0x32,
     0x30, 0x32, 0x36, 0x5f, 0x53, 0x49, 0x47, 0x4e
 };
+#endif
 
-void eia_sign_digest(const uint8_t digest[32], uint16_t key_epoch, uint8_t out_sig[64]) {
+/* Load a 32-byte seed from a file path (supports raw binary or 64-character hex).
+ * Returns 0 on success, -1 on failure. */
+static int eia_load_seed_from_file(const char *path, uint8_t seed[32]) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    char buf[128];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n >= 64) {
+        bool is_hex = true;
+        for (int i = 0; i < 64; ++i) {
+            char c = buf[i];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                is_hex = false;
+                break;
+            }
+        }
+        if (is_hex) {
+            for (int i = 0; i < 32; ++i) {
+                unsigned int v = 0;
+                sscanf(buf + (i * 2), "%02x", &v);
+                seed[i] = (uint8_t)v;
+            }
+            return 0;
+        }
+    }
+    if (n >= 32) {
+        memcpy(seed, buf, 32);
+        return 0;
+    }
+    return -1;
+}
+
+static int eia_load_active_signing_seed(uint8_t seed[32]) {
+    /* Priority 1: external seed file (binary or 64-char hex) */
+    const char *key_file = getenv("EIA_SIGNING_KEY_FILE");
+    if (key_file && eia_load_seed_from_file(key_file, seed) == 0) {
+        return 0;
+    }
+    /* Priority 2: raw env-var hex or bytes */
+    const char *env_key = getenv("EIA_SIGNING_KEY");
+    if (env_key) {
+        if (strlen(env_key) >= 64) {
+            bool is_hex = true;
+            for (int i = 0; i < 64; ++i) {
+                char c = env_key[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                    is_hex = false;
+                    break;
+                }
+            }
+            if (is_hex) {
+                for (int i = 0; i < 32; ++i) {
+                    unsigned int v = 0;
+                    sscanf(env_key + (i * 2), "%02x", &v);
+                    seed[i] = (uint8_t)v;
+                }
+                return 0;
+            }
+        }
+        if (strlen(env_key) >= 32) {
+            memcpy(seed, env_key, 32);
+            return 0;
+        }
+    }
+#ifdef EIA_ALLOW_DEV_FALLBACK_KEY
+    memcpy(seed, EIA_ROOT_SEED, 32);
+    return 0;
+#else
+    fprintf(stderr, "[EIA SIGNER ERROR] Production signing requires an external private key via EIA_SIGNING_KEY_FILE or EIA_SIGNING_KEY. Hardcoded fallback keys are disabled in production.\n");
+    return -1;
+#endif
+}
+
+int eia_sign_digest(const uint8_t digest[32], uint16_t key_epoch, uint8_t out_sig[64]) {
     uint8_t payload[34];
     memcpy(payload, digest, 32);
     payload[32] = (uint8_t)(key_epoch & 0xFF);
     payload[33] = (uint8_t)((key_epoch >> 8) & 0xFF);
 
-    uint8_t pk[32], sk[64];
-    const char *custom_key = getenv("EIA_SIGNING_KEY");
-    if (custom_key && strlen(custom_key) >= 32) {
-        crypto_sign_keypair(pk, sk, (const uint8_t *)custom_key);
-    } else {
-        crypto_sign_keypair(pk, sk, EIA_ROOT_SEED);
+    uint8_t seed[32];
+    if (eia_load_active_signing_seed(seed) != 0) {
+        return -1;
     }
+
+    uint8_t pk[32], sk[64];
+    eia_ed25519_keypair_from_seed(pk, sk, seed);
     eia_ed25519_sign_detached(out_sig, payload, sizeof(payload), sk);
+    return 0;
 }
 
-void spark0_sign_digest(const uint8_t digest[32], uint16_t key_epoch, uint8_t out_sig[64]) {
-    eia_sign_digest(digest, key_epoch, out_sig);
+int spark0_sign_digest(const uint8_t digest[32], uint16_t key_epoch, uint8_t out_sig[64]) {
+    return eia_sign_digest(digest, key_epoch, out_sig);
+}
+
+uint64_t eia_get_active_signing_key_id(uint16_t *out_epoch, uint8_t out_pk[32]) {
+    uint8_t seed[32];
+    if (eia_load_active_signing_seed(seed) != 0) {
+        if (out_epoch) *out_epoch = EIA_DEFAULT_KEY_EPOCH;
+        if (out_pk) memset(out_pk, 0, 32);
+        return 0;
+    }
+
+    uint8_t pk[32], sk[64];
+    eia_ed25519_keypair_from_seed(pk, sk, seed);
+    if (out_pk) memcpy(out_pk, pk, 32);
+
+    if (out_epoch) {
+        const char *ep = getenv("EIA_SIGNING_KEY_EPOCH");
+        if (ep) {
+            int val = atoi(ep);
+            if (val > 0) *out_epoch = (uint16_t)val;
+            else *out_epoch = EIA_DEFAULT_KEY_EPOCH;
+        } else {
+            *out_epoch = EIA_DEFAULT_KEY_EPOCH;
+        }
+    }
+
+    return eia_key_id_of(pk);
 }
 
 #endif /* EIA_SIGNER_ENABLED */

@@ -239,9 +239,13 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
         /* 1. DOS MZ Header Stub at Offset 0x000 (0x4D 0x5A) */
         /* Compatible with Windows loader and POSIX shell variable assignment */
         memcpy(file_buf, "MZ=;\n", 5);
-        const char *tramp1 = "tail -c+129 \"$0\">z;chmod +x z;./z \"$@\"||exit 42\n";
-        memcpy(file_buf + 5, tramp1, strlen(tramp1));
-        memset(file_buf + 5 + strlen(tramp1), ' ', 60 - (5 + strlen(tramp1)));
+        /* tramp1: POSIX short-form trampoline written into bytes 5-59.
+         * Uses 'exec' so the payload's actual exit code propagates to the shell
+         * instead of being masked as 42 on any non-zero result. */
+        const char *tramp1 = "tail -c+129 \"$0\">z;chmod +x z;exec ./z \"$@\"\n";
+        size_t tramp1_len = strlen(tramp1);
+        memcpy(file_buf + 5, tramp1, tramp1_len);
+        memset(file_buf + 5 + tramp1_len, ' ', 60 - (5 + tramp1_len));
         /* bytes 60-63: e_lfanew = 0x140 */
         file_buf[60] = 0x40;
         file_buf[61] = 0x01;
@@ -448,8 +452,9 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
         memset(&sig_rec, 0, sizeof(sig_rec));
         sig_rec.magic = EIA_AUTH_MAGIC;
         sig_rec.version = EIA_AUTH_VERSION;
-        sig_rec.key_epoch = EIA_DEFAULT_KEY_EPOCH;
-        sig_rec.public_key_id = EIA_TRUSTED_PUBKEY_ID;
+        uint16_t signing_epoch = 0;
+        sig_rec.public_key_id = eia_get_active_signing_key_id(&signing_epoch, NULL);
+        sig_rec.key_epoch = signing_epoch;
 
         /* Prepare signature slot with zeroed digest and signature in file_buf */
         memcpy(file_buf + auth_offset, &sig_rec, sizeof(sig_rec));
@@ -459,7 +464,11 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
 
         /* Full 256-bit BLAKE3 digest of entire canonical artifact */
         blake3_hash256(file_buf, total_file_size, sig_rec.blake3_digest);
-        spark0_sign_digest(sig_rec.blake3_digest, sig_rec.key_epoch, sig_rec.signature);
+        if (spark0_sign_digest(sig_rec.blake3_digest, sig_rec.key_epoch, sig_rec.signature) != 0) {
+            fprintf(stderr, "[EIA ERROR] Failed to sign artifact '%s': external signing key required\n", out_path);
+            free(file_buf);
+            return -1;
+        }
 
         memcpy(file_buf + auth_offset, &sig_rec, sizeof(sig_rec));
     }

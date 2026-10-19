@@ -179,6 +179,52 @@ typedef struct {
 _Static_assert(sizeof(EiaTypeGraphEntry) == 24, "EiaTypeGraphEntry must be exactly 24 bytes");
 
 /* ========================================================================= */
+/*       PRODUCTION GDAM (GENERATION-DRIVEN SCHEMA MIGRATION) RUNTIME        */
+/* ========================================================================= */
+
+typedef EiaTypeGraphEntry GdamFieldEntry;
+
+typedef struct GdamGeneration {
+    uint64_t epoch;
+    const uint8_t *record_buf;
+    const GdamFieldEntry *schema;
+    uint32_t count;
+} GdamGeneration;
+
+#define MAX_LOADED_PROVIDERS 64
+
+#ifndef _CONCURRENT_GDAM_STATE_DEFINED
+#define _CONCURRENT_GDAM_STATE_DEFINED
+#include <stdatomic.h>
+typedef struct {
+    _Atomic(uint64_t)         active_readers;
+    _Atomic(GdamGeneration *) active_generation;
+    GdamGeneration           *previous_generation;
+    GdamGeneration           *staged_generation;
+    uint8_t                  *retired_records[MAX_LOADED_PROVIDERS + 1];
+    size_t                    retired_count;
+} ConcurrentGdamState;
+#endif
+
+/* GDAM Runtime API */
+void gdam_init(ConcurrentGdamState *gdam, GdamGeneration *init_gen);
+GdamGeneration *gdam_reader_enter(ConcurrentGdamState *gdam);
+void gdam_reader_leave(ConcurrentGdamState *gdam);
+uint64_t gdam_atomic_publish(ConcurrentGdamState *gdam, GdamGeneration *new_gen);
+int gdam_rollback(ConcurrentGdamState *gdam);
+void gdam_retire_record(ConcurrentGdamState *gdam, uint8_t *old_rec);
+void gdam_reclaim_retired(ConcurrentGdamState *gdam);
+size_t gdam_migrate_record(
+    const uint8_t *old_buf, const GdamFieldEntry *old_tg, size_t old_count,
+    uint8_t *new_buf, const GdamFieldEntry *new_tg, size_t new_count,
+    uint64_t type_hash
+);
+int eia_gdam_stage_upgrade(ConcurrentGdamState *gdam, GdamGeneration *next_gen);
+uint64_t eia_gdam_commit_upgrade(ConcurrentGdamState *gdam, GdamGeneration *new_gen, uint64_t type_hash);
+int eia_gdam_rollback_upgrade(ConcurrentGdamState *gdam);
+
+
+/* ========================================================================= */
 /*                          3. SPARK-0 TYPE SYSTEM                           */
 /* ========================================================================= */
 
@@ -638,7 +684,7 @@ void     blake3_hash256(const uint8_t *buf, size_t len, uint8_t out_digest[32]);
 void     spark0_format_type_sig(const RuType *t, char *buf, size_t cap);
 uint64_t spark0_compute_fn_sig_hash(const RuFnDef *fn);
 uint64_t spark0_compute_struct_layout_hash(const RuStructDef *sdef);
-void     spark0_sign_digest(const uint8_t digest[32], uint16_t key_epoch, uint8_t out_sig[64]);
+int      spark0_sign_digest(const uint8_t digest[32], uint16_t key_epoch, uint8_t out_sig[64]);
 bool     spark0_verify_signature(const uint8_t digest[32], uint16_t key_epoch, uint64_t pubkey_id, const uint8_t sig[64]);
 
 RuModule *spark0_parse(const char *source_text, const char *filename);

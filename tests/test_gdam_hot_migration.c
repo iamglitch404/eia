@@ -26,44 +26,59 @@ uint64_t spark0_hash_str(const char *str) {
     return h;
 }
 
-typedef struct {
-    uint64_t type_sig_hash;
-    uint64_t field_hash;
-    uint32_t byte_offset;
-    uint32_t field_size;
-} GdamFieldEntry;
-
-typedef struct {
-    uint64_t epoch;
-    const uint8_t *record_buf;
-    const GdamFieldEntry *schema;
-    uint32_t count;
-} GdamGeneration;
-
-typedef struct {
-    _Atomic(GdamGeneration *) active_generation;
-    GdamGeneration           *previous_generation;
-    GdamGeneration           *staged_generation;
-} ConcurrentGdamState;
-
-static void gdam_init(ConcurrentGdamState *gdam, GdamGeneration *init_gen) {
+/* Implementation of GDAM lifecycle routines declared in spark0.h */
+void gdam_init(ConcurrentGdamState *gdam, GdamGeneration *init_gen) {
     memset(gdam, 0, sizeof(*gdam));
+    atomic_init(&gdam->active_readers, 0);
     atomic_init(&gdam->active_generation, init_gen);
 }
 
-static uint64_t gdam_atomic_publish(ConcurrentGdamState *gdam, GdamGeneration *new_gen) {
-    gdam->previous_generation = atomic_load(&gdam->active_generation);
-    atomic_store_explicit(&gdam->active_generation, new_gen, memory_order_release);
-    return new_gen->epoch;
+GdamGeneration *gdam_reader_enter(ConcurrentGdamState *gdam) {
+    if (!gdam) return NULL;
+    atomic_fetch_add_explicit(&gdam->active_readers, 1, memory_order_acquire);
+    return atomic_load_explicit(&gdam->active_generation, memory_order_acquire);
 }
 
-static int gdam_rollback(ConcurrentGdamState *gdam) {
-    if (!gdam->previous_generation) return -1;
+void gdam_reader_leave(ConcurrentGdamState *gdam) {
+    if (!gdam) return;
+    atomic_fetch_sub_explicit(&gdam->active_readers, 1, memory_order_release);
+}
+
+uint64_t gdam_atomic_publish(ConcurrentGdamState *gdam, GdamGeneration *new_gen) {
+    if (!gdam || !new_gen) return 0;
+    gdam->previous_generation = atomic_load(&gdam->active_generation);
+    atomic_store_explicit(&gdam->active_generation, new_gen, memory_order_release);
+    return new_gen->epoch ? new_gen->epoch : 1;
+}
+
+int gdam_rollback(ConcurrentGdamState *gdam) {
+    if (!gdam || !gdam->previous_generation) return -1;
     atomic_store_explicit(&gdam->active_generation, gdam->previous_generation, memory_order_release);
     return 0;
 }
 
-static size_t gdam_migrate_record(
+void gdam_retire_record(ConcurrentGdamState *gdam, uint8_t *old_rec) {
+    if (!gdam || !old_rec) return;
+    if (gdam->retired_count < MAX_LOADED_PROVIDERS + 1) {
+        gdam->retired_records[gdam->retired_count++] = old_rec;
+    }
+}
+
+void gdam_reclaim_retired(ConcurrentGdamState *gdam) {
+    if (!gdam) return;
+    while (atomic_load_explicit(&gdam->active_readers, memory_order_acquire) > 0) {
+        usleep(100);
+    }
+    for (size_t i = 0; i < gdam->retired_count; ++i) {
+        if (gdam->retired_records[i]) {
+            free(gdam->retired_records[i]);
+            gdam->retired_records[i] = NULL;
+        }
+    }
+    gdam->retired_count = 0;
+}
+
+size_t gdam_migrate_record(
     const uint8_t *old_buf, const GdamFieldEntry *old_tg, size_t old_count,
     uint8_t *new_buf, const GdamFieldEntry *new_tg, size_t new_count,
     uint64_t type_hash
@@ -91,6 +106,44 @@ static size_t gdam_migrate_record(
     return migrated;
 }
 
+int eia_gdam_stage_upgrade(ConcurrentGdamState *gdam, GdamGeneration *next_gen) {
+    if (!gdam || !next_gen) return -1;
+    gdam->staged_generation = next_gen;
+    return 0;
+}
+
+uint64_t eia_gdam_commit_upgrade(ConcurrentGdamState *gdam, GdamGeneration *new_gen, uint64_t type_hash) {
+    if (!gdam || !new_gen) return 0;
+    GdamGeneration *prev_gen = atomic_load(&gdam->active_generation);
+    if (prev_gen && prev_gen->record_buf && new_gen->count > 0 && new_gen->schema) {
+        size_t new_sz = 0;
+        for (size_t f = 0; f < new_gen->count; ++f) {
+            uint32_t end = new_gen->schema[f].byte_offset + new_gen->schema[f].field_size;
+            if (end > new_sz) new_sz = end;
+        }
+        if (new_sz > 0) {
+            uint8_t *migrated_buf = (uint8_t *)calloc(new_sz, 1);
+            if (migrated_buf) {
+                gdam_migrate_record(
+                    prev_gen->record_buf, prev_gen->schema, prev_gen->count,
+                    migrated_buf, new_gen->schema, new_gen->count,
+                    type_hash
+                );
+                new_gen->record_buf = migrated_buf;
+                gdam_retire_record(gdam, (uint8_t *)prev_gen->record_buf);
+                prev_gen->record_buf = NULL;
+            }
+        }
+    }
+    uint64_t pub_epoch = gdam_atomic_publish(gdam, new_gen);
+    gdam->staged_generation = NULL;
+    return pub_epoch;
+}
+
+int eia_gdam_rollback_upgrade(ConcurrentGdamState *gdam) {
+    return gdam_rollback(gdam);
+}
+
 /* ------------------------------------------------------------------------- */
 /* Concurrent Reader / Upgrade Simulation Test                              */
 /* ------------------------------------------------------------------------- */
@@ -112,8 +165,9 @@ static void *reader_worker(void *arg) {
     uint64_t id_hash = spark0_hash_str("id");
 
     while (atomic_load(ra->running)) {
-        GdamGeneration *gen = atomic_load_explicit(&ra->gdam->active_generation, memory_order_acquire);
+        GdamGeneration *gen = gdam_reader_enter(ra->gdam);
         if (!gen || !gen->record_buf) {
+            gdam_reader_leave(ra->gdam);
             atomic_fetch_add(&ra->error_count, 1);
             continue;
         }
@@ -137,6 +191,8 @@ static void *reader_worker(void *arg) {
                 atomic_fetch_add(&ra->error_count, 1);
             }
         }
+
+        gdam_reader_leave(ra->gdam);
 
         atomic_fetch_add(&ra->read_count, 1);
         if (atomic_load(&ra->read_count) >= READ_CYCLES) break;

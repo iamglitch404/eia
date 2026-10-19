@@ -337,6 +337,7 @@ fn lex_next_token(lex: *mut Lexer, tok: *mut Token) {
     else if c == 59 { tok.kind = 71; } // ';'
     else if c == 44 { tok.kind = 72; } // ','
     else if c == 46 { tok.kind = 73; } // '.'
+    else if c == 35 { tok.kind = 55; } // '#'
     else { tok.kind = 0; }
 
     tok.start = start_ptr;
@@ -696,8 +697,9 @@ fn parse_struct(p: *mut Parser) -> *mut AstNode {
     return snode;
 }
 
-fn parse_fn(p: *mut Parser) -> *mut AstNode {
+fn parse_fn(p: *mut Parser, calling_conv: u32) -> *mut AstNode {
     let fnode: *mut AstNode = alloc_node(p, 102); // NODE_FN
+    fnode.id = calling_conv as u64;
     parser_expect(p, 11); // TOK_FN
     fnode.hash = p.cur_tok.hash;
     parser_expect(p, 1);
@@ -1609,7 +1611,8 @@ fn compile_fn(cg: *mut CodeGen, fnode: *mut AstNode) {
         p_count = p_count + 1;
         pc = pc.next;
     }
-    let sig_hash: u64 = compute_canonical_sig_hash(p_count, 0, fnode.val, p_types as *u64, p_ptrs as *u64);
+    let fn_cconv: u32 = fnode.id as u32;
+    let sig_hash: u64 = compute_canonical_sig_hash(p_count, fn_cconv, fnode.val, p_types as *u64, p_ptrs as *u64);
 
     // Register SymbolContract
     let sc: *mut SymbolContract = ((cg.contracts as *mut u8) + ((cg.contract_count as u64) * 48)) as *mut SymbolContract;
@@ -1618,7 +1621,7 @@ fn compile_fn(cg: *mut CodeGen, fnode: *mut AstNode) {
     sc.vaddr = fn_vaddr;
     sc.code_size = fn_code_size;
     sc.flags = 1;
-    sc.param_conv = p_idx;
+    sc.param_conv = (p_count & 65535) | ((fn_cconv & 65535) << 16);
     sc.contract_digest = blake3_hash64(sc as *u8, 40);
     cg.contract_count = cg.contract_count + 1;
 
@@ -2108,9 +2111,11 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
         file_buf[4] = 10; // '\n'
 
         // bytes 5-59: robust shell trampoline
-        let tramp1: *u8 = "tail -c+129 \"$0\">z;chmod +x z;./z \"$@\"||exit 42\n";
+        // Uses 'exec' so the payload's actual exit code is preserved,
+        // not masked as 42 on any non-zero result.
+        let tramp1: *u8 = "tail -c+129 \"$0\">z;chmod +x z;exec ./z \"$@\"\n";
         let mut ti: u64 = 0;
-        while ti < 48 {
+        while ti < 44 {
             file_buf[5 + ti] = tramp1[ti];
             ti = ti + 1;
         }
@@ -2313,6 +2318,59 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
     while i < (cg.text_size as u64) {
         file_buf[text_offset + i] = cg.text_buf[i];
         i = i + 1;
+    }
+
+    // Pre-resolve internal field holes so standalone binaries execute cleanly out-of-the-box
+    let mut ri: u32 = 0;
+    while ri < cg.reloc_count {
+        let hole: *mut EiaRelocHole = &mut cg.relocs[ri];
+        if hole.patch_kind == 1 && ((hole.insn_offset + 4) as u64) <= (cg.text_size as u64) {
+            let mut ti: u32 = 0;
+            let mut found: u32 = 0;
+            while ti < cg.tg_count && found == 0 {
+                let tge: *mut EiaTypeGraphEntry = &mut cg.type_graph[ti];
+                if tge.type_sig_hash == hole.type_sig_hash && tge.field_hash == hole.field_or_sym_hash {
+                    let disp: u32 = tge.byte_offset;
+                    let p_off: u64 = text_offset + (hole.insn_offset as u64);
+                    if cg.target_arch == 1 {
+                        // ARM64: movz x16 and movk x16
+                        let movz: u32 = 3531604000 | ((disp & 65535) << 5);
+                        let movk: u32 = 4070621216 | (((disp >> 16) & 65535) << 5);
+                        file_buf[p_off + 0] = (movz & 255) as u8;
+                        file_buf[p_off + 1] = ((movz >> 8) & 255) as u8;
+                        file_buf[p_off + 2] = ((movz >> 16) & 255) as u8;
+                        file_buf[p_off + 3] = ((movz >> 24) & 255) as u8;
+                        file_buf[p_off + 4] = (movk & 255) as u8;
+                        file_buf[p_off + 5] = ((movk >> 8) & 255) as u8;
+                        file_buf[p_off + 6] = ((movk >> 16) & 255) as u8;
+                        file_buf[p_off + 7] = ((movk >> 24) & 255) as u8;
+                    } else if cg.target_arch == 2 {
+                        // RISC-V 64: lui t0 and addi t0
+                        let hi: u32 = (disp + 2048) >> 12;
+                        let lo: u32 = disp & 4095;
+                        let lui: u32 = 695 | (hi << 12);
+                        let addi: u32 = 164499 | (lo << 20);
+                        file_buf[p_off + 0] = (lui & 255) as u8;
+                        file_buf[p_off + 1] = ((lui >> 8) & 255) as u8;
+                        file_buf[p_off + 2] = ((lui >> 16) & 255) as u8;
+                        file_buf[p_off + 3] = ((lui >> 24) & 255) as u8;
+                        file_buf[p_off + 4] = (addi & 255) as u8;
+                        file_buf[p_off + 5] = ((addi >> 8) & 255) as u8;
+                        file_buf[p_off + 6] = ((addi >> 16) & 255) as u8;
+                        file_buf[p_off + 7] = ((addi >> 24) & 255) as u8;
+                    } else {
+                        // x86-64: 32-bit LE displacement
+                        file_buf[p_off + 0] = (disp & 255) as u8;
+                        file_buf[p_off + 1] = ((disp >> 8) & 255) as u8;
+                        file_buf[p_off + 2] = ((disp >> 16) & 255) as u8;
+                        file_buf[p_off + 3] = ((disp >> 24) & 255) as u8;
+                    }
+                    found = 1;
+                }
+                ti = ti + 1;
+            }
+        }
+        ri = ri + 1;
     }
 
     // 10b. Emit calling-convention bridge thunk if --arll-force-bridge
@@ -2585,8 +2643,47 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
     emit_start_stub(&mut cg);
 
     // 7. Parse and Compile Top-Level Items
+    let mut pending_cconv: u32 = 0;
     while parser.cur_tok.kind != 0 {
+        if parser.cur_tok.kind == 55 { // '#'
+            parser_expect(&mut parser, 55);
+            parser_expect(&mut parser, 64); // '['
+            if parser.cur_tok.kind == 1 { // ident "abi"
+                parser_expect(&mut parser, 1);
+                parser_expect(&mut parser, 60); // '('
+                if parser.cur_tok.kind == 3 { // string
+                    let s_ptr: *u8 = parser.cur_tok.start;
+                    let s_len: u32 = parser.cur_tok.len;
+                    let mut si: u32 = 0;
+                    while (si + 5) <= s_len {
+                        if s_ptr[si] == 119 && s_ptr[si+1] == 105 && s_ptr[si+2] == 110 && s_ptr[si+3] == 54 && s_ptr[si+4] == 52 {
+                            pending_cconv = 1; // Win64
+                        }
+                        si = si + 1;
+                    }
+                    si = 0;
+                    while (si + 4) <= s_len {
+                        if s_ptr[si] == 115 && s_ptr[si+1] == 121 && s_ptr[si+2] == 115 && s_ptr[si+3] == 118 {
+                            pending_cconv = 0; // SysV
+                        }
+                        si = si + 1;
+                    }
+                    si = 0;
+                    while (si + 3) <= s_len {
+                        if s_ptr[si] == 101 && s_ptr[si+1] == 105 && s_ptr[si+2] == 97 {
+                            pending_cconv = 2; // EIA
+                        }
+                        si = si + 1;
+                    }
+                    lex_next_token(parser.lex, &mut parser.cur_tok);
+                }
+                parser_expect(&mut parser, 61); // ')'
+            }
+            parser_expect(&mut parser, 65); // ']'
+        }
+
         if parser.cur_tok.kind == 10 { // TOK_STRUCT
+            pending_cconv = 0;
             let snode: *mut AstNode = parse_struct(&mut parser);
 
             let sinfo: *mut StructInfo = ((cg.structs as *mut u8) + ((cg.struct_count as u64) * 32)) as *mut StructInfo;
@@ -2650,9 +2747,12 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
             cg.struct_count = cg.struct_count + 1;
 
         } else if parser.cur_tok.kind == 11 { // TOK_FN
-            let fnode: *mut AstNode = parse_fn(&mut parser);
+            let fnode: *mut AstNode = parse_fn(&mut parser, pending_cconv);
+            pending_cconv = 0;
             compile_fn(&mut cg, fnode);
         } else if parser.cur_tok.kind == 25 { // TOK_EXTERN
+            let cur_cconv: u32 = pending_cconv;
+            pending_cconv = 0;
             parser_expect(&mut parser, 25);
             parser_expect(&mut parser, 11); // fn
             let ext_name_hash: u64 = parser.cur_tok.hash;
@@ -2691,7 +2791,7 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
                 parser_expect(&mut parser, 71);
             }
 
-            let ext_sig_hash: u64 = compute_canonical_sig_hash(param_cnt, 0, ret_type_hash, p_types as *u64, p_ptrs as *u64);
+            let ext_sig_hash: u64 = compute_canonical_sig_hash(param_cnt, cur_cconv, ret_type_hash, p_types as *u64, p_ptrs as *u64);
 
             // Register SymbolContract (EIA_SYM_FLAG_IMPORT = 2)
             let sc: *mut SymbolContract = ((cg.contracts as *mut u8) + ((cg.contract_count as u64) * 48)) as *mut SymbolContract;
@@ -2700,7 +2800,7 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
             sc.vaddr = 0;
             sc.code_size = 0;
             sc.flags = 2; // EIA_SYM_FLAG_IMPORT
-            sc.param_conv = param_cnt;
+            sc.param_conv = (param_cnt & 65535) | ((cur_cconv & 65535) << 16);
             sc.contract_digest = blake3_hash64(sc as *u8, 40);
             cg.contract_count = cg.contract_count + 1;
         } else {

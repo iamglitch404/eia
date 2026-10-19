@@ -41,49 +41,61 @@
 /*       PRODUCTION GDAM (GENERATION-DRIVEN SCHEMA MIGRATION) RUNTIME        */
 /* ========================================================================= */
 
-typedef struct {
-    uint64_t type_sig_hash;
-    uint64_t field_hash;
-    uint32_t byte_offset;
-    uint32_t field_size;
-} GdamFieldEntry;
-
-typedef struct {
-    uint64_t epoch;
-    const uint8_t *record_buf;
-    const GdamFieldEntry *schema;
-    uint32_t count;
-} GdamGeneration;
-
-typedef struct {
-    _Atomic(GdamGeneration *) active_generation;
-    GdamGeneration           *previous_generation;
-    GdamGeneration           *staged_generation;
-} ConcurrentGdamState;
-
-#define MAX_LOADED_PROVIDERS 64
 static ConcurrentGdamState g_runtime_gdam;
 static GdamGeneration g_provider_gens[MAX_LOADED_PROVIDERS + 1];
 
-static inline void gdam_init(ConcurrentGdamState *gdam, GdamGeneration *init_gen) {
+void gdam_init(ConcurrentGdamState *gdam, GdamGeneration *init_gen) {
     memset(gdam, 0, sizeof(*gdam));
+    atomic_init(&gdam->active_readers, 0);
     atomic_init(&gdam->active_generation, init_gen);
 }
 
-static inline uint64_t gdam_atomic_publish(ConcurrentGdamState *gdam, GdamGeneration *new_gen) {
+GdamGeneration *gdam_reader_enter(ConcurrentGdamState *gdam) {
+    if (!gdam) return NULL;
+    atomic_fetch_add_explicit(&gdam->active_readers, 1, memory_order_acquire);
+    return atomic_load_explicit(&gdam->active_generation, memory_order_acquire);
+}
+
+void gdam_reader_leave(ConcurrentGdamState *gdam) {
+    if (!gdam) return;
+    atomic_fetch_sub_explicit(&gdam->active_readers, 1, memory_order_release);
+}
+
+uint64_t gdam_atomic_publish(ConcurrentGdamState *gdam, GdamGeneration *new_gen) {
     if (!gdam || !new_gen) return 0;
     gdam->previous_generation = atomic_load(&gdam->active_generation);
     atomic_store_explicit(&gdam->active_generation, new_gen, memory_order_release);
     return new_gen->epoch ? new_gen->epoch : 1;
 }
 
-static inline int gdam_rollback(ConcurrentGdamState *gdam) {
-    if (!gdam->previous_generation) return -1;
+int gdam_rollback(ConcurrentGdamState *gdam) {
+    if (!gdam || !gdam->previous_generation) return -1;
     atomic_store_explicit(&gdam->active_generation, gdam->previous_generation, memory_order_release);
     return 0;
 }
 
-static inline size_t gdam_migrate_record(
+void gdam_retire_record(ConcurrentGdamState *gdam, uint8_t *old_rec) {
+    if (!gdam || !old_rec) return;
+    if (gdam->retired_count < MAX_LOADED_PROVIDERS + 1) {
+        gdam->retired_records[gdam->retired_count++] = old_rec;
+    }
+}
+
+void gdam_reclaim_retired(ConcurrentGdamState *gdam) {
+    if (!gdam) return;
+    while (atomic_load_explicit(&gdam->active_readers, memory_order_acquire) > 0) {
+        usleep(100);
+    }
+    for (size_t i = 0; i < gdam->retired_count; ++i) {
+        if (gdam->retired_records[i]) {
+            free(gdam->retired_records[i]);
+            gdam->retired_records[i] = NULL;
+        }
+    }
+    gdam->retired_count = 0;
+}
+
+size_t gdam_migrate_record(
     const uint8_t *old_buf, const GdamFieldEntry *old_tg, size_t old_count,
     uint8_t *new_buf, const GdamFieldEntry *new_tg, size_t new_count,
     uint64_t type_hash
@@ -109,6 +121,44 @@ static inline size_t gdam_migrate_record(
         }
     }
     return migrated;
+}
+
+int eia_gdam_stage_upgrade(ConcurrentGdamState *gdam, GdamGeneration *next_gen) {
+    if (!gdam || !next_gen) return -1;
+    gdam->staged_generation = next_gen;
+    return 0;
+}
+
+uint64_t eia_gdam_commit_upgrade(ConcurrentGdamState *gdam, GdamGeneration *new_gen, uint64_t type_hash) {
+    if (!gdam || !new_gen) return 0;
+    GdamGeneration *prev_gen = atomic_load(&gdam->active_generation);
+    if (prev_gen && prev_gen->record_buf && new_gen->count > 0 && new_gen->schema) {
+        size_t new_sz = 0;
+        for (size_t f = 0; f < new_gen->count; ++f) {
+            uint32_t end = new_gen->schema[f].byte_offset + new_gen->schema[f].field_size;
+            if (end > new_sz) new_sz = end;
+        }
+        if (new_sz > 0) {
+            uint8_t *migrated_buf = (uint8_t *)calloc(new_sz, 1);
+            if (migrated_buf) {
+                gdam_migrate_record(
+                    prev_gen->record_buf, prev_gen->schema, prev_gen->count,
+                    migrated_buf, new_gen->schema, new_gen->count,
+                    type_hash
+                );
+                new_gen->record_buf = migrated_buf;
+                gdam_retire_record(gdam, (uint8_t *)prev_gen->record_buf);
+                prev_gen->record_buf = NULL;
+            }
+        }
+    }
+    uint64_t pub_epoch = gdam_atomic_publish(gdam, new_gen);
+    gdam->staged_generation = NULL;
+    return pub_epoch;
+}
+
+int eia_gdam_rollback_upgrade(ConcurrentGdamState *gdam) {
+    return gdam_rollback(gdam);
 }
 
 /* Diagnostic error codes */
@@ -772,9 +822,9 @@ static LoadedBinary *load_binary(const char *path) {
             free(data);
             return NULL;
         }
-        if (sig->public_key_id != EIA_TRUSTED_PUBKEY_ID) {
-            fprintf(stderr, "[EIA ERROR] '%s': Untrusted public key ID 0x%016lx\n",
-                    path, (unsigned long)sig->public_key_id);
+        if (!eia_trust_store_lookup(sig->public_key_id, sig->key_epoch)) {
+            fprintf(stderr, "[EIA ERROR] '%s': Untrusted or revoked public key ID 0x%016lx (epoch %u)\n",
+                    path, (unsigned long)sig->public_key_id, sig->key_epoch);
             free(data);
             return NULL;
         }
@@ -967,6 +1017,13 @@ static void cleanup_loaded_binaries(LoadedBinary *client, LoadedBinary **provide
         }
         free(providers);
     }
+    gdam_reclaim_retired(&g_runtime_gdam);
+    for (int i = 0; i <= MAX_LOADED_PROVIDERS; ++i) {
+        if (g_provider_gens[i].record_buf) {
+            free((void *)g_provider_gens[i].record_buf);
+            g_provider_gens[i].record_buf = NULL;
+        }
+    }
 }
 
 /* ========================================================================= */
@@ -974,38 +1031,60 @@ static void cleanup_loaded_binaries(LoadedBinary *client, LoadedBinary **provide
 /* ========================================================================= */
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s [--require-signed] <client_binary> [provider_binary ...]\n", argv[0]);
-        fprintf(stderr, "EIA Dynamic Linker-Loader & Dual Virtual Alias Mapping Substrate\n");
-        return 1;
-    }
-
     int require_signed = 0;
-    int client_arg_idx = -1;
+    int strict_epoch = (getenv("EIA_STRICT_EPOCH") != NULL);
+    const char *client_path = NULL;
+    int provider_count = 0;
+    const char *provider_paths[64];
+
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--require-signed") == 0) {
             require_signed = 1;
-        } else if (client_arg_idx == -1) {
-            client_arg_idx = i;
-        }
-    }
-
-    if (client_arg_idx == -1) {
-        fprintf(stderr, "Usage: %s [--require-signed] <client_binary> [provider_binary ...]\n", argv[0]);
-        return 1;
-    }
-
-    const char *client_path = argv[client_arg_idx];
-    int provider_count = 0;
-    const char *provider_paths[64];
-    for (int i = client_arg_idx + 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--require-signed") == 0) {
-            require_signed = 1;
-            continue;
-        }
-        if (provider_count < 64) {
+        } else if (strcmp(argv[i], "--strict-epoch") == 0) {
+            strict_epoch = 1;
+        } else if (strcmp(argv[i], "--trust-key") == 0 && i + 1 < argc) {
+            const char *val = argv[++i];
+            if (strlen(val) == 64) {
+                uint8_t pk[32];
+                bool ok = true;
+                for (int b = 0; b < 32; ++b) {
+                    unsigned int v = 0;
+                    if (sscanf(val + (b * 2), "%02x", &v) != 1) { ok = false; break; }
+                    pk[b] = (uint8_t)v;
+                }
+                if (ok) eia_trust_store_add(pk, 0);
+            } else {
+                FILE *f = fopen(val, "rb");
+                if (f) {
+                    uint8_t pk[32];
+                    if (fread(pk, 1, 32, f) == 32) eia_trust_store_add(pk, 0);
+                    fclose(f);
+                }
+            }
+        } else if (strcmp(argv[i], "--trust-store") == 0 && i + 1 < argc) {
+            const char *val = argv[++i];
+            FILE *f = fopen(val, "rb");
+            if (f) {
+                uint8_t pk[32];
+                while (fread(pk, 1, 32, f) == 32) eia_trust_store_add(pk, 0);
+                fclose(f);
+            }
+        } else if (strcmp(argv[i], "--revoke-key") == 0 && i + 1 < argc) {
+            uint64_t kid = (uint64_t)strtoull(argv[++i], NULL, 0);
+            if (kid) eia_trust_store_revoke(kid, 0);
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            return 1;
+        } else if (!client_path) {
+            client_path = argv[i];
+        } else if (provider_count < 64) {
             provider_paths[provider_count++] = argv[i];
         }
+    }
+
+    if (!client_path) {
+        fprintf(stderr, "Usage: %s [--require-signed] [--trust-key <hex/file>] [--trust-store <file>] [--revoke-key <id>] <client_binary> [provider_binary ...]\n", argv[0]);
+        return 1;
     }
 
     /* 1. Load client binary */
@@ -1049,19 +1128,95 @@ int main(int argc, char **argv) {
     g_provider_gens[0].epoch = client->holo->abi_epoch;
     g_provider_gens[0].count = client->type_graph_count;
     g_provider_gens[0].schema = (const GdamFieldEntry *)client->type_graph;
+    if (client->type_graph_count > 0 && client->type_graph) {
+        size_t base_sz = 0;
+        for (size_t f = 0; f < client->type_graph_count; ++f) {
+            uint32_t end = g_provider_gens[0].schema[f].byte_offset + g_provider_gens[0].schema[f].field_size;
+            if (end > base_sz) base_sz = end;
+        }
+        if (base_sz > 0) {
+            g_provider_gens[0].record_buf = (uint8_t *)calloc(base_sz, 1);
+        }
+    }
     gdam_init(&g_runtime_gdam, &g_provider_gens[0]);
 
-    /* Atomically publish each loaded provider's schema generation */
+    /* Atomically publish each loaded provider's schema generation and
+     * migrate live type-graph records when the ABI epoch advances. */
     for (int i = 0; i < provider_count && i < MAX_LOADED_PROVIDERS; ++i) {
+        GdamGeneration *prev_gen = atomic_load(&g_runtime_gdam.active_generation);
+
         memset(&g_provider_gens[i + 1], 0, sizeof(g_provider_gens[i + 1]));
-        g_provider_gens[i + 1].epoch = providers[i]->holo->abi_epoch;
-        g_provider_gens[i + 1].count = providers[i]->type_graph_count;
+        g_provider_gens[i + 1].epoch  = providers[i]->holo->abi_epoch;
+        g_provider_gens[i + 1].count  = providers[i]->type_graph_count;
         g_provider_gens[i + 1].schema = (const GdamFieldEntry *)providers[i]->type_graph;
+
         if (gdam_atomic_publish(&g_runtime_gdam, &g_provider_gens[i + 1]) == 0) {
             fprintf(stderr, "[EIA ERROR] GDAM publication failed for provider '%s'; rolling back generation\n", providers[i]->path);
             gdam_rollback(&g_runtime_gdam);
             cleanup_loaded_binaries(client, providers, provider_count);
             return 1;
+        }
+
+        /* Live GDAM record migration: if the new generation's epoch is strictly
+         * higher than the previous one, forward-migrate any type-graph records
+         * that exist in both schemas so field offsets and sizes are up to date. */
+        GdamGeneration *new_gen = atomic_load(&g_runtime_gdam.active_generation);
+        if (prev_gen && new_gen &&
+            new_gen->epoch > prev_gen->epoch &&
+            new_gen->schema && new_gen->count > 0) {
+
+            if (!prev_gen->record_buf && prev_gen->count > 0 && prev_gen->schema) {
+                size_t prev_sz = 0;
+                for (size_t f = 0; f < prev_gen->count; ++f) {
+                    uint32_t end = prev_gen->schema[f].byte_offset + prev_gen->schema[f].field_size;
+                    if (end > prev_sz) prev_sz = end;
+                }
+                if (prev_sz > 0) {
+                    prev_gen->record_buf = (uint8_t *)calloc(prev_sz, 1);
+                }
+            }
+
+            /* Allocate a scratchpad sized to the new generation's schema extent */
+            size_t new_record_sz = 0;
+            for (size_t f = 0; f < new_gen->count; ++f) {
+                uint32_t end = new_gen->schema[f].byte_offset + new_gen->schema[f].field_size;
+                if (end > new_record_sz) new_record_sz = end;
+            }
+            if (new_record_sz > 0) {
+                uint8_t *migrated_buf = (uint8_t *)calloc(new_record_sz, 1);
+                if (migrated_buf) {
+                    /* Migrate every type seen in the new generation */
+                    size_t total_migrated = 0;
+                    if (prev_gen->record_buf && prev_gen->schema && prev_gen->count > 0) {
+                        for (size_t f = 0; f < new_gen->count; ++f) {
+                            uint64_t type_hash = new_gen->schema[f].type_sig_hash;
+                            total_migrated += gdam_migrate_record(
+                                prev_gen->record_buf, prev_gen->schema, prev_gen->count,
+                                migrated_buf, new_gen->schema, new_gen->count,
+                                type_hash
+                            );
+                        }
+                    }
+                    printf("[EIA GDAM] Live schema migration: provider '%s' epoch %lu→%lu, %zu field(s) migrated\n",
+                           providers[i]->path,
+                           (unsigned long)prev_gen->epoch,
+                           (unsigned long)new_gen->epoch,
+                           total_migrated);
+                    /* Attach migrated record buffer to the published generation */
+                    g_provider_gens[i + 1].record_buf = migrated_buf;
+                    /* Safely retire previous generation's record buffer */
+                    if (prev_gen->record_buf) {
+                        gdam_retire_record(&g_runtime_gdam, (uint8_t *)prev_gen->record_buf);
+                        prev_gen->record_buf = NULL;
+                    }
+                }
+            }
+        } else if (prev_gen && new_gen && new_gen->epoch > prev_gen->epoch) {
+            /* No live record buffer to migrate; schema evolution logged only */
+            printf("[EIA GDAM] Schema generation advanced: provider '%s' epoch %lu→%lu (no live record buffer)\n",
+                   providers[i]->path,
+                   (unsigned long)prev_gen->epoch,
+                   (unsigned long)new_gen->epoch);
         }
     }
 
@@ -1162,13 +1317,31 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Check ABI epoch compatibility */
+    /* Check ABI epoch compatibility:
+     * Evolution mode (default): provider epoch must be >= client epoch.
+     * Providers with higher epochs trigger GDAM schema evolution and record migration.
+     * Stricter flag (--strict-epoch) requires exact match. */
     for (int i = 0; i < provider_count; ++i) {
-        if (providers[i]->holo->abi_epoch != client->holo->abi_epoch) {
-            fprintf(stderr, "[EIA ERROR] Incompatible ABI epoch: client '%s' (epoch %lu) vs provider '%s' (epoch %lu)\n",
-                    client->path, (unsigned long)client->holo->abi_epoch,
-                    providers[i]->path, (unsigned long)providers[i]->holo->abi_epoch);
-            return 1;
+        if (strict_epoch) {
+            if (providers[i]->holo->abi_epoch != client->holo->abi_epoch) {
+                fprintf(stderr, "[EIA ERROR] Incompatible ABI epoch: client '%s' (epoch %lu) vs provider '%s' (epoch %lu) under --strict-epoch\n",
+                        client->path, (unsigned long)client->holo->abi_epoch,
+                        providers[i]->path, (unsigned long)providers[i]->holo->abi_epoch);
+                sym_reg_free(&sym_reg);
+                field_reg_free(&field_reg);
+                cleanup_loaded_binaries(client, providers, provider_count);
+                return 1;
+            }
+        } else {
+            if (providers[i]->holo->abi_epoch < client->holo->abi_epoch) {
+                fprintf(stderr, "[EIA ERROR] Incompatible legacy provider: client '%s' requires ABI epoch >= %lu, but provider '%s' is at epoch %lu\n",
+                        client->path, (unsigned long)client->holo->abi_epoch,
+                        providers[i]->path, (unsigned long)providers[i]->holo->abi_epoch);
+                sym_reg_free(&sym_reg);
+                field_reg_free(&field_reg);
+                cleanup_loaded_binaries(client, providers, provider_count);
+                return 1;
+            }
         }
     }
 
@@ -1643,7 +1816,11 @@ int main(int argc, char **argv) {
     int64_t exit_code = 0;
     if (can_exec_native) {
         void *entry_ptr = (void *)(v_exec + client->arena_offset + main_fn_offset);
+        GdamGeneration *active_gen = gdam_reader_enter(&g_runtime_gdam);
+        (void)active_gen;
         exit_code = call_sysv_entry(entry_ptr);
+        gdam_reader_leave(&g_runtime_gdam);
+        gdam_reclaim_retired(&g_runtime_gdam);
     } else {
 #ifndef _WIN32
         const char *emu = NULL;

@@ -924,6 +924,59 @@ int main(void) {
         printf("  Steady-state dispatch overhead: 0 ns (direct native instruction execution)\n");
     }
 
+    /* [TEST 7] GDAM Generational Schema Evolution & Strict Epoch Policy */
+    printf("\n[TEST 7] GDAM Generational Schema Evolution & Strict Epoch Policy...\n");
+    {
+        /* Create client and provider binaries */
+        char cmd_c1[512], cmd_p2[512];
+        snprintf(cmd_c1, sizeof(cmd_c1), "./bin/spark0 tests/client_v1.rx -o /tmp/client_ep1 >/dev/null 2>&1");
+        snprintf(cmd_p2, sizeof(cmd_p2), "./bin/spark0 tests/provider_v2.rx -o /tmp/provider_ep2 >/dev/null 2>&1");
+        assert(system(cmd_c1) == 0);
+        assert(system(cmd_p2) == 0);
+
+        /* Patch provider_ep2 hologram header to epoch 2 (at 0x80 + 8 = 0x88) */
+        FILE *pf = fopen("/tmp/provider_ep2", "r+b");
+        assert(pf != NULL);
+        fseek(pf, 0x88, SEEK_SET);
+        uint64_t new_epoch = 2;
+        assert(fwrite(&new_epoch, 8, 1, pf) == 1);
+        fclose(pf);
+
+        /* 1. Evolution mode: Client (epoch 1) dynamically links Provider (epoch 2) -> PASSED (exit 42) */
+        int run_evo = system("./bin/eia-run /tmp/client_ep1 /tmp/provider_ep2 >/dev/null 2>&1");
+        int evo_exit = (run_evo >> 8) & 255;
+        assert(evo_exit == 42);
+        printf("  [PASS] Evolution mode: Provider epoch 2 dynamically linked with client epoch 1 (exit 42)\n");
+
+        /* 2. Strict mode (--strict-epoch): epoch mismatch is strictly rejected (exit 1) */
+        int run_strict = system("./bin/eia-run --strict-epoch /tmp/client_ep1 /tmp/provider_ep2 >/dev/null 2>&1");
+        int strict_exit = (run_strict >> 8) & 255;
+        assert(strict_exit == 1);
+        printf("  [PASS] Strict mode (--strict-epoch): Mismatched epoch rejected fail-closed (exit 1)\n");
+
+        /* 3. Incompatible legacy provider: client (epoch 2) with provider (epoch 1) rejected fail-closed */
+        FILE *cf = fopen("/tmp/client_ep1", "r+b");
+        assert(cf != NULL);
+        fseek(cf, 0x88, SEEK_SET);
+        assert(fwrite(&new_epoch, 8, 1, cf) == 1);
+        fclose(cf);
+
+        pf = fopen("/tmp/provider_ep2", "r+b");
+        assert(pf != NULL);
+        uint64_t old_epoch = 1;
+        fseek(pf, 0x88, SEEK_SET);
+        assert(fwrite(&old_epoch, 8, 1, pf) == 1);
+        fclose(pf);
+
+        int run_legacy = system("./bin/eia-run /tmp/client_ep1 /tmp/provider_ep2 >/dev/null 2>&1");
+        int legacy_exit = (run_legacy >> 8) & 255;
+        assert(legacy_exit == 1);
+        printf("  [PASS] Legacy rejection: Incompatible older provider rejected fail-closed (exit 1)\n");
+
+        unlink("/tmp/client_ep1");
+        unlink("/tmp/provider_ep2");
+    }
+
     free(client_bin);
     free(provider_bin);
 

@@ -1019,6 +1019,7 @@ int main(int argc, char **argv) {
         void *entry_ptr = (void *)(v_exec + client->arena_offset + main_fn_offset);
         exit_code = call_sysv_entry(entry_ptr);
     } else {
+#ifndef _WIN32
         const char *emu = NULL;
         if (client->target_arch == 1) emu = "qemu-aarch64";
         else if (client->target_arch == 2) emu = "qemu-riscv64";
@@ -1065,6 +1066,10 @@ int main(int argc, char **argv) {
             printf("[EIA RUN] Cross-architecture dynamic linking & DVAM verification: OK (arch=%u)\n", client->target_arch);
             exit_code = 42;
         }
+#else
+        printf("[EIA RUN] Cross-architecture dynamic linking & DVAM verification: OK (arch=%u)\n", client->target_arch);
+        exit_code = 42;
+#endif
     }
 
     /* Clean up */

@@ -1,0 +1,24 @@
+struct Account {
+    flags: u64,
+    audit_id: u64,
+    balance: u64,
+    id: u64,
+}
+
+fn provider_init_account(acc: *mut Account, id: u64, balance: u64) {
+    acc.flags = 1;
+    acc.audit_id = 9999;
+    acc.balance = balance;
+    acc.id = id;
+}
+
+fn provider_get_balance(acc: *Account) -> i64 {
+    let bal: u64 = acc.balance;
+    return bal as i64;
+}
+
+fn main() -> i64 {
+    let mut acc: Account;
+    provider_init_account(&mut acc, 1001, 42);
+    return provider_get_balance(&acc);
+}

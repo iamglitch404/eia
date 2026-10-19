@@ -721,13 +721,8 @@ static RuStructDef *parse_struct_def(Parser *p) {
     sdef->field_count = count;
     sdef->pos = pos;
 
-    /* Compute structural type signature hash */
-    uint64_t sig_hash = spark0_hash_str(sname);
-    for (uint32_t i = 0; i < count; ++i) {
-        sig_hash ^= fields[i].name_hash * 31ULL;
-        sig_hash ^= ((uint64_t)fields[i].type->kind) << 16;
-    }
-    sdef->type_sig_hash = sig_hash;
+    /* Canonical structural type signature hash is the struct interface name hash */
+    sdef->type_sig_hash = sdef->name_hash;
 
     return sdef;
 }

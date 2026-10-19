@@ -1,0 +1,17 @@
+struct Account {
+    id: u64,
+    balance: u64,
+}
+
+fn client_get_balance(acc: *Account) -> i64 {
+    let bal: u64 = acc.balance;
+    return bal as i64;
+}
+
+fn main() -> i64 {
+    let mut acc: Account;
+    let p: *mut Account = &mut acc;
+    p.id = 1001;
+    p.balance = 42;
+    return client_get_balance(p);
+}

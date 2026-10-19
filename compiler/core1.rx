@@ -1901,7 +1901,7 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
         file_buf[ph_base + 32] = (total_file_size & 255) as u8;
         file_buf[ph_base + 33] = ((total_file_size >> 8) & 255) as u8;
         file_buf[ph_base + 34] = ((total_file_size >> 16) & 255) as u8;
-        let memsz: u64 = total_file_size + 1048576;
+        let memsz: u64 = total_file_size;
         file_buf[ph_base + 40] = (memsz & 255) as u8;
         file_buf[ph_base + 41] = ((memsz >> 8) & 255) as u8;
         file_buf[ph_base + 42] = ((memsz >> 16) & 255) as u8;
@@ -1964,7 +1964,7 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
         file_buf[ph_base + 32] = (total_file_size & 255) as u8;
         file_buf[ph_base + 33] = ((total_file_size >> 8) & 255) as u8;
         file_buf[ph_base + 34] = ((total_file_size >> 16) & 255) as u8;
-        let memsz: u64 = total_file_size + 1048576;
+        let memsz: u64 = total_file_size;
         file_buf[ph_base + 40] = (memsz & 255) as u8;
         file_buf[ph_base + 41] = ((memsz >> 8) & 255) as u8;
         file_buf[ph_base + 42] = ((memsz >> 16) & 255) as u8;

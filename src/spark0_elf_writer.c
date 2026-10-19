@@ -230,7 +230,7 @@ int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp
         phdr->p_vaddr = 0x400000;
         phdr->p_paddr = 0x400000;
         phdr->p_filesz = total_file_size;
-        phdr->p_memsz = total_file_size + 0x100000;
+        phdr->p_memsz = total_file_size;
         phdr->p_align = 0x1000;
 
         /* 4. Offset 0x140 (320): PE/COFF Headers */
@@ -306,7 +306,7 @@ int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp
         phdr->p_vaddr = 0x400000;
         phdr->p_paddr = 0x400000;
         phdr->p_filesz = total_file_size;
-        phdr->p_memsz = total_file_size + 0x100000; /* Generous memory segment */
+        phdr->p_memsz = total_file_size;
         phdr->p_align = 0x1000;
     }
 

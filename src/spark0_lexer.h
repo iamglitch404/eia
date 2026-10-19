@@ -4,7 +4,7 @@
 #include "../include/spark0.h"
 
 typedef struct {
-    TokenType type;
+    RuTokenType type;
     SourcePos pos;
     char     *text;
     uint64_t  int_val;

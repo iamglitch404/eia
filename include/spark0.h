@@ -277,7 +277,11 @@ typedef enum {
     TOKEN_RBRACE,
     TOKEN_LBRACKET,
     TOKEN_RBRACKET
-} TokenType;
+} RuTokenType;
+
+#ifndef _WIN32
+typedef RuTokenType TokenType;
+#endif
 
 typedef struct {
     uint32_t line;

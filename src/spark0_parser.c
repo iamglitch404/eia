@@ -47,11 +47,11 @@ static void parser_advance(Parser *p) {
     p->cur = lexer_next(&p->lexer);
 }
 
-static bool check(Parser *p, TokenType type) {
+static bool check(Parser *p, RuTokenType type) {
     return p->cur.type == type;
 }
 
-static bool match(Parser *p, TokenType type) {
+static bool match(Parser *p, RuTokenType type) {
     if (check(p, type)) {
         parser_advance(p);
         return true;
@@ -59,7 +59,7 @@ static bool match(Parser *p, TokenType type) {
     return false;
 }
 
-static void expect(Parser *p, TokenType type, const char *msg) {
+static void expect(Parser *p, RuTokenType type, const char *msg) {
     if (!check(p, type)) {
         fprintf(stderr, "%s:%u:%u: Parse error: %s (got '%s')\n",
                 p->lexer.filename, p->cur.pos.line, p->cur.pos.col, msg,

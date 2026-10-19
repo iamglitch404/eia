@@ -31,6 +31,21 @@
 #define EIA_ERR_INTEGRITY_MISMATCH  -12
 #define EIA_ERR_NARROWING_UNSUPPORTED -13
 
+uint64_t spark0_hash64(const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < len; ++i) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+uint64_t spark0_hash_str(const char *str) {
+    if (!str) return 0;
+    return spark0_hash64(str, strlen(str));
+}
+
 /* BLAKE3 implementation for test harness */
 static inline uint32_t rot32(uint32_t x, int n) {
     return (x >> n) | (x << (32 - n));
@@ -266,6 +281,18 @@ static int validate_instruction_shape(const uint8_t *code, uint32_t insn_offset,
     return EIA_ERR_BAD_INSN;
 }
 
+static int cmp_u32(const void *a, const void *b) {
+    uint32_t ua = *(const uint32_t *)a;
+    uint32_t ub = *(const uint32_t *)b;
+    return (ua > ub) - (ua < ub);
+}
+
+static int cmp_double(const void *a, const void *b) {
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+    return (da > db) - (da < db);
+}
+
 /*
  * EIA Secure Loader:
  * Resolves client holes against provider's type graph and patches into DVAM arena.
@@ -292,35 +319,68 @@ static int eia_load_and_patch(
         }
         int shape_rc = validate_instruction_shape(arena->v_write, hole->insn_offset, hole->patch_kind);
         if (shape_rc != EIA_SUCCESS) return shape_rc;
+    }
 
-        /* Check for overlapping relocations */
-        for (size_t j = i + 1; j < client_reloc_count; ++j) {
-            int64_t diff = (int64_t)hole->insn_offset - (int64_t)client_relocs[j].insn_offset;
-            if (diff >= -3 && diff <= 3) {
+    if (client_reloc_count <= 64) {
+        for (size_t i = 0; i < client_reloc_count; ++i) {
+            for (size_t j = i + 1; j < client_reloc_count; ++j) {
+                int64_t diff = (int64_t)client_relocs[i].insn_offset - (int64_t)client_relocs[j].insn_offset;
+                if (diff >= -3 && diff <= 3) return EIA_ERR_RELOC_OVERLAP;
+            }
+        }
+    } else {
+        uint32_t *sorted_offs = (uint32_t *)malloc(client_reloc_count * sizeof(uint32_t));
+        for (size_t i = 0; i < client_reloc_count; ++i) sorted_offs[i] = client_relocs[i].insn_offset;
+        qsort(sorted_offs, client_reloc_count, sizeof(uint32_t), cmp_u32);
+        for (size_t i = 1; i < client_reloc_count; ++i) {
+            if (sorted_offs[i] - sorted_offs[i-1] < 4) {
+                free(sorted_offs);
                 return EIA_ERR_RELOC_OVERLAP;
             }
         }
+        free(sorted_offs);
     }
 
-    /* 3. Patch each relocation hole using PROVIDER'S type graph */
+    /* 3. Patch each relocation hole using PROVIDER'S type graph indexed by (type_hash, field_hash) */
+    #define TG_MAP_CAP 512
+    typedef struct {
+        uint64_t type_hash;
+        uint64_t field_hash;
+        uint32_t byte_offset;
+        uint32_t field_size;
+        bool occupied;
+    } TgMapEntry;
+    TgMapEntry tg_map[TG_MAP_CAP];
+    memset(tg_map, 0, sizeof(tg_map));
+
+    for (size_t p = 0; p < provider_tg_count; ++p) {
+        size_t idx = (provider_tg[p].type_sig_hash ^ (provider_tg[p].field_hash * 0x100000001b3ULL)) & (TG_MAP_CAP - 1);
+        while (tg_map[idx].occupied) idx = (idx + 1) & (TG_MAP_CAP - 1);
+        tg_map[idx].type_hash = provider_tg[p].type_sig_hash;
+        tg_map[idx].field_hash = provider_tg[p].field_hash;
+        tg_map[idx].byte_offset = provider_tg[p].byte_offset;
+        tg_map[idx].field_size = provider_tg[p].field_size;
+        tg_map[idx].occupied = true;
+    }
+
     for (size_t i = 0; i < client_reloc_count; ++i) {
         const EiaRelocHole *hole = &client_relocs[i];
         bool found = false;
         uint32_t resolved_offset = 0;
 
-        for (size_t p = 0; p < provider_tg_count; ++p) {
-            const EiaTypeGraphEntry *entry = &provider_tg[p];
-            if (entry->type_sig_hash == hole->type_sig_hash &&
-                entry->field_hash == hole->field_or_sym_hash) {
-                
-                /* Schema compatibility check: field width */
-                if (expected_field_size != 0 && entry->field_size != expected_field_size) {
-                    if (entry->field_size < expected_field_size) {
+        size_t idx = (hole->type_sig_hash ^ (hole->field_or_sym_hash * 0x100000001b3ULL)) & (TG_MAP_CAP - 1);
+        for (size_t step = 0; step < TG_MAP_CAP; ++step) {
+            size_t probe = (idx + step) & (TG_MAP_CAP - 1);
+            if (!tg_map[probe].occupied) break;
+            if (tg_map[probe].type_hash == hole->type_sig_hash &&
+                tg_map[probe].field_hash == hole->field_or_sym_hash) {
+                if (expected_field_size != 0 && tg_map[probe].field_size != expected_field_size) {
+                    if (tg_map[probe].field_size < expected_field_size) {
                         return EIA_ERR_NARROWING_UNSUPPORTED;
                     }
                     return EIA_ERR_WIDTH_MISMATCH;
                 }
-                resolved_offset = entry->byte_offset;
+                resolved_offset = tg_map[probe].byte_offset;
                 found = true;
                 break;
             }
@@ -414,20 +474,28 @@ int main(void) {
     printf("  DVAM arena created: v_write=%p (RW-), v_exec=%p (R-X)\n", arena.v_write, arena.v_exec);
 
     /*
-     * Call client_get_balance function:
-     * In client_v1: client_get_balance is the first function (Contract 0)
+     * Dynamically lookup client_get_balance function symbol contract:
      */
     const SymbolContract *client_contracts = (const SymbolContract *)(client_bin + client_holo->contracts_offset);
-    uint32_t client_fn_offset = (uint32_t)(client_contracts[0].vaddr - 0x410000);
+    uint64_t get_bal_hash = spark0_hash_str("client_get_balance");
+    const SymbolContract *target_contract = NULL;
+    for (size_t c = 0; c < client_holo->contracts_count; ++c) {
+        if (client_contracts[c].symbol_hash == get_bal_hash) {
+            target_contract = &client_contracts[c];
+            break;
+        }
+    }
+    assert(target_contract != NULL && "client_get_balance symbol contract not found");
+    uint32_t client_fn_offset = (uint32_t)(target_contract->vaddr - 0x410000);
     printf("  Target function: client_get_balance (offset=0x%x, size=%lu)\n",
-           client_fn_offset, (unsigned long)client_contracts[0].code_size);
+           client_fn_offset, (unsigned long)target_contract->code_size);
 
     /* Filter relocations for this function */
     EiaRelocHole fn_relocs[8];
     size_t fn_reloc_cnt = 0;
     for (size_t i = 0; i < client_reloc_cnt; ++i) {
         if (client_relocs[i].insn_offset >= client_fn_offset &&
-            client_relocs[i].insn_offset < client_fn_offset + client_contracts[0].code_size) {
+            client_relocs[i].insn_offset < client_fn_offset + target_contract->code_size) {
             fn_relocs[fn_reloc_cnt++] = client_relocs[i];
         }
     }
@@ -438,7 +506,7 @@ int main(void) {
     int patch_rc = eia_load_and_patch(
         &arena,
         client_text,
-        client_fn_offset + client_contracts[0].code_size,
+        client_fn_offset + target_contract->code_size,
         fn_relocs,
         fn_reloc_cnt,
         provider_tg,
@@ -502,7 +570,7 @@ int main(void) {
         bad_tg[2].field_hash = 0xDEADBEEF; /* Remove 'balance' hash */
 
         int rc = eia_load_and_patch(
-            &neg_arena, client_text, client_fn_offset + client_contracts[0].code_size,
+            &neg_arena, client_text, client_fn_offset + target_contract->code_size,
             fn_relocs, fn_reloc_cnt, bad_tg, 4, 8
         );
         assert(rc == EIA_ERR_FIELD_NOT_FOUND);
@@ -519,7 +587,7 @@ int main(void) {
         bad_tg[2].field_size = 4; /* Provider changed balance to u32 */
 
         int rc = eia_load_and_patch(
-            &neg_arena, client_text, client_fn_offset + client_contracts[0].code_size,
+            &neg_arena, client_text, client_fn_offset + target_contract->code_size,
             fn_relocs, fn_reloc_cnt, bad_tg, 4, 8 /* client expects 8 */
         );
         assert(rc == EIA_ERR_NARROWING_UNSUPPORTED || rc == EIA_ERR_WIDTH_MISMATCH);
@@ -536,7 +604,7 @@ int main(void) {
         bad_tg[2].field_hash = 0x11223344; /* Renamed field without retaining ID */
 
         int rc = eia_load_and_patch(
-            &neg_arena, client_text, client_fn_offset + client_contracts[0].code_size,
+            &neg_arena, client_text, client_fn_offset + target_contract->code_size,
             fn_relocs, fn_reloc_cnt, bad_tg, 4, 8
         );
         assert(rc == EIA_ERR_FIELD_NOT_FOUND);
@@ -546,7 +614,7 @@ int main(void) {
 
     /* Matrix 5: Hologram BLAKE3 Root Tamper -> Must reject */
     {
-        uint8_t tampered_buf[256];
+        uint8_t tampered_buf[4096];
         memcpy(tampered_buf, client_bin + client_holo->contracts_offset, c_tables_len);
         tampered_buf[10] ^= 0xFF; /* Flip bits in contract */
         uint64_t hash = blake3_hash64(tampered_buf, c_tables_len);
@@ -562,7 +630,7 @@ int main(void) {
         oob_reloc.insn_offset = 0xFFFF0000; /* Way out of section bounds */
 
         int rc = eia_load_and_patch(
-            &neg_arena, client_text, client_fn_offset + client_contracts[0].code_size,
+            &neg_arena, client_text, client_fn_offset + target_contract->code_size,
             &oob_reloc, 1, provider_tg, provider_tg_cnt, 8
         );
         assert(rc == EIA_ERR_BOUNDS_OVERFLOW);
@@ -724,25 +792,48 @@ int main(void) {
                 holes[i].field_or_sym_hash = provider_tg[2].field_hash;
             }
 
-            struct timespec t0, t1;
-            DvamArena bench_arena;
-            dvam_create_arena(&bench_arena, (fake_code_sz + 0xFFF) & ~0xFFFULL);
+            int iters = 50;
+            double times[50];
+            for (int it = 0; it < iters; ++it) {
+                DvamArena bench_arena;
+                dvam_create_arena(&bench_arena, (fake_code_sz + 0xFFF) & ~0xFFFULL);
+                struct timespec t0, t1;
+                clock_gettime(CLOCK_MONOTONIC, &t0);
+                int rc = eia_load_and_patch(
+                    &bench_arena, fake_code, fake_code_sz,
+                    holes, count, provider_tg, provider_tg_cnt, 8
+                );
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                assert(rc == EIA_SUCCESS);
+                times[it] = (t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec);
+                dvam_free_arena(&bench_arena);
+            }
+            qsort(times, iters, sizeof(double), cmp_double);
+            double median_ns = times[iters / 2];
+            double p95_ns = times[(int)(iters * 0.95)];
+            printf("  Patch time for %4d holes: median = %6.2f µs (p95 = %6.2f µs, %5.2f ns/hole)\n",
+                   count, median_ns / 1000.0, p95_ns / 1000.0, median_ns / (double)count);
 
-            clock_gettime(CLOCK_MONOTONIC, &t0);
-            int rc = eia_load_and_patch(
-                &bench_arena, fake_code, fake_code_sz,
-                holes, count, provider_tg, provider_tg_cnt, 8
-            );
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-
-            assert(rc == EIA_SUCCESS);
-            double ns = (t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec);
-            printf("  Patch time for %4d holes: %8.2f µs (%6.2f ns/hole)\n",
-                   count, ns / 1000.0, ns / (double)count);
-
-            dvam_free_arena(&bench_arena);
             free(fake_code);
             free(holes);
+        }
+
+        /* Static baseline comparison: plain memcpy + mprotect for equivalent code size */
+        {
+            size_t base_sz = (2000 + 2) * 16;
+            uint8_t *src = (uint8_t *)malloc(base_sz);
+            memset(src, 0x90, base_sz);
+            DvamArena static_arena;
+            dvam_create_arena(&static_arena, (base_sz + 0xFFF) & ~0xFFFULL);
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            memcpy(static_arena.v_write, src, base_sz);
+            dvam_lock_writer(&static_arena);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double base_ns = (t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec);
+            printf("  Static baseline (memcpy + lock): %6.2f µs\n", base_ns / 1000.0);
+            dvam_free_arena(&static_arena);
+            free(src);
         }
 
         /* Steady-state overhead verification */

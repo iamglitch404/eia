@@ -987,7 +987,7 @@ fn emit_start_stub(cg: *mut CodeGen) {
     cg_emit8(cg, 15); cg_emit8(cg, 162); // cpuid
     cg_emit8(cg, 15); cg_emit8(cg, 174); cg_emit8(cg, 240); // mfence
 
-    // 3b. Strict W^X: sys_mprotect(0x400000, 0x200000, 5) (PROT_READ | PROT_EXEC)
+    // 3b. Strict W^X: sys_mprotect(0x400000, 0x200000, 5) (PROT_READ | PROT_EXEC - strictly non-writable)
     cg_emit8(cg, 184); cg_emit32(cg, 10);        // mov eax, 10
     cg_emit8(cg, 191); cg_emit32(cg, 4194304);   // mov edi, 0x400000
     cg_emit8(cg, 190); cg_emit32(cg, 2097152);   // mov esi, 0x200000 (2MB)
@@ -1901,7 +1901,10 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
         file_buf[ph_base + 32] = (total_file_size & 255) as u8;
         file_buf[ph_base + 33] = ((total_file_size >> 8) & 255) as u8;
         file_buf[ph_base + 34] = ((total_file_size >> 16) & 255) as u8;
-        let memsz: u64 = total_file_size;
+        let mut memsz: u64 = total_file_size;
+        if cg.target_arch == 0 {
+            memsz = total_file_size + 1048576;
+        }
         file_buf[ph_base + 40] = (memsz & 255) as u8;
         file_buf[ph_base + 41] = ((memsz >> 8) & 255) as u8;
         file_buf[ph_base + 42] = ((memsz >> 16) & 255) as u8;
@@ -1964,7 +1967,10 @@ fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
         file_buf[ph_base + 32] = (total_file_size & 255) as u8;
         file_buf[ph_base + 33] = ((total_file_size >> 8) & 255) as u8;
         file_buf[ph_base + 34] = ((total_file_size >> 16) & 255) as u8;
-        let memsz: u64 = total_file_size;
+        let mut memsz: u64 = total_file_size;
+        if cg.target_arch == 0 {
+            memsz = total_file_size + 1048576;
+        }
         file_buf[ph_base + 40] = (memsz & 255) as u8;
         file_buf[ph_base + 41] = ((memsz >> 8) & 255) as u8;
         file_buf[ph_base + 42] = ((memsz >> 16) & 255) as u8;

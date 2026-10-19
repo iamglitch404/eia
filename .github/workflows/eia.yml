@@ -165,7 +165,38 @@ jobs:
         run: |
           ./bin/spark0 tests/client_v1.rx -o bin/client_v1
           ./bin/spark0 tests/provider_v2.rx -o bin/provider_v2
-          gcc -O2 -Wall -Wextra -Iinclude -o bin/test_eia_interop tests/test_eia_interop.c
+
+          # Build and test production eia-run dynamic loader
+          gcc -O2 -Wall -Wextra -Iinclude -o bin/eia-run src/eia_loader.c
+          run_code=0
+          ./bin/eia-run bin/client_v1 bin/provider_v2 || run_code=$?
+          if [ "$run_code" -ne 42 ]; then
+            echo "Expected eia-run exit code 42, got $run_code"
+            exit 1
+          fi
+          echo "Production eia-run client v1 -> provider v2 linking: PASSED (exit code 42)"
+
+          # Verify fail-closed behavior on missing provider
+          neg_code=0
+          ./bin/eia-run bin/client_v1 >/dev/null 2>&1 || neg_code=$?
+          if [ "$neg_code" -ne 1 ]; then
+            echo "Expected eia-run missing symbol exit code 1, got $neg_code"
+            exit 1
+          fi
+          echo "Production eia-run fail-closed missing symbol rejection: PASSED (exit code 1)"
+
+          # Official BLAKE3-64 Standard Reference Vector Suite (ASan + UBSan)
+          gcc -O2 -Wall -Wextra -fsanitize=address,undefined -o bin/test_blake3_vectors tests/test_blake3_vectors.c
+          ./bin/test_blake3_vectors
+          echo "Official BLAKE3-64 Reference Vectors: 100% PASSED"
+
+          # Fuzzing and malformed binary rejection suite (ASan + UBSan)
+          gcc -O2 -Wall -Wextra -fsanitize=address,undefined -Iinclude -o bin/test_eia_fuzz tests/test_eia_fuzz.c
+          ./bin/test_eia_fuzz
+          echo "EIA Parser & Fuzz Robustness: 100% PASSED"
+
+          # Full Schema Evolution & Secure DVAM Matrix Suite (ASan + UBSan)
+          gcc -O2 -Wall -Wextra -fsanitize=address,undefined -Iinclude -o bin/test_eia_interop tests/test_eia_interop.c
           ./bin/test_eia_interop
           echo "EIA Independent Interoperability & Schema Evolution Matrix: 100% PASSED"
 

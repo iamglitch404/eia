@@ -321,7 +321,7 @@ static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
     emit8(u, 0x0f); emit8(u, 0xa2); /* cpuid */
     emit8(u, 0x0f); emit8(u, 0xae); emit8(u, 0xf0); /* mfence */
 
-    /* 3b. Strict W^X: sys_mprotect(0x400000, 0x100000, 5) (PROT_READ | PROT_EXEC) */
+    /* 3b. Strict W^X: sys_mprotect(0x400000, 0x100000, 5) (PROT_READ | PROT_EXEC - strictly non-writable) */
     emit8(u, 0xb8); emit32_le(u, 10);        /* mov eax, 10 */
     emit8(u, 0xbf); emit32_le(u, 0x400000);    /* mov edi, 0x400000 */
     emit8(u, 0xbe); emit32_le(u, 0x100000);    /* mov esi, 0x100000 (1MB) */
@@ -1014,7 +1014,22 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
     /* Compile all functions */
     for (uint32_t f_idx = 0; f_idx < module->function_count; ++f_idx) {
         RuFnDef *fn = module->functions[f_idx];
-        if (fn->is_extern) continue;
+        if (fn->is_extern) {
+            if (u->contract_count >= u->contract_cap) {
+                u->contract_cap = u->contract_cap ? u->contract_cap * 2 : 16;
+                u->contracts = (SymbolContract *)realloc(u->contracts, u->contract_cap * sizeof(SymbolContract));
+            }
+            SymbolContract *sc = &u->contracts[u->contract_count++];
+            sc->symbol_hash = fn->symbol_hash;
+            sc->type_sig_hash = fn->symbol_hash;
+            sc->vaddr = 0;
+            sc->code_size = 0;
+            sc->flags = EIA_SYM_FLAG_IMPORT;
+            sc->param_count = (uint16_t)fn->param_count;
+            sc->calling_conv = 0;
+            sc->contract_digest = fn->symbol_hash ^ 0xFEEDFACECAFEBABEULL;
+            continue;
+        }
 
         /* Align function start to 16 bytes */
         while (u->text_size % 16 != 0) {
@@ -1110,12 +1125,28 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
                 break;
             }
         }
-        if (!found) {
-            fprintf(stderr, "Codegen error: undefined function '%s'\n", all_fixups[i].callee_name);
-            exit(1);
+        if (found) {
+            int32_t disp = (int32_t)(target_offset - (all_fixups[i].hole_offset + 4));
+            patch32(u, all_fixups[i].hole_offset, (uint32_t)disp);
+        } else {
+            bool is_ext = false;
+            uint64_t sym_h = spark0_hash_str(all_fixups[i].callee_name);
+            for (uint32_t f_idx = 0; f_idx < module->function_count; ++f_idx) {
+                if (module->functions[f_idx]->is_extern &&
+                    strcmp(module->functions[f_idx]->name, all_fixups[i].callee_name) == 0) {
+                    is_ext = true;
+                    sym_h = module->functions[f_idx]->symbol_hash;
+                    break;
+                }
+            }
+            if (is_ext) {
+                /* Register EIA_PATCH_SYM_REL32 relocation hole */
+                add_reloc_hole(u, all_fixups[i].hole_offset, EIA_PATCH_SYM_REL32, sym_h, sym_h);
+            } else {
+                fprintf(stderr, "Codegen error: undefined function '%s'\n", all_fixups[i].callee_name);
+                exit(1);
+            }
         }
-        int32_t disp = (int32_t)(target_offset - (all_fixups[i].hole_offset + 4));
-        patch32(u, all_fixups[i].hole_offset, (uint32_t)disp);
         free(all_fixups[i].callee_name);
     }
     if (all_fixups) free(all_fixups);

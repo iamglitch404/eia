@@ -442,6 +442,7 @@ struct RuStmt {
 typedef struct RuFnDef {
     const char  *name;
     uint64_t     symbol_hash;
+    uint64_t     type_sig_hash; /* BLAKE3-64 canonical structural function signature */
     RuParam     *params;
     uint32_t     param_count;
     RuType      *return_type;
@@ -593,6 +594,9 @@ typedef struct {
 
 uint64_t spark0_hash64(const void *data, size_t len);
 uint64_t spark0_hash_str(const char *str);
+
+void     spark0_format_type_sig(const RuType *t, char *buf, size_t cap);
+uint64_t spark0_compute_fn_sig_hash(const RuFnDef *fn);
 
 RuModule *spark0_parse(const char *source_text, const char *filename);
 int spark0_compile_to_elf(RuModule *module, const char *output_path, int is_upbp, int target_arch);

@@ -393,6 +393,42 @@ int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp
     /* 7. .text Section (starts at file offset 0x1000, mapped to 0x401000) */
     if (unit->text_size > 0 && unit->text_buf) {
         memcpy(file_buf + text_offset, unit->text_buf, unit->text_size);
+
+        /* Pre-resolve internal field holes so standalone binaries execute cleanly out-of-the-box */
+        for (uint32_t r = 0; r < unit->reloc_count; ++r) {
+            const EiaRelocHole *h = &unit->relocs[r];
+            if (h->patch_kind == EIA_PATCH_FIELD_DISP32 && h->insn_offset + 4 <= unit->text_size) {
+                for (uint32_t t = 0; t < unit->type_graph_count; ++t) {
+                    if (unit->type_graph[t].type_sig_hash == h->type_sig_hash &&
+                        unit->type_graph[t].field_hash == h->field_or_sym_hash) {
+                        uint32_t disp = unit->type_graph[t].byte_offset;
+                        uint8_t *p = file_buf + text_offset + h->insn_offset;
+                        if (target_arch == 1) {
+                            /* ARM64: movz x16 and movk x16 */
+                            uint32_t movz = 0xd2800010 | ((disp & 0xffff) << 5);
+                            uint32_t movk = 0xf2a00010 | (((disp >> 16) & 0xffff) << 5);
+                            memcpy(p, &movz, 4);
+                            memcpy(p + 4, &movk, 4);
+                        } else if (target_arch == 2) {
+                            /* RISC-V 64: lui t0 and addi t0 */
+                            uint32_t hi = (disp + 0x800) >> 12;
+                            uint32_t lo = disp & 0xFFF;
+                            uint32_t lui = 0x000002b7 | (hi << 12);
+                            uint32_t addi = 0x00028293 | (lo << 20);
+                            memcpy(p, &lui, 4);
+                            memcpy(p + 4, &addi, 4);
+                        } else {
+                            /* x86-64: 32-bit LE displacement */
+                            p[0] = (uint8_t)(disp & 0xFF);
+                            p[1] = (uint8_t)((disp >> 8) & 0xFF);
+                            p[2] = (uint8_t)((disp >> 16) & 0xFF);
+                            p[3] = (uint8_t)((disp >> 24) & 0xFF);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /* 8. .rodata Section (starts at file offset 0x3000, mapped to 0x403000) */

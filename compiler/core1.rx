@@ -1916,11 +1916,11 @@ fn blake3_hash64(buf: *u8, len: u64) -> u64 {
     }
 
     let num_chunks: u64 = (len + 1023) / 1024;
-    let mut cv_list_buf: [u8; 2048]; // up to 64 chunks * 32 bytes
-    let cv_list: *mut u8 = &mut cv_list_buf[0];
+    let cv_bytes: u64 = ((num_chunks * 32) + 4095) & ~4095;
+    let cv_list: *mut u8 = syscall(9, 0, cv_bytes, 3, 34, -1, 0) as *mut u8;
 
     let mut c: u64 = 0;
-    while c < num_chunks && c < 64 {
+    while c < num_chunks {
         let c_off: u64 = c * 1024;
         let mut c_len: u64 = 1024;
         if (len - c_off) < 1024 {
@@ -1931,7 +1931,6 @@ fn blake3_hash64(buf: *u8, len: u64) -> u64 {
     }
 
     let mut cv_count: u64 = num_chunks;
-    if cv_count > 64 { cv_count = 64; }
 
     while cv_count > 1 {
         let mut next_count: u64 = 0;
@@ -1964,6 +1963,7 @@ fn blake3_hash64(buf: *u8, len: u64) -> u64 {
 
     let low: u64 = (get_u32(cv_list, 0) as u64) & 4294967295;
     let high: u64 = (get_u32(cv_list, 1) as u64) & 4294967295;
+    syscall(11, cv_list, cv_bytes); // SYS_munmap
     return low | (high << 32);
 }
 

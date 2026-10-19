@@ -104,7 +104,17 @@ jobs:
             exit 1
           fi
           echo "Production eia-run fail-closed missing symbol verification PASSED on ${{ matrix.os }} (exit code 1)"
-          if [ "${{ matrix.os }}" = "ubuntu-latest" ] || [ "${{ matrix.os }}" = "windows-latest" ]; then
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+            ./bin/spark0 tests/client_v1.rx -o bin/client_v1_arm64 --target=arm64
+            ./bin/spark0 tests/provider_v2.rx -o bin/provider_v2_arm64 --target=arm64
+            mac_code=0
+            ./bin/eia-run bin/client_v1_arm64 bin/provider_v2_arm64 || mac_code=$?
+            if [ "$mac_code" -ne 42 ]; then
+              echo "Expected eia-run exit code 42 on macOS Apple Silicon, got $mac_code"
+              exit 1
+            fi
+            echo "Production eia-run client v1 -> provider v2 linking PASSED natively on macOS Apple Silicon (exit code 42)"
+          else
             run_code=0
             ./bin/eia-run bin/client_v1 bin/provider_v2 || run_code=$?
             if [ "$run_code" -ne 42 ]; then

@@ -993,7 +993,7 @@ static void compile_stmt(FnCompiler *fc, RuStmt *s) {
 /*                   Struct Field Offset Resolution Helper                   */
 /* ------------------------------------------------------------------------- */
 
-static uint32_t get_struct_field_offset(FnCompiler *fc, const RuExpr *e) {
+static uint32_t __attribute__((unused)) get_struct_field_offset(FnCompiler *fc, const RuExpr *e) {
     if (e->kind != EXPR_FIELD_ACCESS) return 0;
     RuExpr *base = e->as.field_access.base;
     RuStructDef *sdef = NULL;
@@ -1070,10 +1070,30 @@ static void compile_lvalue_addr_arm64(FnCompiler *fc, RuExpr *e) {
     }
 
     if (e->kind == EXPR_FIELD_ACCESS) {
-        compile_expr_arm64(fc, e->as.field_access.base); /* base in x0 */
-        uint32_t off = get_struct_field_offset(fc, e);
-        arm64_emit_mov_imm64(fc->u, 16, off);
+        RuExpr *base = e->as.field_access.base;
+        RuStructDef *sdef = NULL;
+        RuType *base_t = get_expr_type(fc, base);
+        if (base_t) {
+            if (base_t->kind == TYPE_STRUCT) {
+                sdef = find_struct(fc->module, base_t->as.structure.name);
+            } else if ((base_t->kind == TYPE_PTR_CONST || base_t->kind == TYPE_PTR_MUT) &&
+                       base_t->as.ptr.pointee &&
+                       base_t->as.ptr.pointee->kind == TYPE_STRUCT) {
+                sdef = find_struct(fc->module, base_t->as.ptr.pointee->as.structure.name);
+            }
+        }
+        if (!sdef && fc->module->struct_count > 0) sdef = fc->module->structs[0];
+
+        compile_expr_arm64(fc, base); /* base in x0 */
+        /* Emit 32-bit zero displacement hole in ARM64: movz x16, #0; movk x16, #0, lsl #16 */
+        uint32_t hole_offset = fc->u->text_size;
+        emit32_le(fc->u, 0xd2800010); /* movz x16, #0 */
+        emit32_le(fc->u, 0xf2a00010); /* movk x16, #0, lsl #16 */
         emit32_le(fc->u, 0x8b100001); /* add x1, x0, x16 */
+
+        uint64_t type_hash = sdef ? sdef->type_sig_hash : 0;
+        uint64_t field_hash = e->as.field_access.field_hash;
+        add_reloc_hole(fc->u, hole_offset, EIA_PATCH_FIELD_DISP32, type_hash, field_hash);
         return;
     }
 
@@ -1472,10 +1492,30 @@ static void compile_lvalue_addr_riscv(FnCompiler *fc, RuExpr *e) {
     }
 
     if (e->kind == EXPR_FIELD_ACCESS) {
-        compile_expr_riscv(fc, e->as.field_access.base); /* base in a0 */
-        uint32_t off = get_struct_field_offset(fc, e);
-        riscv_emit_mov_imm(fc->u, 5 /*t0*/, off);
+        RuExpr *base = e->as.field_access.base;
+        RuStructDef *sdef = NULL;
+        RuType *base_t = get_expr_type(fc, base);
+        if (base_t) {
+            if (base_t->kind == TYPE_STRUCT) {
+                sdef = find_struct(fc->module, base_t->as.structure.name);
+            } else if ((base_t->kind == TYPE_PTR_CONST || base_t->kind == TYPE_PTR_MUT) &&
+                       base_t->as.ptr.pointee &&
+                       base_t->as.ptr.pointee->kind == TYPE_STRUCT) {
+                sdef = find_struct(fc->module, base_t->as.ptr.pointee->as.structure.name);
+            }
+        }
+        if (!sdef && fc->module->struct_count > 0) sdef = fc->module->structs[0];
+
+        compile_expr_riscv(fc, base); /* base in a0 */
+        /* Emit 32-bit zero displacement hole in RISC-V: lui t0, 0; addi t0, t0, 0 */
+        uint32_t hole_offset = fc->u->text_size;
+        emit32_le(fc->u, 0x000002b7); /* lui t0, 0 */
+        emit32_le(fc->u, 0x00028293); /* addi t0, t0, 0 */
         emit32_le(fc->u, 0x005505b3); /* add a1, a0, t0 */
+
+        uint64_t type_hash = sdef ? sdef->type_sig_hash : 0;
+        uint64_t field_hash = e->as.field_access.field_hash;
+        add_reloc_hole(fc->u, hole_offset, EIA_PATCH_FIELD_DISP32, type_hash, field_hash);
         return;
     }
 
@@ -1885,7 +1925,7 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
             }
             SymbolContract *sc = &u->contracts[u->contract_count++];
             sc->symbol_hash = fn->symbol_hash;
-            sc->type_sig_hash = fn->symbol_hash;
+            sc->type_sig_hash = fn->type_sig_hash ? fn->type_sig_hash : spark0_compute_fn_sig_hash(fn);
             sc->vaddr = 0;
             sc->code_size = 0;
             sc->flags = EIA_SYM_FLAG_IMPORT;
@@ -2027,7 +2067,7 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
         }
         SymbolContract *sc = &u->contracts[u->contract_count++];
         sc->symbol_hash = fn->symbol_hash;
-        sc->type_sig_hash = fn->symbol_hash;
+        sc->type_sig_hash = fn->type_sig_hash ? fn->type_sig_hash : spark0_compute_fn_sig_hash(fn);
         sc->vaddr = 0x410000 + fn_start_offset;
         sc->code_size = fn_size;
         sc->flags = EIA_SYM_FLAG_EXPORT;

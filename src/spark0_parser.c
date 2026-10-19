@@ -727,6 +727,62 @@ static RuStructDef *parse_struct_def(Parser *p) {
     return sdef;
 }
 
+void spark0_format_type_sig(const RuType *t, char *buf, size_t cap) {
+    if (!t) {
+        snprintf(buf, cap, "void");
+        return;
+    }
+    switch (t->kind) {
+        case TYPE_VOID: snprintf(buf, cap, "void"); break;
+        case TYPE_I64:  snprintf(buf, cap, "i64"); break;
+        case TYPE_U64:  snprintf(buf, cap, "u64"); break;
+        case TYPE_I32:  snprintf(buf, cap, "i32"); break;
+        case TYPE_U32:  snprintf(buf, cap, "u32"); break;
+        case TYPE_U8:   snprintf(buf, cap, "u8"); break;
+        case TYPE_PTR_CONST: {
+            char sub[256];
+            spark0_format_type_sig(t->as.ptr.pointee, sub, sizeof(sub));
+            snprintf(buf, cap, "*const(%s)", sub);
+            break;
+        }
+        case TYPE_PTR_MUT: {
+            char sub[256];
+            spark0_format_type_sig(t->as.ptr.pointee, sub, sizeof(sub));
+            snprintf(buf, cap, "*mut(%s)", sub);
+            break;
+        }
+        case TYPE_ARRAY: {
+            char sub[256];
+            spark0_format_type_sig(t->as.array.elem_type, sub, sizeof(sub));
+            snprintf(buf, cap, "[%s;%llu]", sub, (unsigned long long)t->as.array.count);
+            break;
+        }
+        case TYPE_STRUCT:
+            snprintf(buf, cap, "struct(%s)", t->as.structure.name ? t->as.structure.name : "anon");
+            break;
+        default:
+            snprintf(buf, cap, "unknown");
+            break;
+    }
+}
+
+uint64_t spark0_compute_fn_sig_hash(const RuFnDef *fn) {
+    if (!fn) return 0;
+    char sig_buf[1024];
+    size_t off = 0;
+    off += snprintf(sig_buf + off, sizeof(sig_buf) - off, "fn(");
+    for (uint32_t i = 0; i < fn->param_count; ++i) {
+        char param_type_buf[256];
+        spark0_format_type_sig(fn->params[i].type, param_type_buf, sizeof(param_type_buf));
+        off += snprintf(sig_buf + off, sizeof(sig_buf) - off, "%s%s", (i > 0 ? "," : ""), param_type_buf);
+        if (off >= sizeof(sig_buf) - 64) break;
+    }
+    char ret_buf[256];
+    spark0_format_type_sig(fn->return_type, ret_buf, sizeof(ret_buf));
+    snprintf(sig_buf + off, sizeof(sig_buf) - off, ")->%s#abi=0", ret_buf);
+    return spark0_hash_str(sig_buf);
+}
+
 static RuFnDef *parse_fn_def(Parser *p, bool is_extern) {
     SourcePos pos = p->cur.pos;
     expect(p, TOKEN_FN, "expected 'fn'");
@@ -794,6 +850,7 @@ static RuFnDef *parse_fn_def(Parser *p, bool is_extern) {
     fndef->stmt_count = stmt_cnt;
     fndef->is_extern = is_extern;
     fndef->pos = pos;
+    fndef->type_sig_hash = spark0_compute_fn_sig_hash(fndef);
 
     return fndef;
 }

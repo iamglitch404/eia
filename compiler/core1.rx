@@ -1619,7 +1619,7 @@ fn compile_fn(cg: *mut CodeGen, fnode: *mut AstNode) {
     sc.code_size = fn_code_size;
     sc.flags = 1;
     sc.param_conv = p_idx;
-    sc.contract_digest = sig_hash;
+    sc.contract_digest = blake3_hash64(sc as *u8, 40);
     cg.contract_count = cg.contract_count + 1;
 
     // Patch call main hole in _start
@@ -2704,7 +2704,7 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
             sc.code_size = 0;
             sc.flags = 2; // EIA_SYM_FLAG_IMPORT
             sc.param_conv = param_cnt;
-            sc.contract_digest = ext_sig_hash;
+            sc.contract_digest = blake3_hash64(sc as *u8, 40);
             cg.contract_count = cg.contract_count + 1;
         } else {
             lex_next_token(parser.lex, &mut parser.cur_tok);

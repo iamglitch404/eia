@@ -730,19 +730,49 @@ static RuStructDef *parse_struct_def(Parser *p) {
 
 static uint64_t get_canonical_type_hash(const RuType *t, uint32_t *is_ptr_out);
 
+static uint64_t get_canonical_type_hash(const RuType *t, uint32_t *is_ptr_out);
+
 uint64_t spark0_compute_struct_layout_hash(const RuStructDef *sdef) {
     if (!sdef) return 0;
     if (sdef->field_count == 0) return spark0_hash_str("struct{}");
-    size_t cap = sdef->field_count * 24;
-    uint8_t *buf = (uint8_t *)calloc(cap, 1);
+
+    uint32_t total_size = 0;
+    uint32_t max_align = 8;
     for (uint32_t i = 0; i < sdef->field_count; ++i) {
-        uint64_t f_type_hash = get_canonical_type_hash(sdef->fields[i].type, NULL);
-        uint32_t f_size = sdef->fields[i].type ? sdef->fields[i].type->size_bytes : 8;
-        memcpy(buf + i * 24, &f_type_hash, 8);
-        memcpy(buf + i * 24 + 8, &f_size, 4);
-        memcpy(buf + i * 24 + 16, &sdef->fields[i].name_hash, 8);
+        uint32_t sz = sdef->fields[i].type ? sdef->fields[i].type->size_bytes : 8;
+        if (sz == 0) sz = 8;
+        total_size += sz;
     }
-    uint64_t h = blake3_hash64(buf, cap);
+
+    size_t header_len = 16;
+    size_t fields_len = (size_t)sdef->field_count * 24;
+    size_t total_len = header_len + fields_len;
+    uint8_t *buf = (uint8_t *)calloc(total_len, 1);
+
+    /* Header: [field_count: u32] [total_size: u32] [alignment: u32] [flags: u32] */
+    uint32_t fc = sdef->field_count;
+    memcpy(buf + 0, &fc, 4);
+    memcpy(buf + 4, &total_size, 4);
+    memcpy(buf + 8, &max_align, 4);
+    /* buf + 12: flags = 0 */
+
+    uint32_t cur_offset = 0;
+    for (uint32_t i = 0; i < sdef->field_count; ++i) {
+        uint8_t *rec = buf + header_len + (i * 24);
+        uint64_t f_name_h = sdef->fields[i].name_hash;
+        uint64_t f_type_h = get_canonical_type_hash(sdef->fields[i].type, NULL);
+        uint32_t f_sz = sdef->fields[i].type ? sdef->fields[i].type->size_bytes : 8;
+        if (f_sz == 0) f_sz = 8;
+        uint32_t f_off = cur_offset;
+        cur_offset += f_sz;
+
+        memcpy(rec + 0, &f_name_h, 8);
+        memcpy(rec + 8, &f_type_h, 8);
+        memcpy(rec + 16, &f_off, 4);
+        memcpy(rec + 20, &f_sz, 4);
+    }
+
+    uint64_t h = blake3_hash64(buf, total_len);
     free(buf);
     return h;
 }
@@ -752,25 +782,55 @@ static uint64_t get_canonical_type_hash(const RuType *t, uint32_t *is_ptr_out) {
         if (is_ptr_out) *is_ptr_out = 0;
         return 3563412735833858527ULL; /* spark0_hash_str("void") */
     }
-    if (t->kind == TYPE_PTR_MUT) {
-        if (is_ptr_out) *is_ptr_out = 2;
-        return get_canonical_type_hash(t->as.ptr.pointee, NULL);
+
+    /* Nested pointer depth & mutability encoding: if depth <= 1: mut_flag (1 or 2); if depth > 1: (depth << 2) | mut_flag */
+    if (t->kind == TYPE_PTR_MUT || t->kind == TYPE_PTR_CONST) {
+        uint32_t depth = 0;
+        uint32_t mut_flag = (t->kind == TYPE_PTR_MUT) ? 2 : 1;
+        const RuType *cur = t;
+        while (cur && (cur->kind == TYPE_PTR_MUT || cur->kind == TYPE_PTR_CONST)) {
+            depth++;
+            if (cur->kind == TYPE_PTR_MUT) mut_flag = 2;
+            cur = cur->as.ptr.pointee;
+        }
+        if (is_ptr_out) {
+            *is_ptr_out = (depth <= 1) ? mut_flag : ((depth << 2) | (mut_flag & 0x3));
+        }
+        return get_canonical_type_hash(cur, NULL);
     }
-    if (t->kind == TYPE_PTR_CONST) {
-        if (is_ptr_out) *is_ptr_out = 1;
-        return get_canonical_type_hash(t->as.ptr.pointee, NULL);
-    }
+
     if (is_ptr_out) *is_ptr_out = 0;
+
+    /* Fixed-size arrays: [T; N] */
+    if (t->kind == TYPE_ARRAY) {
+        uint64_t elem_hash = get_canonical_type_hash(t->as.array.elem_type, NULL);
+        uint8_t arr_buf[24];
+        memset(arr_buf, 0, sizeof(arr_buf));
+        uint32_t kind = 0x0A; /* TYPE_ARRAY */
+        uint64_t cnt = t->as.array.count;
+        memcpy(arr_buf + 0, &kind, 4);
+        memcpy(arr_buf + 4, &elem_hash, 8);
+        memcpy(arr_buf + 12, &cnt, 8);
+        return blake3_hash64(arr_buf, sizeof(arr_buf));
+    }
+
+    /* Full documented primitive set */
     switch (t->kind) {
-        case TYPE_I64: return 3089943341986682694ULL; /* spark0_hash_str("i64") */
-        case TYPE_U64: return 5563585020063213298ULL; /* spark0_hash_str("u64") */
-        case TYPE_I32: return 3090684413159346501ULL; /* spark0_hash_str("i32") */
-        case TYPE_U32: return 5560783464435099345ULL; /* spark0_hash_str("u32") */
-        case TYPE_U8:  return 631772817358541784ULL;  /* spark0_hash_str("u8") */
+        case TYPE_I64:  return 3089943341986682694ULL;
+        case TYPE_U64:  return 5563585020063213298ULL;
+        case TYPE_I32:  return 3094732814638223685ULL;
+        case TYPE_U32:  return 5560783464435099345ULL;
+        case TYPE_I16:  return 3092775683940386555ULL;
+        case TYPE_U16:  return 5558799945458185151ULL;
+        case TYPE_I8:   return 627981701265227156ULL;
+        case TYPE_U8:   return 631772817358541784ULL;
+        case TYPE_F64:  return 15957463049929925035ULL;
+        case TYPE_F32:  return 15952682373371409732ULL;
+        case TYPE_BOOL: return 14785269867199075517ULL;
         case TYPE_STRUCT:
             return spark0_hash_str(t->as.structure.name ? t->as.structure.name : "anon");
         default:
-            return spark0_hash_str("unknown");
+            return spark0_hash_str(t->as.structure.name ? t->as.structure.name : "unknown");
     }
 }
 
@@ -785,7 +845,13 @@ void spark0_format_type_sig(const RuType *t, char *buf, size_t cap) {
         case TYPE_U64:  snprintf(buf, cap, "u64"); break;
         case TYPE_I32:  snprintf(buf, cap, "i32"); break;
         case TYPE_U32:  snprintf(buf, cap, "u32"); break;
+        case TYPE_I16:  snprintf(buf, cap, "i16"); break;
+        case TYPE_U16:  snprintf(buf, cap, "u16"); break;
+        case TYPE_I8:   snprintf(buf, cap, "i8"); break;
         case TYPE_U8:   snprintf(buf, cap, "u8"); break;
+        case TYPE_F64:  snprintf(buf, cap, "f64"); break;
+        case TYPE_F32:  snprintf(buf, cap, "f32"); break;
+        case TYPE_BOOL: snprintf(buf, cap, "bool"); break;
         case TYPE_PTR_CONST: {
             char sub[256];
             spark0_format_type_sig(t->as.ptr.pointee, sub, sizeof(sub));
@@ -815,10 +881,10 @@ void spark0_format_type_sig(const RuType *t, char *buf, size_t cap) {
 
 uint64_t spark0_compute_fn_sig_hash(const RuFnDef *fn) {
     if (!fn) return 0;
-    uint8_t sig_buf[144];
-    memset(sig_buf, 0, sizeof(sig_buf));
-
     uint32_t param_cnt = fn->param_count;
+    size_t total_len = 16 + ((size_t)param_cnt * 16);
+    uint8_t *sig_buf = (uint8_t *)calloc(total_len > 16 ? total_len : 16, 1);
+
     uint32_t is_ret_ptr = 0;
     uint64_t ret_type_hash = get_canonical_type_hash(fn->return_type, &is_ret_ptr);
 
@@ -828,11 +894,12 @@ uint64_t spark0_compute_fn_sig_hash(const RuFnDef *fn) {
     sig_buf[2] = (uint8_t)((param_cnt >> 16) & 0xFF);
     sig_buf[3] = (uint8_t)((param_cnt >> 24) & 0xFF);
 
-    // Bytes 4..7: calling_conv (0) for canonical structural typing matching core1.rx
-    sig_buf[4] = 0;
-    sig_buf[5] = 0;
-    sig_buf[6] = 0;
-    sig_buf[7] = 0;
+    // Bytes 4..7: calling_conv (LE)
+    uint32_t calling_conv = fn->calling_conv;
+    sig_buf[4] = (uint8_t)(calling_conv & 0xFF);
+    sig_buf[5] = (uint8_t)((calling_conv >> 8) & 0xFF);
+    sig_buf[6] = (uint8_t)((calling_conv >> 16) & 0xFF);
+    sig_buf[7] = (uint8_t)((calling_conv >> 24) & 0xFF);
 
     // Bytes 8..15: ret_type_hash (LE)
     for (int b = 0; b < 8; ++b) {
@@ -840,18 +907,19 @@ uint64_t spark0_compute_fn_sig_hash(const RuFnDef *fn) {
     }
 
     // Bytes 16 + i*16 .. : params
-    for (uint32_t i = 0; i < param_cnt && i < 8; ++i) {
+    for (uint32_t i = 0; i < param_cnt; ++i) {
         uint32_t is_ptr = 0;
         uint64_t type_hash = get_canonical_type_hash(fn->params[i].type, &is_ptr);
-        size_t base = 16 + i * 16;
+        size_t base = 16 + (size_t)i * 16;
         for (int b = 0; b < 8; ++b) {
             sig_buf[base + b] = (uint8_t)((type_hash >> (b * 8)) & 0xFF);
             sig_buf[base + 8 + b] = (uint8_t)(((uint64_t)is_ptr >> (b * 8)) & 0xFF);
         }
     }
 
-    size_t total_len = 16 + param_cnt * 16;
-    return blake3_hash64(sig_buf, total_len);
+    uint64_t h = blake3_hash64(sig_buf, total_len);
+    free(sig_buf);
+    return h;
 }
 
 static RuFnDef *parse_fn_def(Parser *p, bool is_extern, uint16_t calling_conv) {

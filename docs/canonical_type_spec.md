@@ -68,9 +68,11 @@ EIA distinguishes two levels of struct typing:
 Function signatures are encoded into a continuous Little-Endian binary record:
 - **Bytes 0..3**: `param_count` (`u32` LE)
 - **Bytes 4..7**: `calling_conv` (`u32` LE)
-  - `0`: System V AMD64 / Standard AAPCS64 / RISC-V Standard
-  - `1`: Microsoft x64 (Win64) ABI
-  - `2`: ARM64 Vector / Variadic ABI
+  - `0`: `EIA_CCONV_SYSV` (System V AMD64 / Standard AAPCS64 / RISC-V LP64D)
+  - `1`: `EIA_CCONV_WIN64` (Microsoft x64 / Win64 ABI)
+  - `2`: `EIA_CCONV_EIA` (EIA Sovereign Canonical Cross-ISA ABI)
+  - `3`: `EIA_CCONV_AAPCS` (ARM64 AAPCS Explicit)
+  - `4`: `EIA_CCONV_RISCV` (RISC-V LP64D Explicit)
 - **Bytes 8..15**: `ret_type_hash` (`u64` LE)
 - **Bytes 16 + i*16 .. 16 + i*16 + 15**: Parameter `i` (`0 <= i < param_count`)
   - `+0..+7`: `param_type_hash` (`u64` LE)

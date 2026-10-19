@@ -129,6 +129,14 @@ _Static_assert(sizeof(UniversalHologramHeaderRaw64) == 96, "UniversalHologramHea
  * Stored inside `.eia_contract`.
  * Exactly 48 bytes. Offsets: 0x00 .. 0x2F.
  */
+typedef enum {
+    EIA_CCONV_SYSV   = 0, /* System V AMD64 (default x86-64, standard AAPCS64, standard LP64D) */
+    EIA_CCONV_WIN64  = 1, /* Microsoft x64 (Win64) Calling Convention */
+    EIA_CCONV_EIA    = 2, /* EIA Sovereign Canonical Cross-ISA ABI */
+    EIA_CCONV_AAPCS  = 3, /* ARM64 AAPCS Explicit */
+    EIA_CCONV_RISCV  = 4  /* RISC-V 64 LP64D Explicit */
+} EiaCallingConv;
+
 typedef struct {
     uint64_t symbol_hash;         /* 0x00: BLAKE3-64 hash of symbol name string */
     uint64_t type_sig_hash;       /* 0x08: BLAKE3-64 structural type signature hash */
@@ -136,8 +144,8 @@ typedef struct {
     uint64_t code_size;           /* 0x18: Size of symbol code/data in bytes */
     uint32_t flags;               /* 0x20: EiaSymbolFlags bitfield */
     uint16_t param_count;         /* 0x24: Number of formal parameters */
-    uint16_t calling_conv;        /* 0x26: Calling convention (0=SysV x86_64, 1=EIA) */
-    uint64_t contract_digest;     /* 0x28: BLAKE3-64 contract digest */
+    uint16_t calling_conv;        /* 0x26: Calling convention (EiaCallingConv) */
+    uint64_t contract_digest;     /* 0x28: BLAKE3-64 contract digest over 0x00..0x27 */
 } __attribute__((packed)) SymbolContract;
 
 _Static_assert(sizeof(SymbolContract) == 48, "SymbolContract must be exactly 48 bytes");
@@ -180,7 +188,13 @@ typedef enum {
     TYPE_U64,
     TYPE_I32,
     TYPE_U32,
+    TYPE_I16,
+    TYPE_U16,
+    TYPE_I8,
     TYPE_U8,
+    TYPE_F64,
+    TYPE_F32,
+    TYPE_BOOL,
     TYPE_PTR_CONST,   /* *T */
     TYPE_PTR_MUT,     /* *mut T */
     TYPE_ARRAY,       /* [T; N] */

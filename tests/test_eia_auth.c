@@ -263,6 +263,51 @@ static void test_tampered_with_forged_root_fail_closed(void) {
     unlink("/tmp/provider_forged");
 }
 
+static void test_tampered_text_section_fail_closed(void) {
+    printf("[AUTH TEST 9] Whole-Artifact Security: Tampered .text Section Rejection...\n");
+    int rc1 = run_cmd_exit("./bin/spark0 tests/client_v1.rx -o /tmp/client_tamper_text --sign >/dev/null 2>&1");
+    int rc2 = run_cmd_exit("./bin/spark0 tests/provider_v2.rx -o /tmp/provider_tamper_text --sign >/dev/null 2>&1");
+    assert(rc1 == 0 && rc2 == 0);
+
+    /* Tamper with machine code byte in .text (starts at 0x10000) */
+    FILE *f = fopen("/tmp/client_tamper_text", "r+b");
+    assert(f != NULL);
+    fseek(f, 0x10000 + 4, SEEK_SET);
+    uint8_t byte = 0;
+    assert(fread(&byte, 1, 1, f) == 1);
+    byte ^= 0x5A;
+    fseek(f, 0x10000 + 4, SEEK_SET);
+    assert(fwrite(&byte, 1, 1, f) == 1);
+    fclose(f);
+
+    int exec_rc = run_cmd_exit("./bin/eia-run /tmp/client_tamper_text /tmp/provider_tamper_text >/dev/null 2>&1");
+    assert(exec_rc == 1);
+    printf("  [PASS] Machine code tampering in .text caught by whole-artifact authentication (exit 1)\n");
+
+    unlink("/tmp/client_tamper_text");
+    unlink("/tmp/provider_tamper_text");
+}
+
+static void test_require_signed_flag_fail_closed(void) {
+    printf("[AUTH TEST 10] Policy Enforcement: --require-signed Mode Rejection of Unsigned Binaries...\n");
+    /* Compile without --sign */
+    int rc1 = run_cmd_exit("./bin/spark0 tests/client_v1.rx -o /tmp/client_unsigned >/dev/null 2>&1");
+    int rc2 = run_cmd_exit("./bin/spark0 tests/provider_v2.rx -o /tmp/provider_unsigned >/dev/null 2>&1");
+    assert(rc1 == 0 && rc2 == 0);
+
+    /* Normal mode succeeds */
+    int normal_rc = run_cmd_exit("./bin/eia-run /tmp/client_unsigned /tmp/provider_unsigned >/dev/null 2>&1");
+    assert(normal_rc == 42);
+
+    /* --require-signed MUST reject unsigned binaries with exit 1 */
+    int req_rc = run_cmd_exit("./bin/eia-run --require-signed /tmp/client_unsigned /tmp/provider_unsigned >/dev/null 2>&1");
+    assert(req_rc == 1);
+    printf("  [PASS] --require-signed strictly blocks unsigned artifacts fail-closed (exit 1)\n");
+
+    unlink("/tmp/client_unsigned");
+    unlink("/tmp/provider_unsigned");
+}
+
 int main(void) {
     printf("============================================================\n");
     printf("   EIA CRYPTOGRAPHIC ARTIFACT AUTHENTICATION SUITE          \n");
@@ -276,6 +321,8 @@ int main(void) {
     test_revoked_key_epoch_fail_closed();
     test_untrusted_pubkey_fail_closed();
     test_tampered_with_forged_root_fail_closed();
+    test_tampered_text_section_fail_closed();
+    test_require_signed_flag_fail_closed();
 
     printf("\n============================================================\n");
     printf(">>> ALL ARTIFACT AUTHENTICATION TESTS PASSED (100%%)         \n");

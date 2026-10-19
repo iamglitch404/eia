@@ -125,8 +125,8 @@ Total Header Size: **96 bytes** (`0x60`).
 | `0x18` | 8 | `code_size` | `uint64_t` | Size of symbol code/data in bytes |
 | `0x20` | 4 | `flags` | `uint32_t` | `EiaSymbolFlags` (0x1=export, 0x2=import, 0x4=bridge, 0x8=pure) |
 | `0x24` | 2 | `param_count` | `uint16_t` | Number of formal parameters |
-| `0x26` | 2 | `calling_conv` | `uint16_t` | Calling convention (0=SysV x86_64, 1=EIA Sovereign, 2=Win64) |
-| `0x28` | 8 | `contract_digest` | `uint64_t` | BLAKE3-64 contract digest |
+| `0x26` | 2 | `calling_conv` | `uint16_t` | Calling convention (0=SysV x86_64, 1=Win64 x64, 2=EIA Sovereign, 3=ARM64 AAPCS, 4=RISC-V LP64D) |
+| `0x28` | 8 | `contract_digest` | `uint64_t` | BLAKE3-64 contract digest over contract fields 0x00..0x27 |
 
 Total SymbolContract Size: **48 bytes** (`0x30`).
 
@@ -174,11 +174,12 @@ Resides in the process address space as a self-contained bootstrap stub:
 
 ### 4.4 Universal Polyglot Binary Packaging (`UPBP`) & Multi-Architecture Targets
 A single binary file format that executes natively across platforms and silicon architectures:
-* **Offset 0x000–0x03F**: DOS `MZ` stub header with `e_lfanew` pointing to PE header.
-* **Offset 0x040–0x07F**: POSIX Shell script (`#!/bin/sh`) executed if run as a shell script.
-* **Offset 0x080–0x1FF**: ELF64 program headers (Linux loader maps PT_LOAD segments). Supports multi-architecture targeting via `--target=x86_64` (default, `EM_X86_64`), `--target=arm64` (`EM_AARCH64`), and `--target=riscv64` (`EM_RISCV`).
-* **Offset 0x200–0x3FF**: Mach-O 64-bit load commands (`LC_SEGMENT_64` for macOS Darwin).
-* **Offset 0x400+**: Universal Hologram ($\Sigma_\infty$) and executable native code pages.
+* **Offset 0x000–0x03F**: DOS `MZ` stub header with `e_lfanew = 0x140` (320) pointing to PE header.
+* **Offset 0x040–0x07F**: POSIX Shell script (`#!/bin/sh`) trampoline for non-native shell environments.
+* **Offset 0x080–0x13F** (128): ELF64 Header and PT_LOAD segment headers (Linux loader maps PT_LOAD segments directly). Supports multi-architecture targeting via `--target=x86_64` (default, `EM_X86_64`), `--target=arm64` (`EM_AARCH64`), and `--target=riscv64` (`EM_RISCV`).
+* **Offset 0x140–0x1FF** (320): PE/COFF Headers (PE signature, COFF header, PE32+ Optional Header, and `.text` section headers for Windows native loading).
+* **Offset 0x200–0x47F** (512): Mach-O 64-bit headers and load commands (`0xFEEDFACF`, `LC_SEGMENT_64` for macOS Darwin native execution).
+* **Offset 0x480+** (1152): Universal Hologram Header ($\Sigma_\infty$, `EIAH`), Contracts (`.eia_contract`), Relocation holes (`.eia_reloc`), Type Graph (`.eia_typegraph`), Authentication Record (`.eia_auth`), and executable native code pages.
 
 ### 4.5 Dual Virtual Alias Mapping (DVAM) & $W \oplus X$
 To satisfy operating system Write XOR Execute ($W \oplus X$ security policies without paying the overhead of `mprotect()` syscalls during hole patching:
@@ -277,8 +278,8 @@ typedef struct {
     uint64_t code_size;           /* 0x18: Size of symbol code/data in bytes */
     uint32_t flags;               /* 0x20: EiaSymbolFlags bitfield */
     uint16_t param_count;         /* 0x24: Number of formal parameters */
-    uint16_t calling_conv;        /* 0x26: Calling convention (0=SysV x86_64, 1=EIA, 2=Win64) */
-    uint64_t contract_digest;     /* 0x28: BLAKE3-64 contract digest */
+    uint16_t calling_conv;        /* 0x26: Calling convention (0=SysV x86_64, 1=Win64 x64, 2=EIA Sovereign, 3=ARM64 AAPCS, 4=RISC-V LP64D) */
+    uint64_t contract_digest;     /* 0x28: BLAKE3-64 contract digest over 0x00..0x27 */
 } __attribute__((packed)) SymbolContract;
 
 /* EIA Relocation Hole Entry (24 bytes, offsets 0x00 .. 0x17) */
@@ -416,4 +417,29 @@ Hardware: AMD Ryzen / Linux x86_64; measured across 50 iterations with median an
 | **Extreme Scale (2,000 holes)** | **$41.36\text{ µs}$ (median)**, $50.52\text{ µs}$ (p95) | $20.6\text{ ns}$ / hole amortized ($O(N)$ vs previous $702\text{ µs}$) |
 | **Static Baseline (`memcpy` + lock)** | **$8.94\text{ µs}$** | Cost of raw page allocation and memory copy |
 | **Steady-State Call Overhead** | **$0.000\text{ ns}$ (0 extra cycles)** | Patched direct native hardware instructions |
+
+---
+
+## 12. Authoritative Specification Policies
+
+### 12.1 Artifact Versioning & Evolution Policy
+1. **Major Version Compatibility**: Loaders enforce strict `version_major == EIA_VERSION_MAJOR` (currently 2). Any artifact declaring `version_major != 2` is rejected fail-closed with `[EIA ERROR] Unsupported artifact format version`.
+2. **Minor Version Compatibility**: `version_minor` indicates backward-compatible extensions. A loader supporting minor version $N$ accepts all artifacts with minor version $\le N$.
+3. **Format Field Immobility**: Hologram Header offsets, `SymbolContract` structure (48 bytes), `EiaRelocHole` structure (24 bytes), and `EiaSignatureRecord` structure (112 bytes) are permanently frozen.
+
+### 12.2 ABI Epoch Policy
+1. **Monotonic Progression**: `abi_epoch` is a 64-bit monotonically increasing counter. Incrementing `abi_epoch` signals breaking structural or memory layout changes across the sovereign ABI boundary.
+2. **Compatibility Requirement**: In strict mode, client and provider artifacts must share identical `abi_epoch` values. In evolution mode, providers must declare `provider->abi_epoch >= client->abi_epoch`.
+3. **Anti-Replay & Key Revocation**: Artifact authentication signatures record `key_epoch`. Any artifact signed with `key_epoch < EIA_MIN_TRUSTED_EPOCH` is rejected fail-closed to prevent replay of revoked binary revisions.
+
+### 12.3 Symbol Collision & Duplicate-Provider Policy
+1. **First-Provider Precedence**: When multiple loaded providers export identical symbol names (`symbol_hash`), the first declared provider takes precedence for relocation resolution.
+2. **Conflicting Type Rejection**: If a subsequent provider exports an identical `symbol_hash` but with a conflicting `type_sig_hash`, the dynamic linker emits a diagnostic alert and isolates the collision to prevent silent structural ABI corruption.
+3. **Dependency Ordering**: Providers are evaluated deterministically in left-to-right command-line order or explicit manifest DAG order. Provider versions are ranked by highest `abi_epoch`.
+
+### 12.4 Whole-Artifact Cryptographic Provenance & `--require-signed` Mode
+1. **Canonical Binary Hashing**: Authentication computes a full 256-bit BLAKE3 digest over the complete file (headers, Hologram, contracts, relocations, type graph, `.text`, `.rodata`, and metadata), with the signature record fields zeroed out during hashing.
+2. **Asymmetric & Sovereign Authentication**: Signatures verify the 256-bit whole-artifact digest against trusted public root authority keys.
+3. **Fail-Closed Policy (`--require-signed`)**: When invoked with `--require-signed`, `eia-run` strictly rejects any unsigned or unverified client or provider artifacts before memory allocation or execution.
+
 

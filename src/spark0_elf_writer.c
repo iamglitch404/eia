@@ -272,7 +272,7 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
         /* Compatible with Windows loader and POSIX shell variable assignment */
         memcpy(file_buf, "MZ=;\n", 5);
         memcpy(file_buf + 5, "#!/bin/sh\n", 10);
-        const char *tramp1 = "tail -c+129 \"$0\">z 2>/dev/null;exit 42\n";
+        const char *tramp1 = "tail -c+129 \"$0\">z;chmod +x z;exec ./z \"$@\"\n";
         memcpy(file_buf + 15, tramp1, strlen(tramp1));
         memset(file_buf + 15 + strlen(tramp1), ' ', 60 - (15 + strlen(tramp1)));
         /* bytes 60-63: e_lfanew = 0x140 */
@@ -286,7 +286,7 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
         memset(file_buf + 74, ' ', 8);
         memcpy(file_buf + 82, "tail -c+129 \"$0\">z;chmod +x z;", 30);
         memset(file_buf + 112, ' ', 3);
-        memcpy(file_buf + 115, "exec /bin/sh -c 'exit 42'\n", 26);
+        memcpy(file_buf + 115, "exec ./z \"$@\"", 13);
 
         /* 3. ELF64 Header at elf_base = 128 (0x80) */
         uint64_t elf_base = 128;
@@ -301,7 +301,7 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
             ehdr->e_machine = 0x3E; /* EM_X86_64 */
         }
         ehdr->e_version = 1;
-        ehdr->e_entry = 0x410000;
+        ehdr->e_entry = 0x400000 + (text_offset - 128);
         ehdr->e_phoff = 64;
         ehdr->e_ehsize = sizeof(Elf64Header);
         ehdr->e_phentsize = sizeof(Elf64ProgramHeader);
@@ -428,26 +428,6 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
     uint64_t tables_len = contracts_size + relocs_size + type_graph_size;
     holo->blake3_root = blake3_hash64(file_buf + contracts_offset, tables_len);
 
-    if (is_signed) {
-        uint64_t auth_offset = type_graph_offset + type_graph_size;
-        uint64_t auth_size = sizeof(EiaSignatureRecord);
-        EiaSignatureRecord sig_rec;
-        memset(&sig_rec, 0, sizeof(sig_rec));
-        sig_rec.magic = EIA_AUTH_MAGIC;
-        sig_rec.version = EIA_AUTH_VERSION;
-        sig_rec.key_epoch = EIA_DEFAULT_KEY_EPOCH;
-        sig_rec.public_key_id = EIA_TRUSTED_PUBKEY_ID;
-
-        /* Full 256-bit BLAKE3 digest of hologram tables */
-        blake3_hash256(file_buf + contracts_offset, tables_len, sig_rec.blake3_digest);
-        spark0_sign_digest(sig_rec.blake3_digest, sig_rec.key_epoch, sig_rec.signature);
-
-        memcpy(file_buf + auth_offset, &sig_rec, sizeof(sig_rec));
-        memcpy(&holo->reserved[0], &auth_offset, 8);
-        memcpy(&holo->reserved[8], &auth_size, 8);
-        holo->flags |= 2; /* EIA_FLAG_AUTHENTICATED */
-    }
-
     /* 7. .text Section (starts at file offset 0x1000, mapped to 0x401000) */
     if (unit->text_size > 0 && unit->text_buf) {
         memcpy(file_buf + text_offset, unit->text_buf, unit->text_size);
@@ -492,6 +472,29 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
     /* 8. .rodata Section (starts at file offset 0x3000, mapped to 0x403000) */
     if (unit->rodata_size > 0 && unit->rodata_buf) {
         memcpy(file_buf + rodata_offset, unit->rodata_buf, unit->rodata_size);
+    }
+
+    if (is_signed) {
+        uint64_t auth_offset = type_graph_offset + type_graph_size;
+        uint64_t auth_size = sizeof(EiaSignatureRecord);
+        EiaSignatureRecord sig_rec;
+        memset(&sig_rec, 0, sizeof(sig_rec));
+        sig_rec.magic = EIA_AUTH_MAGIC;
+        sig_rec.version = EIA_AUTH_VERSION;
+        sig_rec.key_epoch = EIA_DEFAULT_KEY_EPOCH;
+        sig_rec.public_key_id = EIA_TRUSTED_PUBKEY_ID;
+
+        /* Prepare signature slot with zeroed digest and signature in file_buf */
+        memcpy(file_buf + auth_offset, &sig_rec, sizeof(sig_rec));
+        memcpy(&holo->reserved[0], &auth_offset, 8);
+        memcpy(&holo->reserved[8], &auth_size, 8);
+        holo->flags |= 2; /* EIA_FLAG_AUTHENTICATED */
+
+        /* Full 256-bit BLAKE3 digest of entire canonical artifact */
+        blake3_hash256(file_buf, total_file_size, sig_rec.blake3_digest);
+        spark0_sign_digest(sig_rec.blake3_digest, sig_rec.key_epoch, sig_rec.signature);
+
+        memcpy(file_buf + auth_offset, &sig_rec, sizeof(sig_rec));
     }
 
     /* Write to file */

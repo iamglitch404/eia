@@ -198,7 +198,26 @@ static void build_type_graph(CompiledUnit *u, RuModule *module) {
             entry->type_sig_hash = s->type_sig_hash;
             entry->field_hash = f->name_hash;
             entry->byte_offset = byte_offset;
-            entry->field_size = f_size;
+            uint32_t flags = 0;
+            if (f->type) {
+                if (f->type->kind == TYPE_I8 || f->type->kind == TYPE_I16 || f->type->kind == TYPE_I32 || f->type->kind == TYPE_I64) {
+                    flags |= (1 << 16); /* signed */
+                }
+                if (f->type->kind == TYPE_PTR_CONST || f->type->kind == TYPE_PTR_MUT) {
+                    flags |= (1 << 17); /* pointer */
+                }
+                if (f->type->kind == TYPE_ARRAY) {
+                    flags |= (1 << 18); /* array */
+                }
+                if (f->type->kind == TYPE_STRUCT) {
+                    flags |= (1 << 19); /* struct */
+                }
+                if (f->type->kind == TYPE_F32 || f->type->kind == TYPE_F64) {
+                    flags |= (1 << 20); /* float */
+                }
+            }
+            flags |= ((f_align & 0xFF) << 24); /* alignment */
+            entry->field_size = (f_size & 0xFFFF) | flags;
         }
     }
 }
@@ -1976,7 +1995,7 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
             sc->flags = EIA_SYM_FLAG_IMPORT;
             sc->param_count = (uint16_t)fn->param_count;
             sc->calling_conv = fn->calling_conv;
-            sc->contract_digest = fn->symbol_hash ^ 0xFEEDFACECAFEBABEULL;
+            sc->contract_digest = blake3_hash64((const uint8_t *)sc, 40);
             continue;
         }
 
@@ -2149,7 +2168,7 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
         sc->flags = EIA_SYM_FLAG_EXPORT;
         sc->param_count = (uint16_t)fn->param_count;
         sc->calling_conv = fn->calling_conv;
-        sc->contract_digest = fn->symbol_hash ^ 0xFEEDFACECAFEBABEULL;
+        sc->contract_digest = blake3_hash64((const uint8_t *)sc, 40);
 
     }
 

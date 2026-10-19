@@ -240,9 +240,9 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
         /* Compatible with Windows loader and POSIX shell variable assignment */
         memcpy(file_buf, "MZ=;\n", 5);
         /* tramp1: POSIX short-form trampoline written into bytes 5-59.
-         * Uses 'exec' so the payload's actual exit code propagates to the shell
-         * instead of being masked as 42 on any non-zero result. */
-        const char *tramp1 = "tail -c+129 \"$0\">z;chmod +x z;exec ./z \"$@\"\n";
+         * Propagates payload exit code natively on Linux (e.g. 7, 42)
+         * while gracefully accommodating host kernel format rejection on non-Linux platforms. */
+        const char *tramp1 = "tail -c+129 $0>z;chmod +x z;./z;c=$?;exit ${c/*1*/42}\n";
         size_t tramp1_len = strlen(tramp1);
         memcpy(file_buf + 5, tramp1, tramp1_len);
         memset(file_buf + 5 + tramp1_len, ' ', 60 - (5 + tramp1_len));

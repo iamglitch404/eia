@@ -163,7 +163,7 @@ static void blake3_parent_cv(const uint8_t *left_cv, const uint8_t *right_cv, in
     blake3_compress_block(cv, block, 64, 0, flags, out_cv);
 }
 
-static uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
+uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
     if (len <= 1024) {
         uint8_t root_cv[32];
         blake3_hash_chunk(buf, len, 0, 1, root_cv);

@@ -219,16 +219,29 @@ jobs:
           fi
           echo "Production eia-run fail-closed missing symbol rejection: PASSED (exit code 1)"
 
-          # Verify Stage-1 self-hosted core1 interoperability parity
-          ./bin/core1 tests/client_v1.rx -o /tmp/core1_client_v1
-          ./bin/core1 tests/provider_v2.rx -o /tmp/core1_provider_v2
-          c1_code=0
-          ./bin/eia-run /tmp/core1_client_v1 /tmp/core1_provider_v2 || c1_code=$?
-          if [ "$c1_code" -ne 42 ]; then
-            echo "Expected stage-1 core1 client/provider linking exit code 42, got $c1_code"
-            exit 1
-          fi
-          echo "Stage-1 core1 client/provider dynamic linking via eia-run: PASSED (exit code 42)"
+          # Verify Stage-0 and Stage-1 (core1) Complete Interoperability Matrix (All 4 Combinations)
+          ./bin/spark0 tests/client_v1.rx -o bin/client_s0
+          ./bin/spark0 tests/provider_v2.rx -o bin/provider_s0
+          ./bin/core1 tests/client_v1.rx -o bin/client_c1
+          ./bin/core1 tests/provider_v2.rx -o bin/provider_c1
+
+          run_interop() {
+            local client=$1
+            local provider=$2
+            local label=$3
+            local code=0
+            ./bin/eia-run "$client" "$provider" || code=$?
+            if [ "$code" -ne 42 ]; then
+              echo "FAILED: $label exited with $code (expected 42)"
+              exit 1
+            fi
+            echo "PASSED: $label (exit code 42 verified)"
+          }
+
+          run_interop bin/client_s0 bin/provider_s0 "stage-0 client -> stage-0 provider"
+          run_interop bin/client_c1 bin/provider_c1 "stage-1 core1 client -> stage-1 core1 provider"
+          run_interop bin/client_s0 bin/provider_c1 "stage-0 client -> stage-1 core1 provider"
+          run_interop bin/client_c1 bin/provider_s0 "stage-1 core1 client -> stage-0 provider"
 
           # Official BLAKE3-64 Standard Reference Vector Suite (ASan + UBSan)
           gcc -O2 -Wall -Wextra -fsanitize=address,undefined -o bin/test_blake3_vectors tests/test_blake3_vectors.c
@@ -251,7 +264,13 @@ jobs:
           ./bin/spark0 tests/hello_eia.rx -o bin/hello_riscv64 --target=riscv64
           ./bin/spark0 tests/test_semantic_multiarch.rx -o bin/sem_arm64 --target=arm64
           ./bin/spark0 tests/test_semantic_multiarch.rx -o bin/sem_riscv64 --target=riscv64
-          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user || true
+          ./bin/spark0 tests/client_v1.rx -o bin/client_v1_arm64 --target=arm64
+          ./bin/spark0 tests/provider_v2.rx -o bin/provider_v2_arm64 --target=arm64
+          ./bin/spark0 tests/client_v1.rx -o bin/client_v1_rv --target=riscv64
+          ./bin/spark0 tests/provider_v2.rx -o bin/provider_v2_rv --target=riscv64
+
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu || true
+
           if command -v qemu-aarch64 >/dev/null 2>&1; then
             arm_code=0
             arm_out=$(qemu-aarch64 bin/hello_arm64) || arm_code=$?
@@ -264,7 +283,23 @@ jobs:
             qemu-aarch64 bin/sem_arm64 || sem_arm=$?
             [ "$sem_arm" -eq 42 ]
             echo "ARM64 multi-feature semantics (struct pointers, function calls, loops): PASSED (exit code 42)"
+
+            # Host eia-run dynamic linking and cross-ISA execution of ARM64 binaries
+            eia_arm=0
+            ./bin/eia-run bin/client_v1_arm64 bin/provider_v2_arm64 || eia_arm=$?
+            [ "$eia_arm" -eq 42 ]
+            echo "Cross-ISA ARM64 dynamic linking and execution via eia-run: PASSED (exit code 42)"
+
+            # Native ARM64 eia-run execution under QEMU
+            if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+              aarch64-linux-gnu-gcc -O2 -Wall -Wextra -static -Iinclude -o bin/eia-run-arm64 src/eia_loader.c
+              qemu_arm_loader=0
+              qemu-aarch64 bin/eia-run-arm64 bin/client_v1_arm64 bin/provider_v2_arm64 || qemu_arm_loader=$?
+              [ "$qemu_arm_loader" -eq 42 ]
+              echo "Target ARM64 eia-run native DVAM execution under QEMU: PASSED (exit code 42)"
+            fi
           fi
+
           if command -v qemu-riscv64 >/dev/null 2>&1; then
             riscv_code=0
             riscv_out=$(qemu-riscv64 bin/hello_riscv64) || riscv_code=$?
@@ -277,4 +312,19 @@ jobs:
             qemu-riscv64 bin/sem_riscv64 || sem_rv=$?
             [ "$sem_rv" -eq 42 ]
             echo "RISC-V 64 multi-feature semantics (struct pointers, function calls, loops): PASSED (exit code 42)"
+
+            # Host eia-run dynamic linking and cross-ISA execution of RISC-V 64 binaries
+            eia_rv=0
+            ./bin/eia-run bin/client_v1_rv bin/provider_v2_rv || eia_rv=$?
+            [ "$eia_rv" -eq 42 ]
+            echo "Cross-ISA RISC-V 64 dynamic linking and execution via eia-run: PASSED (exit code 42)"
+
+            # Native RISC-V 64 eia-run execution under QEMU
+            if command -v riscv64-linux-gnu-gcc >/dev/null 2>&1; then
+              riscv64-linux-gnu-gcc -O2 -Wall -Wextra -static -Iinclude -o bin/eia-run-riscv64 src/eia_loader.c
+              qemu_rv_loader=0
+              qemu-riscv64 bin/eia-run-riscv64 bin/client_v1_rv bin/provider_v2_rv || qemu_rv_loader=$?
+              [ "$qemu_rv_loader" -eq 42 ]
+              echo "Target RISC-V 64 eia-run native DVAM execution under QEMU: PASSED (exit code 42)"
+            fi
           fi

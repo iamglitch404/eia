@@ -297,8 +297,20 @@ fn blake3_hash64(buf: *u8, len: u64) -> u64 {
     }
 
     let num_chunks: u64 = (len + 1023) / 1024;
+    let mut stack_cv_buf: [u8; 2048];
+    let mut cv_list: *mut u8 = &mut stack_cv_buf[0];
+    let mut is_allocated: u32 = 0;
     let cv_bytes: u64 = ((num_chunks * 32) + 4095) & ~4095;
-    let cv_list: *mut u8 = syscall(9, 0, cv_bytes, 3, 34, -1, 0) as *mut u8;
+    if num_chunks > 64 {
+        if num_chunks > 1048576 { return 0; }
+        let ptr: *mut u8 = syscall(9, 0, cv_bytes, 3, 34, -1, 0) as *mut u8;
+        if (ptr as i64) > 0 {
+            cv_list = ptr;
+            is_allocated = 1;
+        } else {
+            return 0;
+        }
+    }
 
     let mut c: u64 = 0;
     while c < num_chunks {
@@ -344,7 +356,9 @@ fn blake3_hash64(buf: *u8, len: u64) -> u64 {
 
     let low: u64 = (get_u32(cv_list, 0) as u64) & 4294967295;
     let high: u64 = (get_u32(cv_list, 1) as u64) & 4294967295;
-    syscall(11, cv_list, cv_bytes); // SYS_munmap
+    if is_allocated == 1 {
+        syscall(11, cv_list, cv_bytes); // SYS_munmap
+    }
     return low | (high << 32);
 }
 

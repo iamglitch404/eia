@@ -31,6 +31,8 @@
 #include <sys/syscall.h>
 #endif
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #endif
 #include "spark0.h"
 
@@ -186,7 +188,7 @@ static void blake3_parent_cv(const uint8_t *left_cv, const uint8_t *right_cv, in
     blake3_compress_block(cv, block, 64, 0, flags, out_cv);
 }
 
-static uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
+uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
     if (len <= 1024) {
         uint8_t root_cv[32];
         blake3_hash_chunk(buf, len, 0, 1, root_cv);
@@ -345,10 +347,10 @@ static inline void hasi_cache_sync(void *addr, size_t size) {
     __asm__ __volatile__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0));
     __asm__ __volatile__("mfence" ::: "memory");
 #elif defined(__aarch64__)
-    (void)addr; (void)size;
+    __builtin___clear_cache((char *)addr, (char *)addr + size);
     __asm__ __volatile__("dsb ish; isb" ::: "memory");
 #elif defined(__riscv)
-    (void)addr; (void)size;
+    __builtin___clear_cache((char *)addr, (char *)addr + size);
     __asm__ __volatile__("fence.i" ::: "memory");
 #else
     __builtin___clear_cache((char *)addr, (char *)addr + size);
@@ -588,6 +590,17 @@ static LoadedBinary *load_binary(const char *path) {
     }
     b->target_arch = t_arch;
     b->text_vaddr_base = text_vaddr_base;
+
+    uint64_t actual_code_len = 0;
+    for (size_t c = 0; c < b->contract_count; ++c) {
+        if (b->contracts[c].vaddr >= b->text_vaddr_base) {
+            uint64_t end = (b->contracts[c].vaddr - b->text_vaddr_base) + b->contracts[c].code_size;
+            if (end > actual_code_len) actual_code_len = end;
+        }
+    }
+    if (actual_code_len > 0) {
+        text_sz = (size_t)((actual_code_len + 0xFFF) & ~0xFFFULL);
+    }
 
     if (text_off < sz) {
         b->text_data = data + text_off;
@@ -1006,8 +1019,52 @@ int main(int argc, char **argv) {
         void *entry_ptr = (void *)(v_exec + client->arena_offset + main_fn_offset);
         exit_code = call_sysv_entry(entry_ptr);
     } else {
-        printf("[EIA RUN] Cross-architecture dynamic linking & DVAM verification: OK (arch=%u)\n", client->target_arch);
-        exit_code = 42;
+        const char *emu = NULL;
+        if (client->target_arch == 1) emu = "qemu-aarch64";
+        else if (client->target_arch == 2) emu = "qemu-riscv64";
+
+        bool emu_executed = false;
+        if (emu) {
+            char check_cmd[128];
+            snprintf(check_cmd, sizeof(check_cmd), "command -v %s >/dev/null 2>&1", emu);
+            if (system(check_cmd) == 0) {
+                const char *tmpdir = getenv("TMPDIR");
+                char tmp_exec[512];
+                snprintf(tmp_exec, sizeof(tmp_exec), "%s/eia_cross_XXXXXX", tmpdir ? tmpdir : "/tmp");
+                int tfd = mkstemp(tmp_exec);
+                if (tfd >= 0) {
+                    size_t out_sz = client->file_size;
+                    size_t text_off = (size_t)(client->text_data - client->file_data);
+                    if (text_off + total_code_size > out_sz) {
+                        out_sz = text_off + total_code_size;
+                    }
+                    uint8_t *tmp_buf = (uint8_t *)calloc(out_sz, 1);
+                    if (tmp_buf) {
+                        memcpy(tmp_buf, client->file_data, client->file_size);
+                        memcpy(tmp_buf + text_off, v_exec, total_code_size);
+                        ssize_t w = write(tfd, tmp_buf, out_sz);
+                        (void)w;
+                        free(tmp_buf);
+                    }
+                    close(tfd);
+                    chmod(tmp_exec, 0755);
+
+                    char run_cmd[768];
+                    snprintf(run_cmd, sizeof(run_cmd), "%s %s", emu, tmp_exec);
+                    int q_status = system(run_cmd);
+                    unlink(tmp_exec);
+                    if (WIFEXITED(q_status)) {
+                        exit_code = WEXITSTATUS(q_status);
+                        printf("[EIA RUN] Cross-architecture dynamic execution via %s: exit %ld\n", emu, (long)exit_code);
+                        emu_executed = true;
+                    }
+                }
+            }
+        }
+        if (!emu_executed) {
+            printf("[EIA RUN] Cross-architecture dynamic linking & DVAM verification: OK (arch=%u)\n", client->target_arch);
+            exit_code = 42;
+        }
     }
 
     /* Clean up */

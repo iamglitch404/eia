@@ -594,6 +594,7 @@ typedef struct {
 
 uint64_t spark0_hash64(const void *data, size_t len);
 uint64_t spark0_hash_str(const char *str);
+uint64_t blake3_hash64(const uint8_t *buf, size_t len);
 
 void     spark0_format_type_sig(const RuType *t, char *buf, size_t cap);
 uint64_t spark0_compute_fn_sig_hash(const RuFnDef *fn);

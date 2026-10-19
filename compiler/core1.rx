@@ -60,6 +60,9 @@ struct Arena {
 fn mmap_alloc(size: u64) -> *mut u8 {
     // SYS_mmap = 9: addr=0, len=size, prot=PROT_READ|PROT_WRITE (3), flags=MAP_PRIVATE|MAP_ANONYMOUS (34), fd=-1, off=0
     let ptr: *mut u8 = syscall(9, 0, size, 3, 34, -1, 0) as *mut u8;
+    if (ptr as i64) <= 0 {
+        return 0 as *mut u8;
+    }
     return ptr;
 }
 
@@ -708,9 +711,9 @@ fn parse_fn(p: *mut Parser) -> *mut AstNode {
         parser_expect(p, 70); // ':'
         let mut is_ptr: u32 = 0;
         if p.cur_tok.kind == 50 { parser_expect(p, 50); is_ptr = 1; } // '&'
-        if p.cur_tok.kind == 13 { parser_expect(p, 13); }             // 'mut'
+        if p.cur_tok.kind == 13 { parser_expect(p, 13); is_ptr = 2; } // 'mut'
         if p.cur_tok.kind == 32 { parser_expect(p, 32); is_ptr = 1; } // '*'
-        if p.cur_tok.kind == 13 { parser_expect(p, 13); }             // 'mut'
+        if p.cur_tok.kind == 13 { parser_expect(p, 13); is_ptr = 2; } // 'mut'
         pnode.val = p.cur_tok.hash;
         pnode.is_mut = is_ptr;
         lex_next_token(p.lex, &mut p.cur_tok);
@@ -726,10 +729,13 @@ fn parse_fn(p: *mut Parser) -> *mut AstNode {
     }
     parser_expect(p, 61); // ')'
 
+    let mut ret_hash: u64 = 3563412735833858527; // "void"
     if p.cur_tok.kind == 74 { // '->'
         parser_expect(p, 74);
+        ret_hash = p.cur_tok.hash;
         lex_next_token(p.lex, &mut p.cur_tok);
     }
+    fnode.val = ret_hash;
 
     parser_expect(p, 62); // '{'
     let mut last_stmt: *mut AstNode = 0 as *mut AstNode;
@@ -1590,15 +1596,30 @@ fn compile_fn(cg: *mut CodeGen, fnode: *mut AstNode) {
 
     let fn_code_size: u64 = (cg.text_size - fn_text_offset) as u64;
 
+    // Collect parameter types and ptr kinds
+    let mut param_types_buf: [u64; 8];
+    let mut param_ptrs_buf: [u64; 8];
+    let p_types: *mut u64 = &mut param_types_buf[0];
+    let p_ptrs: *mut u64 = &mut param_ptrs_buf[0];
+    let mut pc: *mut AstNode = fnode.child2;
+    let mut p_count: u32 = 0;
+    while pc != (0 as *mut AstNode) && p_count < 8 {
+        p_types[p_count as u64] = pc.val;
+        p_ptrs[p_count as u64] = pc.is_mut as u64;
+        p_count = p_count + 1;
+        pc = pc.next;
+    }
+    let sig_hash: u64 = compute_canonical_sig_hash(p_count, fnode.val, p_types as *u64, p_ptrs as *u64);
+
     // Register SymbolContract
     let sc: *mut SymbolContract = ((cg.contracts as *mut u8) + ((cg.contract_count as u64) * 48)) as *mut SymbolContract;
     sc.symbol_hash = fnode.hash;
-    sc.type_sig_hash = fnode.hash;
+    sc.type_sig_hash = sig_hash;
     sc.vaddr = fn_vaddr;
     sc.code_size = fn_code_size;
     sc.flags = 1;
     sc.param_conv = p_idx;
-    sc.contract_digest = fnode.hash;
+    sc.contract_digest = sig_hash;
     cg.contract_count = cg.contract_count + 1;
 
     // Patch call main hole in _start
@@ -1916,8 +1937,20 @@ fn blake3_hash64(buf: *u8, len: u64) -> u64 {
     }
 
     let num_chunks: u64 = (len + 1023) / 1024;
+    let mut stack_cv_buf: [u8; 2048];
+    let mut cv_list: *mut u8 = &mut stack_cv_buf[0];
+    let mut is_allocated: u32 = 0;
     let cv_bytes: u64 = ((num_chunks * 32) + 4095) & ~4095;
-    let cv_list: *mut u8 = syscall(9, 0, cv_bytes, 3, 34, -1, 0) as *mut u8;
+    if num_chunks > 64 {
+        if num_chunks > 1048576 { return 0; }
+        let ptr: *mut u8 = syscall(9, 0, cv_bytes, 3, 34, -1, 0) as *mut u8;
+        if (ptr as i64) > 0 {
+            cv_list = ptr;
+            is_allocated = 1;
+        } else {
+            return 0;
+        }
+    }
 
     let mut c: u64 = 0;
     while c < num_chunks {
@@ -1963,8 +1996,62 @@ fn blake3_hash64(buf: *u8, len: u64) -> u64 {
 
     let low: u64 = (get_u32(cv_list, 0) as u64) & 4294967295;
     let high: u64 = (get_u32(cv_list, 1) as u64) & 4294967295;
-    syscall(11, cv_list, cv_bytes); // SYS_munmap
+    if is_allocated == 1 {
+        syscall(11, cv_list, cv_bytes); // SYS_munmap
+    }
     return low | (high << 32);
+}
+
+fn compute_canonical_sig_hash(param_cnt: u32, ret_type_hash: u64, param_types: *u64, param_ptrs: *u64) -> u64 {
+    let mut sig_buf: [u8; 144];
+    let p: *mut u8 = &mut sig_buf[0];
+    let mut i: u64 = 0;
+    while i < 144 {
+        p[i] = 0;
+        i = i + 1;
+    }
+
+    // Bytes 0..3: param_cnt
+    p[0] = (param_cnt & 255) as u8;
+    p[1] = ((param_cnt >> 8) & 255) as u8;
+    p[2] = ((param_cnt >> 16) & 255) as u8;
+    p[3] = ((param_cnt >> 24) & 255) as u8;
+
+    // Bytes 4..7: calling_conv (0)
+    p[4] = 0; p[5] = 0; p[6] = 0; p[7] = 0;
+
+    // Bytes 8..15: ret_type_hash
+    let mut rh: u64 = ret_type_hash;
+    let mut b: u64 = 0;
+    while b < 8 {
+        p[8 + b] = (rh & 255) as u8;
+        rh = rh >> 8;
+        b = b + 1;
+    }
+
+    // Bytes 16 + i*16 .. : params
+    let mut pi: u32 = 0;
+    while pi < param_cnt && pi < 8 {
+        let base: u64 = 16 + ((pi as u64) * 16);
+        let mut th: u64 = param_types[pi as u64];
+        let mut ptr_kind: u64 = param_ptrs[pi as u64];
+        b = 0;
+        while b < 8 {
+            p[base + b] = (th & 255) as u8;
+            th = th >> 8;
+            b = b + 1;
+        }
+        b = 0;
+        while b < 8 {
+            p[base + 8 + b] = (ptr_kind & 255) as u8;
+            ptr_kind = ptr_kind >> 8;
+            b = b + 1;
+        }
+        pi = pi + 1;
+    }
+
+    let total_len: u64 = 16 + ((param_cnt as u64) * 16);
+    return blake3_hash64(p, total_len);
 }
 
 // -------------------------------------------------------------------------
@@ -2574,36 +2661,50 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
             let ext_name_hash: u64 = parser.cur_tok.hash;
             parser_expect(&mut parser, 1);  // ident
             parser_expect(&mut parser, 60); // (
+            let mut param_types_buf: [u64; 8];
+            let mut param_ptrs_buf: [u64; 8];
+            let p_types: *mut u64 = &mut param_types_buf[0];
+            let p_ptrs: *mut u64 = &mut param_ptrs_buf[0];
             let mut param_cnt: u32 = 0;
             while parser.cur_tok.kind != 61 && parser.cur_tok.kind != 0 {
                 parser_expect(&mut parser, 1);  // param name
                 parser_expect(&mut parser, 70); // :
-                if parser.cur_tok.kind == 50 { parser_expect(&mut parser, 50); } // &
-                if parser.cur_tok.kind == 13 { parser_expect(&mut parser, 13); } // mut
-                if parser.cur_tok.kind == 32 { parser_expect(&mut parser, 32); } // *
-                if parser.cur_tok.kind == 13 { parser_expect(&mut parser, 13); } // mut
+                let mut is_ptr: u32 = 0;
+                if parser.cur_tok.kind == 50 { parser_expect(&mut parser, 50); is_ptr = 1; } // &
+                if parser.cur_tok.kind == 13 { parser_expect(&mut parser, 13); is_ptr = 2; } // mut
+                if parser.cur_tok.kind == 32 { parser_expect(&mut parser, 32); is_ptr = 1; } // *
+                if parser.cur_tok.kind == 13 { parser_expect(&mut parser, 13); is_ptr = 2; } // mut
+                let p_type_hash: u64 = parser.cur_tok.hash;
                 lex_next_token(parser.lex, &mut parser.cur_tok); // type
+                if param_cnt < 8 {
+                    p_types[param_cnt as u64] = p_type_hash;
+                    p_ptrs[param_cnt as u64] = is_ptr as u64;
+                }
                 param_cnt = param_cnt + 1;
                 if parser.cur_tok.kind == 72 { parser_expect(&mut parser, 72); } // ,
             }
             parser_expect(&mut parser, 61); // )
+            let mut ret_type_hash: u64 = 3563412735833858527; // "void"
             if parser.cur_tok.kind == 74 { // ->
                 parser_expect(&mut parser, 74);
+                ret_type_hash = parser.cur_tok.hash;
                 lex_next_token(parser.lex, &mut parser.cur_tok);
             }
             if parser.cur_tok.kind == 71 { // ;
                 parser_expect(&mut parser, 71);
             }
 
+            let ext_sig_hash: u64 = compute_canonical_sig_hash(param_cnt, ret_type_hash, p_types as *u64, p_ptrs as *u64);
+
             // Register SymbolContract (EIA_SYM_FLAG_IMPORT = 2)
             let sc: *mut SymbolContract = ((cg.contracts as *mut u8) + ((cg.contract_count as u64) * 48)) as *mut SymbolContract;
             sc.symbol_hash = ext_name_hash;
-            sc.type_sig_hash = ext_name_hash;
+            sc.type_sig_hash = ext_sig_hash;
             sc.vaddr = 0;
             sc.code_size = 0;
             sc.flags = 2; // EIA_SYM_FLAG_IMPORT
             sc.param_conv = param_cnt;
-            sc.contract_digest = ext_name_hash;
+            sc.contract_digest = ext_sig_hash;
             cg.contract_count = cg.contract_count + 1;
         } else {
             lex_next_token(parser.lex, &mut parser.cur_tok);

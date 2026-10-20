@@ -232,7 +232,42 @@ typedef struct {
 #define EIA_TARGET_BAREMETAL 3
 #define EIA_TARGET_UEFI      4
 #define EIA_TARGET_UNIVERSAL 5
+#define EIA_TARGET_PE        6
+#define EIA_TARGET_MACHO     7
 #define MULTIBOOT_HEADER_MAGIC 0x1BADB002
+
+/* EIA Universal Package ('UEIA') Format */
+#define EIA_UNIVERSAL_MAGIC   0x41494555U /* 'UEIA' */
+#define EIA_UNIVERSAL_VERSION 2U
+#define EIA_MAX_SLICES        8
+
+typedef struct {
+    uint32_t arch_id;          /* 0=x86_64, 1=arm64, 2=riscv64 */
+    uint32_t abi_id;           /* 0=SysV, 1=Win64, 2=EIA, 3=AAPCS, 4=LP64D */
+    uint64_t slice_offset;     /* Offset from start of file */
+    uint64_t slice_size;       /* Size of slice in bytes */
+    uint64_t text_offset;      /* Offset of .text in slice */
+    uint64_t text_size;        /* Size of .text in slice */
+    uint64_t entry_point;      /* Virtual entry point */
+    uint64_t holo_offset;      /* Architecture-specific Universal Hologram offset */
+    uint64_t holo_size;        /* Hologram size */
+    uint8_t  slice_blake3[32]; /* 256-bit BLAKE3 digest of slice */
+} __attribute__((packed)) EiaUniversalSliceHeader;
+
+_Static_assert(sizeof(EiaUniversalSliceHeader) == 96, "EiaUniversalSliceHeader must be exactly 96 bytes");
+
+typedef struct {
+    uint32_t magic;            /* 0x41494555 ('UEIA') */
+    uint16_t version_major;    /* 2 */
+    uint16_t version_minor;    /* 0 */
+    uint32_t flags;            /* Bit 0: Valid, Bit 1: Signed */
+    uint32_t slice_count;      /* Number of architecture slices */
+    uint64_t total_size;       /* Total container file size */
+    uint64_t header_blake3;    /* BLAKE3 hash of header + slice table */
+    uint8_t  reserved[32];     /* 128-bit alignment padding */
+} __attribute__((packed)) EiaUniversalHeader;
+
+_Static_assert(sizeof(EiaUniversalHeader) == 64, "EiaUniversalHeader must be exactly 64 bytes");
 
 /* GDAM Runtime API */
 void gdam_init(ConcurrentGdamState *gdam, GdamGeneration *init_gen);

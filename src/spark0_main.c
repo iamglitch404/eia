@@ -81,7 +81,10 @@ int main(int argc, char **argv) {
                 target_arch = 4;
             } else if (strcmp(t, "universal") == 0 || strcmp(t, "multiarch") == 0) {
                 target_arch = 5;
-                is_upbp = 1;
+            } else if (strcmp(t, "pe") == 0 || strcmp(t, "windows") == 0 || strcmp(t, "win64") == 0) {
+                target_arch = 6;
+            } else if (strcmp(t, "macho") == 0 || strcmp(t, "macos") == 0 || strcmp(t, "darwin") == 0) {
+                target_arch = 7;
             } else {
                 fprintf(stderr, "Error: unsupported target architecture '%s'\n", t);
                 return 1;
@@ -101,7 +104,10 @@ int main(int argc, char **argv) {
                     target_arch = 4;
                 } else if (strcmp(t, "universal") == 0 || strcmp(t, "multiarch") == 0) {
                     target_arch = 5;
-                    is_upbp = 1;
+                } else if (strcmp(t, "pe") == 0 || strcmp(t, "windows") == 0 || strcmp(t, "win64") == 0) {
+                    target_arch = 6;
+                } else if (strcmp(t, "macho") == 0 || strcmp(t, "macos") == 0 || strcmp(t, "darwin") == 0) {
+                    target_arch = 7;
                 } else {
                     fprintf(stderr, "Error: unsupported target architecture '%s'\n", t);
                     return 1;

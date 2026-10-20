@@ -453,15 +453,212 @@ static uint8_t *spark0_create_elf_buf(const CompiledUnit *unit, size_t *out_size
     return file_buf;
 }
 
+static uint8_t *spark0_create_pe_buf(const CompiledUnit *unit, size_t *out_size, int is_uefi) {
+    uint32_t align = 0x1000; /* 4KB page alignment */
+    uint32_t text_aligned = (unit->text_size + align - 1) & ~(align - 1);
+    if (text_aligned == 0) text_aligned = align;
+    uint32_t rodata_aligned = (unit->rodata_size + align - 1) & ~(align - 1);
+
+    uint32_t headers_size = 0x1000;
+    uint32_t text_offset = headers_size;
+    uint32_t rodata_offset = text_offset + text_aligned;
+    uint32_t total_file_size = rodata_offset + rodata_aligned;
+
+    uint8_t *file_buf = (uint8_t *)calloc(total_file_size, 1);
+    if (!file_buf) return NULL;
+
+    /* 1. DOS MZ Header (64 bytes) */
+    file_buf[0] = 'M'; file_buf[1] = 'Z';
+    file_buf[2] = 0x90; file_buf[3] = 0x00;
+    file_buf[4] = 0x03; file_buf[5] = 0x00;
+    file_buf[8] = 0x04; file_buf[9] = 0x00;
+    file_buf[12] = 0xFF; file_buf[13] = 0xFF;
+    file_buf[16] = 0xB8; file_buf[17] = 0x00;
+    file_buf[24] = 0x40; file_buf[25] = 0x00;
+    /* e_lfanew at offset 0x3C points to 0x80 */
+    file_buf[0x3C] = 0x80;
+
+    /* DOS Stub */
+    const char dos_msg[] = "This program cannot be run in DOS mode.\r\r\n$";
+    memcpy(file_buf + 0x40, dos_msg, sizeof(dos_msg) - 1);
+
+    /* 2. PE Signature at 0x80 */
+    uint64_t pe_base = 0x80;
+    memcpy(file_buf + pe_base, "PE\0\0", 4);
+
+    /* 3. COFF File Header at 0x84 (20 bytes) */
+    uint64_t coff_base = pe_base + 4;
+    file_buf[coff_base + 0] = 0x64; file_buf[coff_base + 1] = 0x86; /* Machine = 0x8664 (AMD64) */
+    file_buf[coff_base + 2] = 2;    file_buf[coff_base + 3] = 0;    /* NumberOfSections = 2 */
+    file_buf[coff_base + 16] = 240; file_buf[coff_base + 17] = 0;   /* SizeOfOptionalHeader = 240 */
+    uint16_t pe_char = is_uefi ? 0x202E : 0x0022;
+    file_buf[coff_base + 18] = (uint8_t)(pe_char & 0xFF);
+    file_buf[coff_base + 19] = (uint8_t)((pe_char >> 8) & 0xFF);
+
+    /* 4. PE32+ Optional Header at 0x98 (240 bytes) */
+    uint64_t opt_base = coff_base + 20;
+    file_buf[opt_base + 0] = 0x0B; file_buf[opt_base + 1] = 0x02;   /* Magic = 0x020B (PE32+) */
+    file_buf[opt_base + 2] = 1;    file_buf[opt_base + 3] = 0;      /* Linker version 1.0 */
+    set_u32(file_buf, (opt_base + 4) / 4, text_aligned);            /* SizeOfCode */
+    set_u32(file_buf, (opt_base + 8) / 4, rodata_aligned);          /* SizeOfInitializedData */
+    set_u32(file_buf, (opt_base + 12) / 4, 0);                      /* SizeOfUninitializedData */
+    set_u32(file_buf, (opt_base + 16) / 4, text_offset);            /* AddressOfEntryPoint = 0x1000 */
+    set_u32(file_buf, (opt_base + 20) / 4, text_offset);            /* BaseOfCode = 0x1000 */
+
+    if (is_uefi) {
+        set_u32(file_buf, (opt_base + 24) / 4, 0x00400000);        /* ImageBase = 0x400000 */
+        set_u32(file_buf, (opt_base + 28) / 4, 0x00000000);
+    } else {
+        set_u32(file_buf, (opt_base + 24) / 4, 0x40000000);        /* ImageBase = 0x140000000 */
+        set_u32(file_buf, (opt_base + 28) / 4, 0x00000001);
+    }
+
+    set_u32(file_buf, (opt_base + 32) / 4, align);                  /* SectionAlignment = 0x1000 */
+    set_u32(file_buf, (opt_base + 36) / 4, align);                  /* FileAlignment = 0x1000 */
+    file_buf[opt_base + 40] = 6; file_buf[opt_base + 41] = 0;       /* MajorOperatingSystemVersion = 6 */
+    file_buf[opt_base + 48] = 6; file_buf[opt_base + 49] = 0;       /* MajorSubsystemVersion = 6 */
+    set_u32(file_buf, (opt_base + 56) / 4, total_file_size);        /* SizeOfImage */
+    set_u32(file_buf, (opt_base + 60) / 4, headers_size);           /* SizeOfHeaders = 0x1000 */
+    file_buf[opt_base + 68] = is_uefi ? 10 : 3;                     /* Subsystem: 10=EFI, 3=CUI */
+    file_buf[opt_base + 69] = 0;
+    if (!is_uefi) {
+        file_buf[opt_base + 70] = 0x60; file_buf[opt_base + 71] = 0x81; /* DllCharacteristics = 0x8160 */
+    }
+    set_u32(file_buf, (opt_base + 72) / 4, 0x200000);               /* SizeOfStackReserve = 2MB */
+    set_u32(file_buf, (opt_base + 80) / 4, 0x1000);                 /* SizeOfStackCommit = 4KB */
+    set_u32(file_buf, (opt_base + 88) / 4, 0x100000);               /* SizeOfHeapReserve = 1MB */
+    set_u32(file_buf, (opt_base + 96) / 4, 0x1000);                 /* SizeOfHeapCommit = 4KB */
+    set_u32(file_buf, (opt_base + 108) / 4, 16);                    /* NumberOfRvaAndSizes = 16 */
+
+    /* 5. Section Table at opt_base + 240 = 0x188 */
+    uint64_t sec_base = opt_base + 240;
+
+    /* Section 1: .text */
+    memcpy(file_buf + sec_base, ".text\0\0\0", 8);
+    set_u32(file_buf, (sec_base + 8) / 4, (uint32_t)unit->text_size); /* VirtualSize */
+    set_u32(file_buf, (sec_base + 12) / 4, text_offset);             /* VirtualAddress */
+    set_u32(file_buf, (sec_base + 16) / 4, text_aligned);            /* SizeOfRawData */
+    set_u32(file_buf, (sec_base + 20) / 4, text_offset);             /* PointerToRawData */
+    set_u32(file_buf, (sec_base + 36) / 4, 0x60000020);              /* CNT_CODE | MEM_EXECUTE | MEM_READ */
+
+    /* Section 2: .rdata */
+    uint64_t rdata_sec = sec_base + 40;
+    memcpy(file_buf + rdata_sec, ".rdata\0\0", 8);
+    set_u32(file_buf, (rdata_sec + 8) / 4, (uint32_t)unit->rodata_size); /* VirtualSize */
+    set_u32(file_buf, (rdata_sec + 12) / 4, rodata_offset);             /* VirtualAddress */
+    set_u32(file_buf, (rdata_sec + 16) / 4, rodata_aligned);            /* SizeOfRawData */
+    set_u32(file_buf, (rdata_sec + 20) / 4, rodata_offset);             /* PointerToRawData */
+    set_u32(file_buf, (rdata_sec + 36) / 4, 0x40000040);              /* CNT_INITIALIZED_DATA | MEM_READ */
+
+    /* Copy payload data */
+    if (unit->text_size > 0 && unit->text_buf) {
+        memcpy(file_buf + text_offset, unit->text_buf, unit->text_size);
+    }
+    if (unit->rodata_size > 0 && unit->rodata_buf) {
+        memcpy(file_buf + rodata_offset, unit->rodata_buf, unit->rodata_size);
+    }
+
+    if (out_size) *out_size = total_file_size;
+    return file_buf;
+}
+
+static uint8_t *spark0_create_macho_buf(const CompiledUnit *unit, size_t *out_size) {
+    uint32_t align = 0x1000;
+    uint32_t text_aligned = (unit->text_size + align - 1) & ~(align - 1);
+    if (text_aligned == 0) text_aligned = align;
+    uint32_t rodata_aligned = (unit->rodata_size + align - 1) & ~(align - 1);
+
+    uint32_t headers_size = 0x1000;
+    uint32_t text_offset = headers_size;
+    uint32_t rodata_offset = text_offset + text_aligned;
+    uint32_t total_file_size = rodata_offset + rodata_aligned;
+
+    uint8_t *file_buf = (uint8_t *)calloc(total_file_size, 1);
+    if (!file_buf) return NULL;
+
+    /* Mach-O 64-bit Header (32 bytes) */
+    set_u32(file_buf, 0, 0xFEEDFACF); /* MH_MAGIC_64 */
+    set_u32(file_buf, 1, 0x01000007); /* CPU_TYPE_X86_64 */
+    set_u32(file_buf, 2, 0x80000003); /* CPU_SUBTYPE_LIB64 | CPU_SUBTYPE_X86_64_ALL */
+    set_u32(file_buf, 3, 2);          /* MH_EXECUTE */
+    set_u32(file_buf, 4, 3);          /* ncmds = 3 */
+    set_u32(file_buf, 5, 72 + 152 + 24); /* sizeofcmds = 248 */
+    set_u32(file_buf, 6, 0x00200085); /* flags: MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE */
+    set_u32(file_buf, 7, 0);          /* reserved */
+
+    /* Command 1: LC_SEGMENT_64 for __PAGEZERO (72 bytes) at offset 32 */
+    uint64_t cmd1 = 32;
+    set_u32(file_buf, (cmd1 + 0) / 4, 0x19); /* LC_SEGMENT_64 */
+    set_u32(file_buf, (cmd1 + 4) / 4, 72);   /* cmdsize */
+    memcpy(file_buf + cmd1 + 8, "__PAGEZERO", 10);
+    set_u32(file_buf, (cmd1 + 24) / 4, 0x00000000);
+    set_u32(file_buf, (cmd1 + 28) / 4, 0x00000001); /* vmsize = 4GB (0x100000000) */
+
+    /* Command 2: LC_SEGMENT_64 for __TEXT (152 bytes) at offset 104 */
+    uint64_t cmd2 = cmd1 + 72;
+    set_u32(file_buf, (cmd2 + 0) / 4, 0x19);  /* LC_SEGMENT_64 */
+    set_u32(file_buf, (cmd2 + 4) / 4, 152);  /* cmdsize = 72 + 80 */
+    memcpy(file_buf + cmd2 + 8, "__TEXT", 6);
+    set_u32(file_buf, (cmd2 + 24) / 4, 0x00000000);
+    set_u32(file_buf, (cmd2 + 28) / 4, 0x00000001); /* vmaddr = 0x100000000 */
+    set_u32(file_buf, (cmd2 + 32) / 4, total_file_size); /* vmsize */
+    set_u32(file_buf, (cmd2 + 40) / 4, 0);               /* fileoff */
+    set_u32(file_buf, (cmd2 + 48) / 4, total_file_size); /* filesize */
+    set_u32(file_buf, (cmd2 + 56) / 4, 7); /* maxprot = VM_PROT_ALL */
+    set_u32(file_buf, (cmd2 + 60) / 4, 5); /* initprot = VM_PROT_READ | VM_PROT_EXECUTE */
+    set_u32(file_buf, (cmd2 + 64) / 4, 1); /* nsects = 1 */
+    set_u32(file_buf, (cmd2 + 68) / 4, 0); /* flags = 0 */
+
+    /* Section 1 inside __TEXT: __text (80 bytes) at cmd2 + 72 */
+    uint64_t sect = cmd2 + 72;
+    memcpy(file_buf + sect + 0, "__text", 6);
+    memcpy(file_buf + sect + 16, "__TEXT", 6);
+    set_u32(file_buf, (sect + 32) / 4, text_offset); /* addr = 0x100001000 */
+    set_u32(file_buf, (sect + 36) / 4, 0x00000001);
+    set_u32(file_buf, (sect + 40) / 4, (uint32_t)unit->text_size); /* size */
+    set_u32(file_buf, (sect + 48) / 4, text_offset);               /* offset */
+    set_u32(file_buf, (sect + 52) / 4, 4);                         /* align = 2^4 = 16 */
+    set_u32(file_buf, (sect + 56) / 4, 0);                         /* reloff */
+    set_u32(file_buf, (sect + 60) / 4, 0);                         /* nreloc */
+    set_u32(file_buf, (sect + 64) / 4, 0x80000400);                 /* flags: S_ATTR_SOME_INSTRUCTIONS | S_ATTR_PURE_INSTRUCTIONS */
+
+    /* Command 3: LC_MAIN (24 bytes) at offset 256 */
+    uint64_t cmd3 = cmd2 + 152;
+    set_u32(file_buf, (cmd3 + 0) / 4, 0x80000028); /* LC_MAIN */
+    set_u32(file_buf, (cmd3 + 4) / 4, 24);         /* cmdsize */
+    set_u32(file_buf, (cmd3 + 8) / 4, text_offset); /* entryoff = 0x1000 */
+    set_u32(file_buf, (cmd3 + 12) / 4, 0);
+    set_u32(file_buf, (cmd3 + 16) / 4, 0);         /* stacksize = 0 (default) */
+    set_u32(file_buf, (cmd3 + 20) / 4, 0);
+
+    /* Copy payload */
+    if (unit->text_size > 0 && unit->text_buf) {
+        memcpy(file_buf + text_offset, unit->text_buf, unit->text_size);
+    }
+    if (unit->rodata_size > 0 && unit->rodata_buf) {
+        memcpy(file_buf + rodata_offset, unit->rodata_buf, unit->rodata_size);
+    }
+
+    if (out_size) *out_size = total_file_size;
+    return file_buf;
+}
+
 int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_upbp, int target_arch, int is_signed) {
     size_t total_file_size = 0;
-    uint8_t *file_buf = spark0_create_elf_buf(unit, &total_file_size, is_upbp, target_arch);
+    uint8_t *file_buf = NULL;
+    if (target_arch == 4 || target_arch == 6) {
+        file_buf = spark0_create_pe_buf(unit, &total_file_size, target_arch == 4);
+    } else if (target_arch == 7) {
+        file_buf = spark0_create_macho_buf(unit, &total_file_size);
+    } else {
+        file_buf = spark0_create_elf_buf(unit, &total_file_size, is_upbp, target_arch);
+    }
     if (!file_buf) return -1;
 
     uint64_t holo_offset = is_upbp ? 1152 : 0x80;
     UniversalHologramHeader *holo = (UniversalHologramHeader *)(file_buf + holo_offset);
 
-    if (is_signed) {
+    if (is_signed && (target_arch != 4 && target_arch != 6 && target_arch != 7)) {
         uint64_t contracts_offset = is_upbp ? 1248 : (holo_offset + sizeof(UniversalHologramHeader));
         uint64_t contracts_size = unit->contract_count * sizeof(SymbolContract);
         uint64_t relocs_offset = contracts_offset + contracts_size;
@@ -541,128 +738,57 @@ int spark0_write_universal_binary(const CompiledUnit *u_x86, const CompiledUnit 
         return -1;
     }
 
-    /* 1. DOS MZ Header Stub at Offset 0x000 (0x4D 0x5A) */
-    const char *tramp1 = "MZ= tail -c+641 \"$0\"|head -n7|sh -s -- \"$0\" \"$@\";exit $?   \n";
-    memcpy(file_buf, tramp1, 60);
-    file_buf[60] = 0x40; file_buf[61] = 0x01; /* e_lfanew = 0x140 */
+    /* 1. Versioned EIA Universal Header at Offset 0 (64 bytes) */
+    EiaUniversalHeader *uhdr = (EiaUniversalHeader *)file_buf;
+    uhdr->magic = EIA_UNIVERSAL_MAGIC; /* 0x41494555 ('UEIA') */
+    uhdr->version_major = EIA_UNIVERSAL_VERSION; /* 2 */
+    uhdr->version_minor = 0;
+    uhdr->flags = 1 | (is_signed ? 2 : 0);
+    uhdr->slice_count = 3;
+    uhdr->total_size = total_size;
 
-    /* 2. Multi-ISA Shell Trampoline at Offset 0x040 (64) */
-    memcpy(file_buf + 64, "#!/bin/sh\n", 10);
-    memset(file_buf + 74, ' ', 8);
-    memcpy(file_buf + 82, "tail -c+641 \"$0\"|head -n7|sh;    ", 33);
-    memcpy(file_buf + 115, "exec true   \n", 13);
+    /* 2. Slice Headers at Offset 64 (3 * 96 = 288 bytes) */
+    EiaUniversalSliceHeader *slices = (EiaUniversalSliceHeader *)(file_buf + sizeof(EiaUniversalHeader));
 
-    /* Embed Multi-Architecture shell dispatcher at offset 640 */
-    const char *multi_tramp =
-        "f=\"$1\"; [ $# -gt 0 ] && shift\n"
-        "case `uname -m` in\n"
-        "  aarch64*|arm64*) o=327680;;\n"
-        "  riscv64*)        o=589824;;\n"
-        "  *)               o=65536;;\n"
-        "esac\n"
-        "tail -c+$((o+1)) \"$f\"|head -c262144>z;chmod +x z;./z \"$@\";c=$?;rm -f z;exit $c\n";
-    memcpy(file_buf + 640, multi_tramp, strlen(multi_tramp));
+    /* Slice 0: x86_64 */
+    slices[0].arch_id = 0;
+    slices[0].abi_id = 0; /* SysV */
+    slices[0].slice_offset = 0x10000;
+    slices[0].slice_size = sz_x86;
+    slices[0].text_offset = 0x10000;
+    slices[0].text_size = u_x86->text_size;
+    slices[0].entry_point = u_x86->entry_vaddr;
+    slices[0].holo_offset = 0x10000 + 0x80;
+    slices[0].holo_size = sizeof(UniversalHologramHeader);
+    blake3_hash256(buf_x86, sz_x86, slices[0].slice_blake3);
 
-    /* 3. ELF64 Header at offset 128 */
-    uint64_t elf_base = 128;
-    Elf64Header *ehdr = (Elf64Header *)(file_buf + elf_base);
-    memcpy(ehdr->e_ident, "\x7f\x45\x4c\x46\x02\x01\x01\0\0\0\0\0\0\0\0\0", 16);
-    ehdr->e_type = 2; /* ET_EXEC */
-    ehdr->e_machine = 0x3E; /* EM_X86_64 */
-    ehdr->e_version = 1;
-    ehdr->e_entry = 0x410000;
-    ehdr->e_phoff = 64;
-    ehdr->e_ehsize = sizeof(Elf64Header);
-    ehdr->e_phentsize = sizeof(Elf64ProgramHeader);
-    ehdr->e_phnum = 1;
+    /* Slice 1: arm64 */
+    slices[1].arch_id = 1;
+    slices[1].abi_id = 3; /* AAPCS */
+    slices[1].slice_offset = 0x50000;
+    slices[1].slice_size = sz_arm;
+    slices[1].text_offset = 0x10000;
+    slices[1].text_size = u_arm->text_size;
+    slices[1].entry_point = u_arm->entry_vaddr;
+    slices[1].holo_offset = 0x50000 + 0x80;
+    slices[1].holo_size = sizeof(UniversalHologramHeader);
+    blake3_hash256(buf_arm, sz_arm, slices[1].slice_blake3);
 
-    Elf64ProgramHeader *phdr = (Elf64ProgramHeader *)(file_buf + elf_base + 64);
-    phdr->p_type = 1; /* PT_LOAD */
-    phdr->p_flags = 5; /* PF_R | PF_X */
-    phdr->p_offset = 0;
-    phdr->p_vaddr = 0x400000;
-    phdr->p_paddr = 0x400000;
-    phdr->p_filesz = total_size;
-    phdr->p_memsz = total_size + 0x100000;
-    phdr->p_align = 0x1000;
+    /* Slice 2: riscv64 */
+    slices[2].arch_id = 2;
+    slices[2].abi_id = 4; /* LP64D */
+    slices[2].slice_offset = 0x90000;
+    slices[2].slice_size = sz_riscv;
+    slices[2].text_offset = 0x10000;
+    slices[2].text_size = u_riscv->text_size;
+    slices[2].entry_point = u_riscv->entry_vaddr;
+    slices[2].holo_offset = 0x90000 + 0x80;
+    slices[2].holo_size = sizeof(UniversalHologramHeader);
+    blake3_hash256(buf_riscv, sz_riscv, slices[2].slice_blake3);
 
-    /* 4. PE/COFF Headers at offset 320 */
-    uint64_t pe_base = 320;
-    memcpy(file_buf + pe_base, "PE\0\0", 4);
-    file_buf[pe_base + 4] = 0x64; file_buf[pe_base + 5] = 0x86; /* AMD64 */
-    file_buf[pe_base + 6] = 1;
-    file_buf[pe_base + 20] = 240;
-    file_buf[pe_base + 22] = 0x22;
+    uhdr->header_blake3 = blake3_hash64(file_buf, sizeof(EiaUniversalHeader) + 3 * sizeof(EiaUniversalSliceHeader));
 
-    uint64_t opt_base = pe_base + 24;
-    file_buf[opt_base + 0] = 0x0B; file_buf[opt_base + 1] = 0x02; /* PE32+ */
-    file_buf[opt_base + 2] = 1;
-    file_buf[opt_base + 16] = 0; file_buf[opt_base + 17] = 0; file_buf[opt_base + 18] = 1;
-    file_buf[opt_base + 20] = 0; file_buf[opt_base + 21] = 0; file_buf[opt_base + 22] = 1;
-    file_buf[opt_base + 27] = 0x40; file_buf[opt_base + 28] = 1;
-    file_buf[opt_base + 32] = 0; file_buf[opt_base + 33] = 0x10;
-    file_buf[opt_base + 36] = 0; file_buf[opt_base + 37] = 0x10;
-    set_u32(file_buf, (opt_base + 56) / 4, (uint32_t)total_size);
-    set_u32(file_buf, (opt_base + 60) / 4, 0x1000);
-    file_buf[opt_base + 68] = 3;
-    set_u32(file_buf, (opt_base + 72) / 4, 0x200000);
-    set_u32(file_buf, (opt_base + 88) / 4, 0x100000);
-    set_u32(file_buf, (opt_base + 108) / 4, 16);
-
-    /* 5. Mach-O Universal / Fat Binary Header at offset 512 */
-    uint64_t macho_base = 512;
-    file_buf[macho_base + 0] = 0xCA; file_buf[macho_base + 1] = 0xFE;
-    file_buf[macho_base + 2] = 0xBA; file_buf[macho_base + 3] = 0xBE;
-    set_u32(file_buf, (macho_base + 4) / 4, __builtin_bswap32(2));
-
-    uint64_t arch1 = macho_base + 8;
-    set_u32(file_buf, (arch1 + 0) / 4, __builtin_bswap32(0x01000007)); /* CPU_TYPE_X86_64 */
-    set_u32(file_buf, (arch1 + 4) / 4, __builtin_bswap32(3));
-    set_u32(file_buf, (arch1 + 8) / 4, __builtin_bswap32(0x10000));
-    set_u32(file_buf, (arch1 + 12) / 4, __builtin_bswap32((uint32_t)sz_x86));
-    set_u32(file_buf, (arch1 + 16) / 4, __builtin_bswap32(14));
-
-    uint64_t arch2 = arch1 + 20;
-    set_u32(file_buf, (arch2 + 0) / 4, __builtin_bswap32(0x0100000C)); /* CPU_TYPE_ARM64 */
-    set_u32(file_buf, (arch2 + 4) / 4, __builtin_bswap32(0));
-    set_u32(file_buf, (arch2 + 8) / 4, __builtin_bswap32(0x50000));
-    set_u32(file_buf, (arch2 + 12) / 4, __builtin_bswap32((uint32_t)sz_arm));
-    set_u32(file_buf, (arch2 + 16) / 4, __builtin_bswap32(14));
-
-    /* 6. Universal Hologram Header at 1152 */
-    uint64_t holo_offset = 1152;
-    uint64_t contracts_offset = 1248;
-    uint64_t contracts_size = u_x86->contract_count * sizeof(SymbolContract);
-    uint64_t relocs_offset = contracts_offset + contracts_size;
-    uint64_t relocs_size = u_x86->reloc_count * sizeof(EiaRelocHole);
-    uint64_t type_graph_offset = relocs_offset + relocs_size;
-    uint64_t type_graph_size = u_x86->type_graph_count * sizeof(EiaTypeGraphEntry);
-
-    UniversalHologramHeader *holo = (UniversalHologramHeader *)(file_buf + holo_offset);
-    holo->magic = EIA_MAGIC_HOLO;
-    holo->version_major = EIA_VERSION_MAJOR;
-    holo->version_minor = EIA_VERSION_MINOR;
-    holo->abi_epoch = 1;
-    holo->contracts_offset = contracts_offset;
-    holo->contracts_count = u_x86->contract_count;
-    holo->relocs_offset = relocs_offset;
-    holo->relocs_count = u_x86->reloc_count;
-    holo->type_graph_offset = type_graph_offset;
-    holo->type_graph_size = type_graph_size;
-    holo->flags = 1 | 4; /* bit 0: valid hologram, bit 2: Multi-ISA Universal Payload */
-
-    if (u_x86->contract_count > 0 && u_x86->contracts) {
-        memcpy(file_buf + contracts_offset, u_x86->contracts, contracts_size);
-    }
-    if (u_x86->reloc_count > 0 && u_x86->relocs) {
-        memcpy(file_buf + relocs_offset, u_x86->relocs, relocs_size);
-    }
-    if (u_x86->type_graph_count > 0 && u_x86->type_graph) {
-        memcpy(file_buf + type_graph_offset, u_x86->type_graph, type_graph_size);
-    }
-    holo->blake3_root = blake3_hash64(file_buf + contracts_offset, contracts_size + relocs_size + type_graph_size);
-
-    /* 7. Copy individual ISA slices into multi-ISA container */
+    /* 3. Copy individual ISA slices into multi-ISA container */
     memcpy(file_buf + 0x10000, buf_x86, sz_x86);
     memcpy(file_buf + 0x50000, buf_arm, sz_arm);
     memcpy(file_buf + 0x90000, buf_riscv, sz_riscv);
@@ -671,10 +797,9 @@ int spark0_write_universal_binary(const CompiledUnit *u_x86, const CompiledUnit 
     free(buf_arm);
     free(buf_riscv);
 
-    /* 8. Cryptographic whole-artifact signing if requested */
+    /* 4. Cryptographic whole-artifact signing if requested */
     if (is_signed) {
-        uint64_t auth_offset = type_graph_offset + type_graph_size;
-        uint64_t auth_size = sizeof(EiaSignatureRecord);
+        uint64_t auth_offset = sizeof(EiaUniversalHeader) + 3 * sizeof(EiaUniversalSliceHeader);
         EiaSignatureRecord sig_rec;
         memset(&sig_rec, 0, sizeof(sig_rec));
         sig_rec.magic = EIA_AUTH_MAGIC;
@@ -682,11 +807,6 @@ int spark0_write_universal_binary(const CompiledUnit *u_x86, const CompiledUnit 
         uint16_t signing_epoch = 0;
         sig_rec.public_key_id = eia_get_active_signing_key_id(&signing_epoch, NULL);
         sig_rec.key_epoch = signing_epoch;
-
-        memcpy(file_buf + auth_offset, &sig_rec, sizeof(sig_rec));
-        memcpy(&holo->reserved[0], &auth_offset, 8);
-        memcpy(&holo->reserved[8], &auth_size, 8);
-        holo->flags |= 2;
 
         blake3_hash256(file_buf, total_size, sig_rec.blake3_digest);
         if (spark0_sign_digest(sig_rec.blake3_digest, sig_rec.key_epoch, sig_rec.signature) != 0) {

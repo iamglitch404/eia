@@ -5,6 +5,7 @@
  * Enforces Reynolds' Relational Parametricity and zero-downtime hot migration.
  */
 
+#define _DEFAULT_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -278,6 +279,7 @@ int main(void) {
     assert(eia_gdam_unregister_object(&app_gdam, &app_account_array) == 0);
     assert(eia_gdam_unregister_thread(&app_gdam, worker_tid1) == 0);
     assert(eia_gdam_unregister_thread(&app_gdam, worker_tid2) == 0);
+    gdam_reclaim_retired(&app_gdam);
     free(app_single_account);
     free(app_account_array);
 

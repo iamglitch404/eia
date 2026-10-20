@@ -317,17 +317,17 @@ static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
         emit8(u, 0x48); emit8(u, 0x83); emit8(u, 0xec); emit8(u, 0x30); /* sub rsp, 48 (shadow space) */
         emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xd3);         /* mov rbx, rdx (save SystemTable) */
 
-        /* ConOut->OutputString call */
+        /* ConOut->OutputString call: prints L"[EIA_EFI_OK]\r\n" */
         emit8(u, 0x48); emit8(u, 0x85); emit8(u, 0xdb);         /* test rbx, rbx */
-        emit8(u, 0x74); emit8(u, 0x24);                         /* jz .Lno_conout (+36 bytes) */
+        emit8(u, 0x74); emit8(u, 0x30);                         /* jz .Lno_conout (+48 bytes) */
         emit8(u, 0x48); emit8(u, 0x8b); emit8(u, 0x4b); emit8(u, 0x40); /* mov rcx, [rbx + 0x40] (ConOut) */
         emit8(u, 0x48); emit8(u, 0x85); emit8(u, 0xc9);         /* test rcx, rcx */
-        emit8(u, 0x74); emit8(u, 0x1c);                         /* jz .Lno_conout (+28 bytes) */
+        emit8(u, 0x74); emit8(u, 0x28);                         /* jz .Lno_conout (+40 bytes) */
         emit8(u, 0x48); emit8(u, 0x8d); emit8(u, 0x15); emit32_le(u, 10); /* lea rdx, [rip + 10] */
-        emit8(u, 0xeb); emit8(u, 0x08);                         /* jmp +8 over UTF-16 data */
-        /* UTF-16LE 'E', 'I', 'A', '\0' = 8 bytes */
-        emit8(u, 'E'); emit8(u, 0); emit8(u, 'I'); emit8(u, 0);
-        emit8(u, 'A'); emit8(u, 0); emit8(u, 0);   emit8(u, 0);
+        emit8(u, 0xeb); emit8(u, 0x1e);                         /* jmp +30 over UTF-16 data */
+        /* UTF-16LE L"[EIA_EFI_OK]\r\n\0" (30 bytes) */
+        const uint16_t efi_str[] = { '[', 'E', 'I', 'A', '_', 'E', 'F', 'I', '_', 'O', 'K', ']', '\r', '\n', '\0' };
+        for (size_t mi = 0; mi < sizeof(efi_str); ++mi) emit8(u, ((const uint8_t *)efi_str)[mi]);
         emit8(u, 0xff); emit8(u, 0x51); emit8(u, 0x08);         /* call [rcx + 8] (OutputString) */
         /* .Lno_conout: */
 
@@ -341,6 +341,31 @@ static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
         emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xec);         /* mov rsp, rbp */
         emit8(u, 0x5d);                                         /* pop rbp */
         emit8(u, 0xc3);                                         /* ret */
+        return;
+    }
+    if (u->target_arch == 6) {
+        /* Windows x86_64 PE mainCRTStartup: */
+        emit8(u, 0x55);                                          /* push rbp */
+        emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xe5);         /* mov rbp, rsp */
+        emit8(u, 0x48); emit8(u, 0x83); emit8(u, 0xec); emit8(u, 0x20); /* sub rsp, 32 */
+        emit8(u, 0xe8);
+        if (call_main_hole_out) *call_main_hole_out = u->text_size;
+        emit32_le(u, 0);                                         /* call main() */
+        emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xec);         /* mov rsp, rbp */
+        emit8(u, 0x5d);                                         /* pop rbp */
+        emit8(u, 0xc3);                                         /* ret */
+        return;
+    }
+    if (u->target_arch == 7) {
+        /* macOS x86_64 Mach-O entrypoint: */
+        emit8(u, 0x55);                                          /* push rbp */
+        emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xe5);         /* mov rbp, rsp */
+        emit8(u, 0xe8);
+        if (call_main_hole_out) *call_main_hole_out = u->text_size;
+        emit32_le(u, 0);                                         /* call main() */
+        emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xc7);         /* mov rdi, rax */
+        emit8(u, 0x48); emit8(u, 0xc7); emit8(u, 0xc0); emit32_le(u, 0x2000001); /* mov rax, 0x2000001 (sys_exit) */
+        emit8(u, 0x0f); emit8(u, 0x05);                         /* syscall */
         return;
     }
 
@@ -2062,7 +2087,7 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
     uint32_t call_main_hole = 0;
     emit_start_stub(u, &call_main_hole);
     u->start_stub_size = u->text_size;
-    u->entry_vaddr = (u->target_arch == 3) ? 0x101000 : 0x410000;
+    u->entry_vaddr = (u->target_arch == 3) ? 0x101000 : (u->target_arch == 6) ? 0x140001000ULL : (u->target_arch == 7) ? 0x100001000ULL : 0x410000;
 
     /* Global function catalog and call fixups */
     CompiledFn *compiled_fns = NULL;

@@ -35,6 +35,7 @@
 #include <sys/wait.h>
 #endif
 #include "spark0.h"
+#include "gdam.h"
 #include <stdatomic.h>
 
 /* ========================================================================= */
@@ -304,6 +305,9 @@ uint64_t eia_gdam_migrate_object_graph(ConcurrentGdamState *gdam, GdamGeneration
                         type_hash
                     );
                 }
+                if (!new_gen->record_buf) {
+                    new_gen->record_buf = new_buf;
+                }
                 __atomic_store_n(curr->object_ptr_ref, new_buf, __ATOMIC_RELEASE);
                 curr->element_size = new_elem_size;
                 gdam_retire_record(gdam, old_buf);
@@ -327,9 +331,60 @@ uint64_t eia_gdam_migrate_object_graph(ConcurrentGdamState *gdam, GdamGeneration
 #endif
         }
     }
-
-    gdam_reclaim_retired(gdam);
     return migrated_count;
+}
+
+/* Public GDAM Runtime API (include/gdam.h) */
+int gdam_runtime_init(ConcurrentGdamState *gdam, GdamGeneration *init_gen) {
+    if (!gdam) return GDAM_ERR_INVALID_ARG;
+    gdam_init(gdam, init_gen);
+    return GDAM_SUCCESS;
+}
+
+int gdam_runtime_shutdown(ConcurrentGdamState *gdam) {
+    if (!gdam) return GDAM_ERR_INVALID_ARG;
+    gdam_reclaim_retired(gdam);
+    return GDAM_SUCCESS;
+}
+
+int gdam_thread_register(ConcurrentGdamState *gdam, uint64_t tid) {
+    return eia_gdam_register_thread(gdam, tid) == 0 ? GDAM_SUCCESS : GDAM_ERR_BUSY;
+}
+
+int gdam_thread_unregister(ConcurrentGdamState *gdam, uint64_t tid) {
+    return eia_gdam_unregister_thread(gdam, tid) == 0 ? GDAM_SUCCESS : GDAM_ERR_INVALID_ARG;
+}
+
+void gdam_safepoint_enter(ConcurrentGdamState *gdam, uint64_t tid) {
+    eia_gdam_thread_enter(gdam, tid);
+}
+
+void gdam_safepoint_leave(ConcurrentGdamState *gdam, uint64_t tid) {
+    eia_gdam_thread_leave(gdam, tid);
+}
+
+int gdam_object_register(ConcurrentGdamState *gdam, void **obj_ref, uint64_t type_hash, size_t count, size_t elem_size) {
+    return eia_gdam_register_object(gdam, obj_ref, type_hash, count, elem_size) == 0 ? GDAM_SUCCESS : GDAM_ERR_INVALID_ARG;
+}
+
+int gdam_object_unregister(ConcurrentGdamState *gdam, void **obj_ref) {
+    return eia_gdam_unregister_object(gdam, obj_ref) == 0 ? GDAM_SUCCESS : GDAM_ERR_INVALID_ARG;
+}
+
+int gdam_publish_pointer(ConcurrentGdamState *gdam, void **obj_ref, void *new_ptr) {
+    return eia_gdam_publish_object_pointer(gdam, obj_ref, new_ptr) == 0 ? GDAM_SUCCESS : GDAM_ERR_INVALID_ARG;
+}
+
+int gdam_stage_migration(ConcurrentGdamState *gdam, GdamGeneration *next_gen) {
+    return eia_gdam_stage_upgrade(gdam, next_gen) == 0 ? GDAM_SUCCESS : GDAM_ERR_INVALID_ARG;
+}
+
+uint64_t gdam_commit_migration(ConcurrentGdamState *gdam, GdamGeneration *new_gen, uint64_t type_hash) {
+    return eia_gdam_migrate_object_graph(gdam, new_gen, type_hash);
+}
+
+int gdam_abort_migration(ConcurrentGdamState *gdam) {
+    return gdam_rollback(gdam) == 0 ? GDAM_SUCCESS : GDAM_ERR_ROLLBACK;
 }
 
 /* Diagnostic error codes */
@@ -903,6 +958,86 @@ static __attribute__((unused)) LoadedBinary *load_binary(const char *path) {
         return NULL;
     }
     fclose(f);
+
+    /* Check if input is a versioned EIA Universal Package ('UEIA') */
+    if (sz >= sizeof(EiaUniversalHeader)) {
+        const EiaUniversalHeader *uhdr = (const EiaUniversalHeader *)data;
+        if (uhdr->magic == EIA_UNIVERSAL_MAGIC) {
+            if (uhdr->version_major != EIA_UNIVERSAL_VERSION) {
+                fprintf(stderr, "[EIA ERROR] '%s': Unsupported Universal Container version %u.%u (expected %u.x)\n",
+                        path, uhdr->version_major, uhdr->version_minor, EIA_UNIVERSAL_VERSION);
+                free(data);
+                return NULL;
+            }
+            if (uhdr->slice_count == 0 || uhdr->slice_count > EIA_MAX_SLICES) {
+                fprintf(stderr, "[EIA ERROR] '%s': Invalid slice count %u in Universal Container\n",
+                        path, uhdr->slice_count);
+                free(data);
+                return NULL;
+            }
+            if (uhdr->total_size > sz) {
+                fprintf(stderr, "[EIA ERROR] '%s': Universal Container total_size exceeds file bounds\n", path);
+                free(data);
+                return NULL;
+            }
+
+            uint64_t table_sz = sizeof(EiaUniversalHeader) + uhdr->slice_count * sizeof(EiaUniversalSliceHeader);
+            if (table_sz > sz) {
+                fprintf(stderr, "[EIA ERROR] '%s': Universal slice table exceeds file bounds\n", path);
+                free(data);
+                return NULL;
+            }
+
+            const EiaUniversalSliceHeader *slices = (const EiaUniversalSliceHeader *)(data + sizeof(EiaUniversalHeader));
+            uint32_t host_arch = 0;
+#if defined(__aarch64__)
+            host_arch = 1;
+#elif defined(__riscv) && (__riscv_xlen == 64)
+            host_arch = 2;
+#else
+            host_arch = 0;
+#endif
+
+            const EiaUniversalSliceHeader *selected = NULL;
+            for (uint32_t s = 0; s < uhdr->slice_count; ++s) {
+                const EiaUniversalSliceHeader *sl = &slices[s];
+                if (sl->slice_offset > sz || sl->slice_size > sz - sl->slice_offset) {
+                    fprintf(stderr, "[EIA ERROR] '%s': Universal slice %u offset/size exceeds bounds\n", path, s);
+                    free(data);
+                    return NULL;
+                }
+                for (uint32_t prev = 0; prev < s; ++prev) {
+                    const EiaUniversalSliceHeader *psl = &slices[prev];
+                    if ((sl->slice_offset < psl->slice_offset + psl->slice_size) &&
+                        (psl->slice_offset < sl->slice_offset + sl->slice_size)) {
+                        fprintf(stderr, "[EIA ERROR] '%s': Overlapping slices %u and %u in Universal Container\n",
+                                path, prev, s);
+                        free(data);
+                        return NULL;
+                    }
+                }
+                if (sl->arch_id == host_arch && !selected) {
+                    selected = sl;
+                }
+            }
+
+            if (!selected) {
+                selected = &slices[0];
+            }
+
+            size_t slice_sz = selected->slice_size;
+            uint8_t *slice_data = (uint8_t *)malloc(slice_sz);
+            if (!slice_data) {
+                free(data);
+                return NULL;
+            }
+            memcpy(slice_data, data + selected->slice_offset, slice_sz);
+            free(data);
+
+            data = slice_data;
+            sz = slice_sz;
+        }
+    }
 
     const UniversalHologramHeader *holo = find_hologram(data, sz);
     if (!holo) {

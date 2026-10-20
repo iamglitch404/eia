@@ -83,28 +83,59 @@ jobs:
           print('Multi-architecture targets (EM_AARCH64 & EM_RISCV) verified on ${{ matrix.os }}')
           "
 
-      - name: Verify Universal Multi-ISA Artifact & Polyglot Header Structure
+      - name: Verify Versioned Universal Package Container ('UEIA') and Multi-ISA Slices
         run: |
           ./bin/spark0 tests/hello_eia.rx -o bin/hello_universal --target=universal
-          exit_code=0
-          /bin/sh bin/hello_universal || exit_code=$?
-          echo "Universal multi-ISA shell execution exit code: $exit_code"
-          if [ "$exit_code" -ne 42 ]; then
-            echo "Expected exit code 42, got $exit_code"
-            exit 1
-          fi
           python3 -c "
+          import struct
           with open('bin/hello_universal', 'rb') as f:
               b = f.read()
-          assert b[0:2] in (b'MZ', b'#!'), 'Missing MZ or shebang magic'
-          assert b[60:62] == b'\x40\x01', 'Invalid e_lfanew offset to PE header'
-          assert b[320:324] == b'PE\x00\x00', 'Missing PE/COFF header'
-          assert b[512:516] == b'\xca\xfe\xba\xbe', 'Missing Mach-O Fat header'
-          assert b[1152:1156] == bytes([69, 73, 72, 68]), 'Missing Universal Hologram Header'
+          magic, vmaj, vmin, flags, slices_cnt, total_sz, hdr_blake3 = struct.unpack('<IHHI I QQ', b[:32])
+          assert magic == 0x41494555, 'Missing UEIA magic header'
+          assert vmaj == 2 and vmin == 0, 'Invalid Universal container version'
+          assert slices_cnt == 3, 'Expected 3 ISA slices'
           assert b[0x10000:0x10004] == b'\x7fELF', 'Missing x86_64 ELF slice'
           assert b[0x50000:0x50004] == b'\x7fELF', 'Missing ARM64 ELF slice'
           assert b[0x90000:0x90004] == b'\x7fELF', 'Missing RISC-V 64 ELF slice'
-          print('Universal multi-ISA binary successfully verified on ${{ matrix.os }}')
+          print('Universal multi-ISA container (UEIA v2.0) successfully verified on ${{ matrix.os }}')
+          "
+          # Direct launcher-based in-memory execution of universal package via eia-run
+          gcc -O2 -Wall -Wextra -Iinclude -o bin/eia-run src/eia_loader.c
+          u_code=0
+          ./bin/eia-run bin/hello_universal || u_code=$?
+          if [ "$u_code" -ne 42 ]; then
+            echo "Expected eia-run universal execution exit code 42, got $u_code"
+            exit 1
+          fi
+          echo "Native eia-run universal container in-memory loading PASSED (exit code 42 verified on ${{ matrix.os }})"
+
+      - name: Verify OS-Native Formats: Windows PE32+ and macOS Mach-O 64
+        run: |
+          ./bin/spark0 tests/hello_eia.rx -o bin/hello_pe.exe --target=pe
+          ./bin/spark0 tests/hello_eia.rx -o bin/hello_macho --target=macho
+          ./bin/spark0 tests/hello_eia.rx -o bin/hello_uefi.efi --target=uefi
+          python3 -c "
+          import struct
+          with open('bin/hello_pe.exe', 'rb') as f:
+              b_pe = f.read()
+          assert b_pe[:2] == b'MZ', 'PE: Invalid DOS signature'
+          pe_off = struct.unpack('<I', b_pe[0x3C:0x40])[0]
+          assert b_pe[pe_off:pe_off+4] == b'PE\0\0', 'PE: Invalid PE signature'
+          subsystem = struct.unpack('<H', b_pe[pe_off+24+68:pe_off+24+70])[0]
+          assert subsystem == 3, 'PE: Expected CUI subsystem (3)'
+
+          with open('bin/hello_uefi.efi', 'rb') as f:
+              b_efi = f.read()
+          assert b_efi[:2] == b'MZ', 'EFI: Invalid DOS signature'
+          efi_pe_off = struct.unpack('<I', b_efi[0x3C:0x40])[0]
+          efi_subsystem = struct.unpack('<H', b_efi[efi_pe_off+24+68:efi_pe_off+24+70])[0]
+          assert efi_subsystem == 10, 'EFI: Expected EFI_APPLICATION subsystem (10)'
+
+          with open('bin/hello_macho', 'rb') as f:
+              b_mac = f.read()
+          m_magic = struct.unpack('<I', b_mac[:4])[0]
+          assert m_magic == 0xfeedfacf, 'Mach-O: Invalid MH_MAGIC_64 signature'
+          print('OS-native artifacts (PE32+, Mach-O 64, UEFI) verified on ${{ matrix.os }}')
           "
 
       - name: Stage-1 compiler subsystems cross-compilation
@@ -293,6 +324,7 @@ jobs:
           echo "EIA System V AMD64 <-> Win64 ABI Calling Convention Bridge Suite: 100% PASSED"
 
           # Bare-Metal Multiboot 1 & UEFI PE32+ Boot Verification Suite
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-system-x86 ovmf || true
           gcc -O2 -Wall -Wextra -Iinclude -o bin/test_firmware_boot tests/test_firmware_boot.c
           ./bin/test_firmware_boot
           echo "EIA Bare-Metal Multiboot 1 & UEFI Firmware Boot Verification Suite: 100% PASSED"
@@ -308,6 +340,13 @@ jobs:
           gcc -O2 -Wall -Wextra -pthread -fsanitize=address,undefined -Iinclude -DEIA_LOADER_LIB src/eia_loader.c tests/test_gdam_hot_migration.c -o bin/test_gdam_hot_migration_asan
           ./bin/test_gdam_hot_migration_asan
           echo "EIA GDAM Concurrent Live Upgrades & Hot Migration Suite: 100% PASSED"
+
+          # Production Reusable GDAM Application Runtime Lifecycle Suite (TSan & ASan)
+          gcc -O2 -Wall -Wextra -pthread -fsanitize=thread -Iinclude -DEIA_LOADER_LIB src/eia_loader.c tests/sample_gdam_app.c -o bin/sample_gdam_app_tsan
+          ./bin/sample_gdam_app_tsan
+          gcc -O2 -Wall -Wextra -pthread -fsanitize=address,undefined -Iinclude -DEIA_LOADER_LIB src/eia_loader.c tests/sample_gdam_app.c -o bin/sample_gdam_app_asan
+          ./bin/sample_gdam_app_asan
+          echo "EIA Production GDAM Reusable Application Runtime Suite: 100% PASSED"
 
       - name: Verify Multi-Architecture Emission & Semantic Execution (ARM64 and RISC-V 64 via QEMU)
         run: |

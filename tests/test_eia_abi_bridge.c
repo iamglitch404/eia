@@ -447,11 +447,27 @@ static void create_minimal_thunk_elf(const char *path, uint16_t machine, const u
     chmod(path, 0755);
 }
 
+static const char *get_qemu_arm64(void) {
+    if (access("/usr/bin/qemu-aarch64", X_OK) == 0) return "/usr/bin/qemu-aarch64";
+    if (system("command -v qemu-aarch64 >/dev/null 2>&1") == 0) return "qemu-aarch64";
+    return NULL;
+}
+
+static const char *get_qemu_riscv64(void) {
+    if (access("/usr/bin/qemu-riscv64", X_OK) == 0) return "/usr/bin/qemu-riscv64";
+    if (system("command -v qemu-riscv64 >/dev/null 2>&1") == 0) return "qemu-riscv64";
+    return NULL;
+}
+
 static void test_e2e_qemu_arm64_execution(void) {
     printf("[ABI TEST 9] Real Silicon Simulation: ARM64 Native Execution via QEMU AArch64...\n");
+    const char *qemu = get_qemu_arm64();
+    assert(qemu != NULL && "qemu-aarch64 required for ARM64 silicon simulation");
     int rc = run_cmd_exit("./bin/spark0 tests/hello_eia.rx -o /tmp/abi_arm64 --target=arm64 >/dev/null 2>&1");
     assert(rc == 0);
-    int exec_rc = run_cmd_exit("/usr/bin/qemu-aarch64 /tmp/abi_arm64 >/dev/null 2>&1");
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "%s /tmp/abi_arm64 >/dev/null 2>&1", qemu);
+    int exec_rc = run_cmd_exit(cmd);
     assert(exec_rc == 42);
     printf("  [PASS] ARM64 binary compiled with AAPCS contracts and executed in QEMU (exit 42)\n");
     unlink("/tmp/abi_arm64");
@@ -476,7 +492,8 @@ static void test_e2e_qemu_arm64_execution(void) {
         0xd65f03c0  /* ret */
     };
     create_minimal_thunk_elf("/tmp/abi_arm64_thunk", 183, arm_thunk_prog, sizeof(arm_thunk_prog)/4);
-    int thunk_rc = run_cmd_exit("/usr/bin/qemu-aarch64 /tmp/abi_arm64_thunk >/dev/null 2>&1");
+    snprintf(cmd, sizeof(cmd), "%s /tmp/abi_arm64_thunk >/dev/null 2>&1", qemu);
+    int thunk_rc = run_cmd_exit(cmd);
     assert(thunk_rc == 42 && "ARM64 AAPCS bridge thunk execution failed in QEMU");
     printf("  [PASS] Real ARM64 AAPCS Bridge Thunk Program executed in QEMU AArch64 (returned 42)!\n");
     unlink("/tmp/abi_arm64_thunk");
@@ -484,9 +501,13 @@ static void test_e2e_qemu_arm64_execution(void) {
 
 static void test_e2e_qemu_riscv64_execution(void) {
     printf("[ABI TEST 10] Real Silicon Simulation: RISC-V 64 Native Execution via QEMU RISC-V 64...\n");
+    const char *qemu = get_qemu_riscv64();
+    assert(qemu != NULL && "qemu-riscv64 required for RISC-V silicon simulation");
     int rc = run_cmd_exit("./bin/spark0 tests/hello_eia.rx -o /tmp/abi_riscv64 --target=riscv64 >/dev/null 2>&1");
     assert(rc == 0);
-    int exec_rc = run_cmd_exit("/usr/bin/qemu-riscv64 /tmp/abi_riscv64 >/dev/null 2>&1");
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "%s /tmp/abi_riscv64 >/dev/null 2>&1", qemu);
+    int exec_rc = run_cmd_exit(cmd);
     assert(exec_rc == 42);
     printf("  [PASS] RISC-V 64 binary compiled with LP64D contracts and executed in QEMU (exit 42)\n");
     unlink("/tmp/abi_riscv64");
@@ -513,7 +534,8 @@ static void test_e2e_qemu_riscv64_execution(void) {
         0x00008067  /* ret (jalr zero, 0(ra)) */
     };
     create_minimal_thunk_elf("/tmp/abi_riscv_thunk", 243, rv_thunk_prog, sizeof(rv_thunk_prog)/4);
-    int thunk_rc = run_cmd_exit("/usr/bin/qemu-riscv64 /tmp/abi_riscv_thunk >/dev/null 2>&1");
+    snprintf(cmd, sizeof(cmd), "%s /tmp/abi_riscv_thunk >/dev/null 2>&1", qemu);
+    int thunk_rc = run_cmd_exit(cmd);
     assert(thunk_rc == 42 && "RISC-V LP64D bridge thunk execution failed in QEMU");
     printf("  [PASS] Real RISC-V LP64D Bridge Thunk Program executed in QEMU RISC-V 64 (returned 42)!\n");
     unlink("/tmp/abi_riscv_thunk");

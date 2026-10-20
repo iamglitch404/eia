@@ -49,12 +49,15 @@ static bool command_available(const char *cmd) {
 
 static const char *find_ovmf_firmware(void) {
     static const char *candidates[] = {
+        "/usr/share/ovmf/OVMF.fd",
+        "/usr/share/OVMF/OVMF.fd",
         "/usr/share/ovmf/x64/OVMF.fd",
         "/usr/share/OVMF/OVMF_CODE.fd",
         "/usr/share/qemu/OVMF.fd",
         "/usr/share/edk2/x64/OVMF.fd",
         "/usr/share/edk2-ovmf/x64/OVMF.fd",
-        "/usr/share/edk2/ovmf-x64/OVMF_CODE.fd"
+        "/usr/share/edk2/ovmf-x64/OVMF_CODE.fd",
+        "/usr/share/OVMF/OVMF_CODE_4M.fd"
     };
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
         if (access(candidates[i], R_OK) == 0) {

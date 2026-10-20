@@ -188,6 +188,10 @@ static void test_live_baremetal_multiisa_runner(void) {
                 ip++;
             } else if (data[ip] == 0x48 && data[ip+1] == 0xc7 && data[ip+2] == 0xc4) {
                 ip += 7;
+            } else if (data[ip] == 0x66 && data[ip+1] == 0xba && data[ip+4] == 0x30 && data[ip+5] == 0xc0 && data[ip+6] == 0xee) {
+                ip += 7;
+            } else if (data[ip] == 0x66 && data[ip+1] == 0xba && data[ip+4] == 0xb0 && data[ip+6] == 0xee) {
+                ip += 7;
             } else if (data[ip] == 0xba && data[ip+3] == 0x30 && data[ip+4] == 0xc0 && data[ip+5] == 0xee) {
                 ip += 6;
             } else if (data[ip] == 0xba && data[ip+3] == 0xb0 && data[ip+5] == 0xee) {

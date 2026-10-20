@@ -277,13 +277,13 @@ static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
         emit8(u, 0xbc); emit32_le(u, 0x00090000);                      /* mov esp, 0x90000 */
 
         /* 16550 UART COM1 (0x3F8) */
-        emit8(u, 0xba); emit8(u, 0xf9); emit8(u, 0x03); emit8(u, 0x30); emit8(u, 0xc0); emit8(u, 0xee); /* mov dx, 0x3f9; xor al, al; out dx, al */
-        emit8(u, 0xba); emit8(u, 0xfb); emit8(u, 0x03); emit8(u, 0xb0); emit8(u, 0x80); emit8(u, 0xee); /* mov dx, 0x3fb; mov al, 0x80; out dx, al */
-        emit8(u, 0xba); emit8(u, 0xf8); emit8(u, 0x03); emit8(u, 0xb0); emit8(u, 0x03); emit8(u, 0xee); /* mov dx, 0x3f8; mov al, 0x03; out dx, al */
-        emit8(u, 0xba); emit8(u, 0xf9); emit8(u, 0x03); emit8(u, 0x30); emit8(u, 0xc0); emit8(u, 0xee); /* mov dx, 0x3f9; xor al, al; out dx, al */
-        emit8(u, 0xba); emit8(u, 0xfb); emit8(u, 0x03); emit8(u, 0xb0); emit8(u, 0x03); emit8(u, 0xee); /* mov dx, 0x3fb; mov al, 0x03; out dx, al */
-        emit8(u, 0xba); emit8(u, 0xfa); emit8(u, 0x03); emit8(u, 0xb0); emit8(u, 0xc7); emit8(u, 0xee); /* mov dx, 0x3fa; mov al, 0xc7; out dx, al */
-        emit8(u, 0xba); emit8(u, 0xfc); emit8(u, 0x03); emit8(u, 0xb0); emit8(u, 0x0b); emit8(u, 0xee); /* mov dx, 0x3fc; mov al, 0x0b; out dx, al */
+        emit8(u, 0x66); emit8(u, 0xba); emit8(u, 0xf9); emit8(u, 0x03); emit8(u, 0x30); emit8(u, 0xc0); emit8(u, 0xee); /* mov dx, 0x3f9; xor al, al; out dx, al */
+        emit8(u, 0x66); emit8(u, 0xba); emit8(u, 0xfb); emit8(u, 0x03); emit8(u, 0xb0); emit8(u, 0x80); emit8(u, 0xee); /* mov dx, 0x3fb; mov al, 0x80; out dx, al */
+        emit8(u, 0x66); emit8(u, 0xba); emit8(u, 0xf8); emit8(u, 0x03); emit8(u, 0xb0); emit8(u, 0x03); emit8(u, 0xee); /* mov dx, 0x3f8; mov al, 0x03; out dx, al */
+        emit8(u, 0x66); emit8(u, 0xba); emit8(u, 0xf9); emit8(u, 0x03); emit8(u, 0x30); emit8(u, 0xc0); emit8(u, 0xee); /* mov dx, 0x3f9; xor al, al; out dx, al */
+        emit8(u, 0x66); emit8(u, 0xba); emit8(u, 0xfb); emit8(u, 0x03); emit8(u, 0xb0); emit8(u, 0x03); emit8(u, 0xee); /* mov dx, 0x3fb; mov al, 0x03; out dx, al */
+        emit8(u, 0x66); emit8(u, 0xba); emit8(u, 0xfa); emit8(u, 0x03); emit8(u, 0xb0); emit8(u, 0xc7); emit8(u, 0xee); /* mov dx, 0x3fa; mov al, 0xc7; out dx, al */
+        emit8(u, 0x66); emit8(u, 0xba); emit8(u, 0xfc); emit8(u, 0x03); emit8(u, 0xb0); emit8(u, 0x0b); emit8(u, 0xee); /* mov dx, 0x3fc; mov al, 0x0b; out dx, al */
 
         /* VGA text buffer @ 0xB8000: write "[EIA_OK]" (attribute 0x1F) */
         emit8(u, 0x48); emit8(u, 0xc7); emit8(u, 0xc7); emit32_le(u, 0xb8000); /* mov rdi, 0xb8000 */

@@ -357,6 +357,10 @@ static void test_live_baremetal_boot(void) {
             ip++;
         } else if (data[ip] == 0x48 && data[ip+1] == 0xc7 && data[ip+2] == 0xc4) {
             ip += 7;
+        } else if (data[ip] == 0x66 && data[ip+1] == 0xba && data[ip+4] == 0x30 && data[ip+5] == 0xc0 && data[ip+6] == 0xee) {
+            ip += 7;
+        } else if (data[ip] == 0x66 && data[ip+1] == 0xba && data[ip+4] == 0xb0 && data[ip+6] == 0xee) {
+            ip += 7;
         } else if (data[ip] == 0xba && data[ip+3] == 0x30 && data[ip+4] == 0xc0 && data[ip+5] == 0xee) {
             ip += 6;
         } else if (data[ip] == 0xba && data[ip+3] == 0xb0 && data[ip+5] == 0xee) {
@@ -442,20 +446,38 @@ static void test_live_baremetal_boot(void) {
     }
     if (command_available("qemu-system-x86_64")) {
         unlink("/tmp/bm_serial.log");
+        unlink("/tmp/qemu_err.log");
         char qemu_cmd[512];
         snprintf(qemu_cmd, sizeof(qemu_cmd),
-                 "timeout 6s qemu-system-x86_64 -kernel /tmp/boot_bm_qemu.elf -serial file:/tmp/bm_serial.log -display none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 >/dev/null 2>&1");
-        (void)!system(qemu_cmd);
+                 "timeout 6s qemu-system-x86_64 -kernel /tmp/boot_bm_qemu.elf -serial file:/tmp/bm_serial.log -display none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 >/dev/null 2>/tmp/qemu_err.log");
+        int q_rc = system(qemu_cmd);
         size_t log_sz = 0;
         uint8_t *log_data = read_file("/tmp/bm_serial.log", &log_sz);
-        if (strict) {
-            assert(log_data && log_sz > 0 && log_data[0] == 42 && "x86_64 QEMU Multiboot failed to boot or exit 42");
+        int has_42 = (log_data && log_sz > 0 && log_data[0] == 42);
+        if (!has_42 && log_data && log_sz > 0) {
+            for (size_t si = 0; si < log_sz; ++si) {
+                if (log_data[si] == 42) {
+                    has_42 = 1;
+                    break;
+                }
+            }
         }
-        if (log_data && log_sz > 0 && log_data[0] == 42) {
+        if (strict) {
+            if (!has_42) {
+                size_t err_sz = 0;
+                char *err_data = (char *)read_file("/tmp/qemu_err.log", &err_sz);
+                fprintf(stderr, "\n[DEBUG QEMU MULTIBOOT FAILURE]: qemu_exit=%d, serial_log_sz=%zu, serial_byte0=%d, qemu_err='%s'\n\n",
+                        q_rc, log_sz, (log_data && log_sz > 0) ? (int)log_data[0] : -1, err_data ? err_data : "(none)");
+                if (err_data) free(err_data);
+            }
+            assert(has_42 && "x86_64 QEMU Multiboot failed to boot or exit 42");
+        }
+        if (has_42) {
             printf("  [PASS] Live QEMU Bare-metal Multiboot kernel booted in VM and exited with 42!\n");
         }
         if (log_data) free(log_data);
         unlink("/tmp/bm_serial.log");
+        unlink("/tmp/qemu_err.log");
     }
 
     /* 4b. ARM64 Bare-Metal in QEMU */

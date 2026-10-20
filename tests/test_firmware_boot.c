@@ -414,8 +414,6 @@ static void test_live_baremetal_boot(void) {
     assert(a_found != NULL);
     printf("  [PASS] Live ARM64 Bare-Metal Execution: PL011 UART MMIO 0x09000000 captured '[EIA_BAREMETAL_ARM64_OK]'!\n");
     free(arm_data);
-    unlink("/tmp/boot_bm_arm.elf");
-    unlink("/tmp/boot_bm_arm.elf.bin");
 
     /* 3. RISC-V 64 Bare-Metal Hardware Execution */
     int rv_rc = system("./bin/spark0 /tmp/boot_bm_qemu.rx -o /tmp/boot_bm_rv.elf --target=baremetal-riscv64 >/dev/null 2>&1");
@@ -434,8 +432,6 @@ static void test_live_baremetal_boot(void) {
     assert(r_found != NULL);
     printf("  [PASS] Live RISC-V 64 Bare-Metal Execution: NS16550A UART MMIO 0x10000000 captured '[EIA_BAREMETAL_RISCV64_OK]'!\n");
     free(rv_data);
-    unlink("/tmp/boot_bm_rv.elf");
-    unlink("/tmp/boot_bm_rv.elf.bin");
 
     /* 4. Live QEMU Bare-Metal VM Boots (x86_64, ARM64, RISC-V 64) */
     int strict = (getenv("EIA_STRICT_FIRMWARE_BOOT") != NULL);
@@ -486,9 +482,11 @@ static void test_live_baremetal_boot(void) {
     }
     if (command_available("qemu-system-aarch64")) {
         unlink("/tmp/arm_serial.log");
+        const char *arm_img = (access("/tmp/boot_bm_arm.elf.bin", F_OK) == 0) ? "/tmp/boot_bm_arm.elf.bin" : "/tmp/boot_bm_arm.elf";
         char qemu_cmd[512];
         snprintf(qemu_cmd, sizeof(qemu_cmd),
-                 "timeout 6s qemu-system-aarch64 -M virt -cpu cortex-a57 -nographic -kernel /tmp/boot_bm_arm.elf -serial file:/tmp/arm_serial.log >/dev/null 2>&1");
+                 "timeout 6s qemu-system-aarch64 -M virt -cpu cortex-a57 -net none -nographic -kernel %s -serial file:/tmp/arm_serial.log >/dev/null 2>&1",
+                 arm_img);
         (void)!system(qemu_cmd);
         size_t arm_log_sz = 0;
         uint8_t *arm_log = read_file("/tmp/arm_serial.log", &arm_log_sz);
@@ -508,9 +506,11 @@ static void test_live_baremetal_boot(void) {
     }
     if (command_available("qemu-system-riscv64")) {
         unlink("/tmp/rv_serial.log");
+        const char *rv_img = (access("/tmp/boot_bm_rv.elf.bin", F_OK) == 0) ? "/tmp/boot_bm_rv.elf.bin" : "/tmp/boot_bm_rv.elf";
         char qemu_cmd[512];
         snprintf(qemu_cmd, sizeof(qemu_cmd),
-                 "timeout 6s qemu-system-riscv64 -M virt -bios none -nographic -kernel /tmp/boot_bm_rv.elf -serial file:/tmp/rv_serial.log >/dev/null 2>&1");
+                 "timeout 6s qemu-system-riscv64 -M virt -bios none -nographic -kernel %s -serial file:/tmp/rv_serial.log >/dev/null 2>&1",
+                 rv_img);
         (void)!system(qemu_cmd);
         size_t rv_log_sz = 0;
         uint8_t *rv_log = read_file("/tmp/rv_serial.log", &rv_log_sz);
@@ -526,6 +526,10 @@ static void test_live_baremetal_boot(void) {
 
     unlink("/tmp/boot_bm_qemu.rx");
     unlink("/tmp/boot_bm_qemu.elf");
+    unlink("/tmp/boot_bm_arm.elf");
+    unlink("/tmp/boot_bm_arm.elf.bin");
+    unlink("/tmp/boot_bm_rv.elf");
+    unlink("/tmp/boot_bm_rv.elf.bin");
 }
 
 /* ------------------------------------------------------------------------- */

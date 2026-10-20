@@ -409,7 +409,7 @@ static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
          * Invoke PSCI SYSTEM_OFF or halt
          */
         emit32_le(u, 0xd2a12000); /* movz x0, #0x0900, lsl #16 (0x09000000) */
-        emit32_le(u, 0x10000101); /* adr x1, #32 (points to string below) */
+        emit32_le(u, 0x10000141); /* adr x1, #40 (points to arm_str at +40) */
         /* .Larm_loop: */
         emit32_le(u, 0x38401422); /* ldrb w2, [x1], #1 */
         emit32_le(u, 0x340000c2); /* cbz w2, .Larm_done (+24 bytes) */
@@ -448,14 +448,14 @@ static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
          */
         emit32_le(u, 0x100002b7); /* lui t0, 0x10000 (0x10000000) */
         emit32_le(u, 0x00000317); /* auipc t1, 0 */
-        emit32_le(u, 0x02830313); /* addi t1, t1, 40 (points to string below) */
+        emit32_le(u, 0x03030313); /* addi t1, t1, 48 (points to rv_str at +48) */
         /* .Lriscv_loop: */
         emit32_le(u, 0x00034383); /* lbu t2, 0(t1) */
-        emit32_le(u, 0x00038e63); /* beqz t2, .Lriscv_done (+28 bytes) */
+        emit32_le(u, 0x00038863); /* beqz t2, .Lriscv_done (+16 bytes -> 0x60) */
         emit32_le(u, 0x00728023); /* sb t2, 0(t0) */
         emit32_le(u, 0x00130313); /* addi t1, t1, 1 */
         emit32_le(u, 0xff1ff06f); /* jal x0, -16 */
-        /* .Lriscv_done: */
+        /* .Lriscv_done (offset 0x60): */
         emit32_le(u, 0x001003b7); /* lui t2, 0x100 (0x100000) */
         emit32_le(u, 0x00005e37); /* lui t3, 5 */
         emit32_le(u, 0x555e0e13); /* addi t3, t3, 0x555 -> t3 = 0x5555 */

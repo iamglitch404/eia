@@ -2400,15 +2400,15 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
             }
         }
         if (found) {
-            if (u->target_arch == 0) {
+            if (u->target_arch == 0 || u->target_arch == 3 || u->target_arch == 4 || u->target_arch == 6 || u->target_arch == 7) {
                 int32_t disp = (int32_t)(target_offset - (all_fixups[i].hole_offset + 4));
                 patch32(u, all_fixups[i].hole_offset, (uint32_t)disp);
-            } else if (u->target_arch == 1) {
+            } else if (u->target_arch == 1 || u->target_arch == 8) {
                 int32_t disp = (int32_t)(target_offset - all_fixups[i].hole_offset);
                 int32_t imm26 = disp / 4;
                 uint32_t insn = 0x94000000 | ((uint32_t)imm26 & 0x03FFFFFF);
                 patch32(u, all_fixups[i].hole_offset, insn);
-            } else if (u->target_arch == 2) {
+            } else if (u->target_arch == 2 || u->target_arch == 9) {
                 int32_t disp = (int32_t)(target_offset - all_fixups[i].hole_offset);
                 uint32_t bit20 = (disp >> 20) & 1;
                 uint32_t bits10_1 = (disp >> 1) & 0x3FF;
@@ -2456,25 +2456,27 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
         exit(1);
     }
     u->main_vaddr = 0x410000 + main_text_offset;
-    if (u->target_arch == 0) {
-        int32_t disp_to_main = (int32_t)(main_text_offset - (call_main_hole + 4));
-        patch32(u, call_main_hole, (uint32_t)disp_to_main);
-    } else if (u->target_arch == 1) {
-        /* ARM64: bl imm26 where imm26 = disp / 4 */
-        int32_t disp_to_main = (int32_t)(main_text_offset - call_main_hole);
-        int32_t imm26 = disp_to_main / 4;
-        uint32_t insn = 0x94000000 | ((uint32_t)imm26 & 0x03FFFFFF);
-        patch32(u, call_main_hole, insn);
-    } else if (u->target_arch == 2) {
-        /* RISC-V 64: jal ra, imm20 */
-        int32_t disp = (int32_t)(main_text_offset - call_main_hole);
-        uint32_t bit20 = (disp >> 20) & 1;
-        uint32_t bits10_1 = (disp >> 1) & 0x3FF;
-        uint32_t bit11 = (disp >> 11) & 1;
-        uint32_t bits19_12 = (disp >> 12) & 0xFF;
-        uint32_t imm = (bit20 << 31) | (bits10_1 << 21) | (bit11 << 20) | (bits19_12 << 12);
-        uint32_t insn = imm | 0x000000EF;
-        patch32(u, call_main_hole, insn);
+    if (call_main_hole != 0) {
+        if (u->target_arch == 0 || u->target_arch == 3 || u->target_arch == 4 || u->target_arch == 6 || u->target_arch == 7) {
+            int32_t disp_to_main = (int32_t)(main_text_offset - (call_main_hole + 4));
+            patch32(u, call_main_hole, (uint32_t)disp_to_main);
+        } else if (u->target_arch == 1) {
+            /* ARM64: bl imm26 where imm26 = disp / 4 */
+            int32_t disp_to_main = (int32_t)(main_text_offset - call_main_hole);
+            int32_t imm26 = disp_to_main / 4;
+            uint32_t insn = 0x94000000 | ((uint32_t)imm26 & 0x03FFFFFF);
+            patch32(u, call_main_hole, insn);
+        } else if (u->target_arch == 2) {
+            /* RISC-V 64: jal ra, imm20 */
+            int32_t disp = (int32_t)(main_text_offset - call_main_hole);
+            uint32_t bit20 = (disp >> 20) & 1;
+            uint32_t bits10_1 = (disp >> 1) & 0x3FF;
+            uint32_t bit11 = (disp >> 11) & 1;
+            uint32_t bits19_12 = (disp >> 12) & 0xFF;
+            uint32_t imm = (bit20 << 31) | (bits10_1 << 21) | (bit11 << 20) | (bits19_12 << 12);
+            uint32_t insn = imm | 0x000000EF;
+            patch32(u, call_main_hole, insn);
+        }
     }
 
     for (uint32_t j = 0; j < compiled_fn_count; ++j) {

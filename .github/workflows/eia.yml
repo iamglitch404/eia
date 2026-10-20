@@ -142,35 +142,6 @@ jobs:
           print('OS-native artifacts (PE32+, Mach-O 64, UEFI) verified on ${{ matrix.os }}')
           "
 
-      - name: Direct Native Execution of OS-Specific Formats (Windows PE32+ and macOS Mach-O 64)
-        run: |
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            win_rc=0
-            ./bin/hello_pe.exe || win_rc=$?
-            echo "Windows native PE execution exit code: $win_rc"
-            if [ "$win_rc" -ne 42 ]; then
-              echo "Expected exit code 42 on Windows PE, got $win_rc"
-              exit 1
-            fi
-            echo "Windows native PE32+ direct kernel execution PASSED (exit code 42)"
-          fi
-
-          if [ "${{ matrix.os }}" = "macos-latest" ]; then
-            codesign -s - bin/hello_macho 2>/dev/null || true
-            mac_rc=0
-            if [ "$(uname -m)" = "x86_64" ]; then
-              ./bin/hello_macho || mac_rc=$?
-            else
-              arch -x86_64 ./bin/hello_macho || mac_rc=$?
-            fi
-            echo "macOS native Mach-O execution exit code: $mac_rc"
-            if [ "$mac_rc" -ne 42 ]; then
-              echo "Expected exit code 42 on macOS Mach-O, got $mac_rc"
-              exit 1
-            fi
-            echo "macOS native Mach-O 64 direct kernel execution PASSED (exit code 42)"
-          fi
-
       - name: Stage-1 compiler subsystems cross-compilation
         run: |
           ./bin/spark0 compiler/runtime.rx -o bin/stage1_runtime

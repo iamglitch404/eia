@@ -2183,7 +2183,7 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
     uint32_t rodata_base = 0x430000;
 
     /* Emit _start stub first */
-    uint32_t call_main_hole = 0;
+    uint32_t call_main_hole = 0xFFFFFFFF;
     emit_start_stub(u, &call_main_hole);
     u->start_stub_size = u->text_size;
     u->entry_vaddr = (u->target_arch == 3) ? 0x101000 : (u->target_arch == 8) ? 0x80040 : (u->target_arch == 9) ? 0x80000040 : (u->target_arch == 6) ? 0x140001000ULL : (u->target_arch == 7) ? 0x100001000ULL : 0x410000;
@@ -2456,7 +2456,7 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
         exit(1);
     }
     u->main_vaddr = 0x410000 + main_text_offset;
-    if (call_main_hole != 0) {
+    if (call_main_hole != 0xFFFFFFFF) {
         if (u->target_arch == 0 || u->target_arch == 3 || u->target_arch == 4 || u->target_arch == 6 || u->target_arch == 7) {
             int32_t disp_to_main = (int32_t)(main_text_offset - (call_main_hole + 4));
             patch32(u, call_main_hole, (uint32_t)disp_to_main);

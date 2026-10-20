@@ -109,7 +109,7 @@ jobs:
           fi
           echo "Native eia-run universal container in-memory loading PASSED (exit code 42 verified on ${{ matrix.os }})"
 
-      - name: Verify OS-Native Formats: Windows PE32+ and macOS Mach-O 64
+      - name: "Verify OS-Native Formats: Windows PE32+ and macOS Mach-O 64"
         run: |
           ./bin/spark0 tests/hello_eia.rx -o bin/hello_pe.exe --target=pe
           ./bin/spark0 tests/hello_eia.rx -o bin/hello_macho --target=macho
@@ -352,9 +352,9 @@ jobs:
           echo "EIA System V AMD64 <-> Win64 ABI Calling Convention Bridge Suite: 100% PASSED"
 
           # Bare-Metal Multi-ISA & UEFI PE32+ Boot Verification Suite
-          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-system-x86 qemu-system-arm qemu-system-misc ovmf || true
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-system-x86 qemu-system-arm qemu-system-misc ovmf
           gcc -O2 -Wall -Wextra -Iinclude -o bin/test_firmware_boot tests/test_firmware_boot.c
-          EIA_STRICT_FIRMWARE_BOOT=1 ./bin/test_firmware_boot || ./bin/test_firmware_boot
+          EIA_STRICT_FIRMWARE_BOOT=1 ./bin/test_firmware_boot
           gcc -O2 -Wall -Wextra -fsanitize=address,undefined -Iinclude -o bin/test_live_firmware_runner tests/test_live_firmware_runner.c
           ./bin/test_live_firmware_runner
           echo "EIA Bare-Metal Multi-ISA & UEFI Firmware Boot Verification Suite: 100% PASSED"

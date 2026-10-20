@@ -89,7 +89,7 @@ jobs:
 
       - name: Verify Versioned Universal Package Container ('UEIA') and Multi-ISA Slices
         run: |
-          ./bin/spark0 tests/hello_eia.rx -o bin/hello_universal --target=universal
+          ./bin/spark0 tests/universal_app.rx -o bin/hello_universal --target=universal
           python3 -c "
           import struct
           with open('bin/hello_universal', 'rb') as f:

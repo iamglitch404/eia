@@ -48,7 +48,9 @@
 static ConcurrentGdamState g_runtime_gdam;
 static GdamGeneration g_provider_gens[MAX_LOADED_PROVIDERS + 1];
 static GdamKernelResource *g_kernel_resources = NULL;
+#ifndef _WIN32
 static pthread_mutex_t g_kernel_res_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 void gdam_init(ConcurrentGdamState *gdam, GdamGeneration *init_gen) {
     memset(gdam, 0, sizeof(*gdam));
@@ -417,11 +419,12 @@ int gdam_register_kernel_handle(ConcurrentGdamState *gdam, int fd, int resource_
 #ifndef _WIN32
     node->flags = fcntl(fd, F_GETFL, 0);
     node->seek_offset = lseek(fd, 0, SEEK_CUR);
-#endif
+#ifndef _WIN32
     pthread_mutex_lock(&g_kernel_res_lock);
     node->next = g_kernel_resources;
     g_kernel_resources = node;
     pthread_mutex_unlock(&g_kernel_res_lock);
+#endif
     return GDAM_SUCCESS;
 }
 
@@ -462,6 +465,7 @@ int gdam_migrate_kernel_handle(ConcurrentGdamState *gdam, int old_fd, int *new_f
 
 int gdam_unregister_kernel_handle(ConcurrentGdamState *gdam, int fd) {
     (void)gdam;
+#ifndef _WIN32
     pthread_mutex_lock(&g_kernel_res_lock);
     GdamKernelResource **curr = &g_kernel_resources;
     while (*curr) {
@@ -476,6 +480,10 @@ int gdam_unregister_kernel_handle(ConcurrentGdamState *gdam, int fd) {
     }
     pthread_mutex_unlock(&g_kernel_res_lock);
     return GDAM_ERR_INVALID_ARG;
+#else
+    (void)fd;
+    return GDAM_SUCCESS;
+#endif
 }
 
 int gdam_send_fd_scm_rights(int unix_sock, int fd_to_send) {

@@ -1,0 +1,786 @@
+//             9. Calling Convention Bridge & Widening Stencils
+// -------------------------------------------------------------------------
+
+struct CallingConventionBridge {
+    from_conv: u32,
+    to_conv: u32,
+    thunk_size: u32,
+    thunk_bytes: [u8; 64],
+}
+
+fn arll_negotiate_calling_convention(bridge: *mut CallingConventionBridge, from_conv: u32, to_conv: u32) -> u32 {
+    bridge.from_conv = from_conv;
+    bridge.to_conv = to_conv;
+
+    if from_conv == 1 && to_conv == 2 {
+        let b: *mut u8 = &mut bridge.thunk_bytes[0];
+        b[0] = 73;  b[1] = 137; b[2] = 201; // mov r9, rcx
+        b[3] = 73;  b[4] = 137; b[5] = 208; // mov r8, rdx
+        b[6] = 72;  b[7] = 137; b[8] = 242; // mov rdx, rsi
+        b[9] = 72;  b[10] = 137; b[11] = 249; // mov rcx, rdi
+        b[12] = 72; b[13] = 131; b[14] = 236; b[15] = 40; // sub rsp, 40
+        b[16] = 255; b[17] = 208;           // call rax
+        b[18] = 72; b[19] = 131; b[20] = 196; b[21] = 40; // add rsp, 40
+        b[22] = 195;                        // ret
+        bridge.thunk_size = 23;
+        return 23;
+    }
+
+    if from_conv == 2 && to_conv == 1 {
+        let b: *mut u8 = &mut bridge.thunk_bytes[0];
+        b[0] = 72; b[1] = 137; b[2] = 207; // mov rdi, rcx
+        b[3] = 72; b[4] = 137; b[5] = 214; // mov rsi, rdx
+        b[6] = 76; b[7] = 137; b[8] = 194; // mov rdx, r8
+        b[9] = 76; b[10] = 137; b[11] = 201; // mov rcx, r9
+        b[12] = 255; b[13] = 208;          // call rax
+        b[14] = 195;                       // ret
+        bridge.thunk_size = 15;
+        return 15;
+    }
+
+    bridge.thunk_size = 0;
+    return 0;
+}
+
+struct SchemaEvolutionStencil {
+    old_size: u32,
+    new_size: u32,
+    is_signed: u32,
+    stencil_size: u32,
+    stencil_bytes: [u8; 32],
+}
+
+fn arll_emit_widening_stencil(stencil: *mut SchemaEvolutionStencil, old_size: u32, new_size: u32, is_signed: u32) -> u32 {
+    stencil.old_size = old_size;
+    stencil.new_size = new_size;
+    stencil.is_signed = is_signed;
+
+    let b: *mut u8 = &mut stencil.stencil_bytes[0];
+    if old_size == 4 && new_size == 8 {
+        if is_signed == 0 {
+            b[0] = 139; b[1] = 7; // mov eax, [rdi]
+            b[2] = 195;           // ret
+            stencil.stencil_size = 3;
+            return 3;
+        } else {
+            b[0] = 72; b[1] = 99; b[2] = 7; // movsxd rax, [rdi]
+            b[3] = 195;                     // ret
+            stencil.stencil_size = 4;
+            return 4;
+        }
+    }
+
+    if old_size == 1 && new_size == 8 {
+        if is_signed == 0 {
+            b[0] = 72; b[1] = 15; b[2] = 182; b[3] = 7; // movzx rax, byte ptr [rdi]
+            b[4] = 195;                                 // ret
+            stencil.stencil_size = 5;
+            return 5;
+        } else {
+            b[0] = 72; b[1] = 15; b[2] = 190; b[3] = 7; // movsx rax, byte ptr [rdi]
+            b[4] = 195;                                 // ret
+            stencil.stencil_size = 5;
+            return 5;
+        }
+    }
+
+    b[0] = 72; b[1] = 139; b[2] = 7; // mov rax, [rdi]
+    b[3] = 195;                      // ret
+    stencil.stencil_size = 4;
+    return 4;
+}
+
+// -------------------------------------------------------------------------
+//                10. Cryptographic Hashing Engine (BLAKE3-64)
+// -------------------------------------------------------------------------
+
+fn rotr32(x: u32, n: u32) -> u32 {
+    let x32: u32 = x & 4294967295;
+    let r: u32 = x32 >> n;
+    let l: u32 = (x32 << (32 - n)) & 4294967295;
+    return (r | l) & 4294967295;
+}
+
+fn get_u32(buf: *u8, idx: u64) -> u32 {
+    let p: *u8 = buf + (idx * 4);
+    let b0: u32 = p[0] as u32;
+    let b1: u32 = p[1] as u32;
+    let b2: u32 = p[2] as u32;
+    let b3: u32 = p[3] as u32;
+    return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) & 4294967295;
+}
+
+fn set_u32(buf: *mut u8, idx: u64, val: u32) {
+    let p: *mut u8 = buf + (idx * 4);
+    p[0] = (val & 255) as u8;
+    p[1] = ((val >> 8) & 255) as u8;
+    p[2] = ((val >> 16) & 255) as u8;
+    p[3] = ((val >> 24) & 255) as u8;
+}
+
+fn blake3_round_g(state: *mut u8, msg: *u8, step: u64) {
+    let mut a_idx: u64 = 0;
+    let mut b_idx: u64 = 0;
+    let mut c_idx: u64 = 0;
+    let mut d_idx: u64 = 0;
+    let mx_idx: u64 = step * 2;
+    let my_idx: u64 = (step * 2) + 1;
+
+    if step == 0 { a_idx = 0; b_idx = 4; c_idx = 8;  d_idx = 12; }
+    else if step == 1 { a_idx = 1; b_idx = 5; c_idx = 9;  d_idx = 13; }
+    else if step == 2 { a_idx = 2; b_idx = 6; c_idx = 10; d_idx = 14; }
+    else if step == 3 { a_idx = 3; b_idx = 7; c_idx = 11; d_idx = 15; }
+    else if step == 4 { a_idx = 0; b_idx = 5; c_idx = 10; d_idx = 15; }
+    else if step == 5 { a_idx = 1; b_idx = 6; c_idx = 11; d_idx = 12; }
+    else if step == 6 { a_idx = 2; b_idx = 7; c_idx = 8;  d_idx = 13; }
+    else if step == 7 { a_idx = 3; b_idx = 4; c_idx = 9;  d_idx = 14; }
+
+    let mx: u32 = get_u32(msg, mx_idx);
+    let my: u32 = get_u32(msg, my_idx);
+
+    let mut a: u32 = get_u32(state, a_idx);
+    let mut b: u32 = get_u32(state, b_idx);
+    let mut c: u32 = get_u32(state, c_idx);
+    let mut d: u32 = get_u32(state, d_idx);
+
+    a = (a + b + mx) & 4294967295;
+    d = rotr32(d ^ a, 16);
+    c = (c + d) & 4294967295;
+    b = rotr32(b ^ c, 12);
+    a = (a + b + my) & 4294967295;
+    d = rotr32(d ^ a, 8);
+    c = (c + d) & 4294967295;
+    b = rotr32(b ^ c, 7);
+
+    set_u32(state, a_idx, a);
+    set_u32(state, b_idx, b);
+    set_u32(state, c_idx, c);
+    set_u32(state, d_idx, d);
+}
+
+fn blake3_permute_msg(msg: *mut u8) {
+    let mut temp: [u8; 64];
+    let t: *mut u8 = &mut temp[0];
+    let mut i: u64 = 0;
+    while i < 16 {
+        set_u32(t, i, get_u32(msg, i));
+        i = i + 1;
+    }
+    set_u32(msg, 0,  get_u32(t, 2));
+    set_u32(msg, 1,  get_u32(t, 6));
+    set_u32(msg, 2,  get_u32(t, 3));
+    set_u32(msg, 3,  get_u32(t, 10));
+    set_u32(msg, 4,  get_u32(t, 7));
+    set_u32(msg, 5,  get_u32(t, 0));
+    set_u32(msg, 6,  get_u32(t, 4));
+    set_u32(msg, 7,  get_u32(t, 13));
+    set_u32(msg, 8,  get_u32(t, 1));
+    set_u32(msg, 9,  get_u32(t, 11));
+    set_u32(msg, 10, get_u32(t, 12));
+    set_u32(msg, 11, get_u32(t, 5));
+    set_u32(msg, 12, get_u32(t, 9));
+    set_u32(msg, 13, get_u32(t, 14));
+    set_u32(msg, 14, get_u32(t, 15));
+    set_u32(msg, 15, get_u32(t, 8));
+}
+
+fn blake3_compress_64(cv: *mut u8, block_buf: *u8, block_len: u32, block_index: u64, flags: u32) -> u64 {
+    let mut state_buf: [u8; 64];
+    let state: *mut u8 = &mut state_buf[0];
+
+    let mut i: u64 = 0;
+    while i < 8 {
+        set_u32(state, i, get_u32(cv, i));
+        i = i + 1;
+    }
+    set_u32(state, 8,  1779033703);
+    set_u32(state, 9,  3144134277);
+    set_u32(state, 10, 1013904242);
+    set_u32(state, 11, 2773480762);
+    set_u32(state, 12, (block_index & 4294967295) as u32);
+    set_u32(state, 13, ((block_index >> 32) & 4294967295) as u32);
+    set_u32(state, 14, block_len);
+    set_u32(state, 15, flags);
+
+    let mut msg_buf: [u8; 64];
+    let msg: *mut u8 = &mut msg_buf[0];
+    i = 0;
+    while i < 64 {
+        if i < (block_len as u64) {
+            msg[i] = block_buf[i];
+        } else {
+            msg[i] = 0;
+        }
+        i = i + 1;
+    }
+
+    let mut round: u64 = 0;
+    while round < 7 {
+        let mut step: u64 = 0;
+        while step < 8 {
+            blake3_round_g(state, msg, step);
+            step = step + 1;
+        }
+        if round < 6 {
+            blake3_permute_msg(msg);
+        }
+        round = round + 1;
+    }
+
+    i = 0;
+    while i < 8 {
+        let new_cv_word: u32 = get_u32(state, i) ^ get_u32(state, i + 8);
+        set_u32(cv, i, new_cv_word);
+        i = i + 1;
+    }
+
+    let low: u64 = (get_u32(cv, 0) as u64) & 4294967295;
+    let high: u64 = (get_u32(cv, 1) as u64) & 4294967295;
+    return low | (high << 32);
+}
+
+fn blake3_init_cv(cv: *mut u8) {
+    set_u32(cv, 0, 1779033703);
+    set_u32(cv, 1, 3144134277);
+    set_u32(cv, 2, 1013904242);
+    set_u32(cv, 3, 2773480762);
+    set_u32(cv, 4, 1359893119);
+    set_u32(cv, 5, 2600822924);
+    set_u32(cv, 6, 528734635);
+    set_u32(cv, 7, 1541459225);
+}
+
+fn blake3_hash_chunk(chunk_data: *u8, chunk_len: u64, chunk_counter: u64, is_root: u32, out_cv: *mut u8) {
+    blake3_init_cv(out_cv);
+    if chunk_len == 0 {
+        let mut flags: u32 = 1 | 2; // CHUNK_START | CHUNK_END
+        if is_root == 1 { flags = flags | 8; }
+        blake3_compress_64(out_cv, chunk_data, 0, chunk_counter, flags);
+        return;
+    }
+    let num_blocks: u64 = (chunk_len + 63) / 64;
+    let mut b: u64 = 0;
+    let mut blk_off: u64 = 0;
+    while b < num_blocks {
+        let mut blk_len: u32 = 64;
+        if (chunk_len - blk_off) < 64 {
+            blk_len = (chunk_len - blk_off) as u32;
+        }
+        let mut flags: u32 = 0;
+        if b == 0 { flags = flags | 1; } // CHUNK_START
+        if b == (num_blocks - 1) {
+            flags = flags | 2; // CHUNK_END
+            if is_root == 1 { flags = flags | 8; }
+        }
+        blake3_compress_64(out_cv, chunk_data + blk_off, blk_len, chunk_counter, flags);
+        blk_off = blk_off + (blk_len as u64);
+        b = b + 1;
+    }
+}
+
+fn blake3_parent_cv(left_cv: *u8, right_cv: *u8, is_root: u32, out_cv: *mut u8) {
+    let mut block_buf: [u8; 64];
+    let block: *mut u8 = &mut block_buf[0];
+    let mut i: u64 = 0;
+    while i < 32 {
+        block[i] = left_cv[i];
+        block[i + 32] = right_cv[i];
+        i = i + 1;
+    }
+    blake3_init_cv(out_cv);
+    let mut flags: u32 = 4; // PARENT
+    if is_root == 1 { flags = flags | 8; }
+    blake3_compress_64(out_cv, block, 64, 0, flags);
+}
+
+fn blake3_hash64(buf: *u8, len: u64) -> u64 {
+    let mut root_cv_buf: [u8; 32];
+    let root_cv: *mut u8 = &mut root_cv_buf[0];
+
+    if len <= 1024 {
+        blake3_hash_chunk(buf, len, 0, 1, root_cv);
+        let low: u64 = (get_u32(root_cv, 0) as u64) & 4294967295;
+        let high: u64 = (get_u32(root_cv, 1) as u64) & 4294967295;
+        return low | (high << 32);
+    }
+
+    let num_chunks: u64 = (len + 1023) / 1024;
+    let mut stack_cv_buf: [u8; 2048];
+    let mut cv_list: *mut u8 = &mut stack_cv_buf[0];
+    let mut is_allocated: u32 = 0;
+    let cv_bytes: u64 = ((num_chunks * 32) + 4095) & ~4095;
+    if num_chunks > 64 {
+        if num_chunks > 1048576 { return 0; }
+        let ptr: *mut u8 = syscall(9, 0, cv_bytes, 3, 34, -1, 0) as *mut u8;
+        if (ptr as i64) > 0 {
+            cv_list = ptr;
+            is_allocated = 1;
+        } else {
+            return 0;
+        }
+    }
+
+    let mut c: u64 = 0;
+    while c < num_chunks {
+        let c_off: u64 = c * 1024;
+        let mut c_len: u64 = 1024;
+        if (len - c_off) < 1024 {
+            c_len = len - c_off;
+        }
+        blake3_hash_chunk(buf + c_off, c_len, c, 0, cv_list + (c * 32));
+        c = c + 1;
+    }
+
+    let mut cv_count: u64 = num_chunks;
+
+    while cv_count > 1 {
+        let mut next_count: u64 = 0;
+        let mut idx: u64 = 0;
+        while idx < cv_count {
+            if (idx + 1) < cv_count {
+                let mut is_root: u32 = 0;
+                if cv_count == 2 { is_root = 1; }
+                let mut p_cv_buf: [u8; 32];
+                let p_cv: *mut u8 = &mut p_cv_buf[0];
+                blake3_parent_cv(cv_list + (idx * 32), cv_list + ((idx + 1) * 32), is_root, p_cv);
+                let mut k: u64 = 0;
+                while k < 32 {
+                    cv_list[(next_count * 32) + k] = p_cv[k];
+                    k = k + 1;
+                }
+                next_count = next_count + 1;
+            } else {
+                let mut k: u64 = 0;
+                while k < 32 {
+                    cv_list[(next_count * 32) + k] = cv_list[(idx * 32) + k];
+                    k = k + 1;
+                }
+                next_count = next_count + 1;
+            }
+            idx = idx + 2;
+        }
+        cv_count = next_count;
+    }
+
+    let low: u64 = (get_u32(cv_list, 0) as u64) & 4294967295;
+    let high: u64 = (get_u32(cv_list, 1) as u64) & 4294967295;
+    if is_allocated == 1 {
+        syscall(11, cv_list, cv_bytes); // SYS_munmap
+    }
+    return low | (high << 32);
+}
+
+fn compute_canonical_sig_hash(param_cnt: u32, calling_conv: u32, ret_type_hash: u64, param_types: *u64, param_ptrs: *u64) -> u64 {
+    let mut sig_buf: [u8; 1040];
+    let p: *mut u8 = &mut sig_buf[0];
+    let mut i: u64 = 0;
+    while i < 1040 {
+        p[i] = 0;
+        i = i + 1;
+    }
+
+    // Bytes 0..3: param_cnt
+    p[0] = (param_cnt & 255) as u8;
+    p[1] = ((param_cnt >> 8) & 255) as u8;
+    p[2] = ((param_cnt >> 16) & 255) as u8;
+    p[3] = ((param_cnt >> 24) & 255) as u8;
+
+    // Bytes 4..7: calling_conv
+    p[4] = (calling_conv & 255) as u8;
+    p[5] = ((calling_conv >> 8) & 255) as u8;
+    p[6] = ((calling_conv >> 16) & 255) as u8;
+    p[7] = ((calling_conv >> 24) & 255) as u8;
+
+    // Bytes 8..15: ret_type_hash
+    let mut rh: u64 = ret_type_hash;
+    let mut b: u64 = 0;
+    while b < 8 {
+        p[8 + b] = (rh & 255) as u8;
+        rh = rh >> 8;
+        b = b + 1;
+    }
+
+    // Bytes 16 + i*16 .. : params
+    let mut pi: u32 = 0;
+    while pi < param_cnt && pi < 64 {
+        let base: u64 = 16 + ((pi as u64) * 16);
+        let mut th: u64 = param_types[pi as u64];
+        let mut ptr_kind: u64 = param_ptrs[pi as u64];
+        b = 0;
+        while b < 8 {
+            p[base + b] = (th & 255) as u8;
+            th = th >> 8;
+            b = b + 1;
+        }
+        b = 0;
+        while b < 8 {
+            p[base + 8 + b] = (ptr_kind & 255) as u8;
+            ptr_kind = ptr_kind >> 8;
+            b = b + 1;
+        }
+        pi = pi + 1;
+    }
+
+    let total_len: u64 = 16 + ((param_cnt as u64) * 16);
+    return blake3_hash64(p, total_len);
+}
+
+// -------------------------------------------------------------------------
+//                11. UPBP Polyglot Binary Package Writer
+// -------------------------------------------------------------------------
+
+fn write_elf64_binary(cg: *mut CodeGen, out_path: *u8, is_upbp: u32) -> i64 {
+    let mut holo_offset: u64 = 1152; // 0x480 for UPBP
+    let mut contracts_offset: u64 = 1248; // 0x480 + 96 = 0x4E0 for UPBP
+    if is_upbp == 0 {
+        holo_offset = 128; // 0x80 for Native ELF
+        contracts_offset = 224; // 0xE0 for Native ELF
+    }
+    let contracts_size: u64 = (cg.contract_count as u64) * 48;
+
+    let relocs_offset: u64 = contracts_offset + contracts_size;
+    let relocs_size: u64 = (cg.reloc_count as u64) * 24;
+
+    let tg_offset: u64 = relocs_offset + relocs_size;
+    let tg_size: u64 = (cg.tg_count as u64) * 24;
+
+    let text_offset: u64 = 65536; // 0x10000
+    let rodata_offset: u64 = 196608; // 0x30000
+    let total_file_size: u64 = rodata_offset + 4096;
+
+    let file_buf: *mut u8 = mmap_alloc(total_file_size);
+    if (file_buf as i64) < 0 {
+        return -1;
+    }
+
+    let mut z: u64 = 0;
+    while z < total_file_size {
+        file_buf[z] = 0;
+        z = z + 1;
+    }
+
+    let mut emach: u8 = 62; // EM_X86_64
+    if cg.target_arch == 1 {
+        emach = 183; // EM_AARCH64 (0xB7)
+    } else if cg.target_arch == 2 {
+        emach = 243; // EM_RISCV (0xF3)
+    }
+
+    if is_upbp == 1 {
+        // 1. Offset 0x000: DOS MZ Header Stub (0x4D 0x5A)
+        // Compatible with Windows loader and POSIX shell variable assignment
+        let tramp1: *u8 = "MZ= tail +129c $0>z;chmod +x z;./z;c=${?#126};exit ${c:-42}\n";
+        let mut ti: u64 = 0;
+        while ti < 60 {
+            file_buf[ti] = tramp1[ti];
+            ti = ti + 1;
+        }
+
+        // bytes 60-63: e_lfanew = 0x140
+        file_buf[60] = 64;  // 0x40
+        file_buf[61] = 1;   // 0x01 -> 0x00000140
+        file_buf[62] = 0;
+        file_buf[63] = 0;
+
+        // bytes 64-127: POSIX Shell Trampoline pattern data
+        file_buf[64] = 35;  // '#'
+        file_buf[65] = 33;  // '!'
+        file_buf[66] = 47;  // '/'
+        file_buf[67] = 98;  // 'b'
+        file_buf[68] = 105; // 'i'
+        file_buf[69] = 110; // 'n'
+        file_buf[70] = 47;  // '/'
+        file_buf[71] = 115; // 's'
+        file_buf[72] = 104; // 'h'
+        file_buf[73] = 10;  // '\n'
+        file_buf[74] = 32; file_buf[75] = 32; file_buf[76] = 32; file_buf[77] = 32;
+        file_buf[78] = 32; file_buf[79] = 32; file_buf[80] = 32; file_buf[81] = 32;
+        // "tail" at byte 82
+        file_buf[82] = 116; file_buf[83] = 97; file_buf[84] = 105; file_buf[85] = 108;
+        file_buf[86] = 32; file_buf[87] = 45; file_buf[88] = 99; file_buf[89] = 43;
+        file_buf[90] = 49; file_buf[91] = 50; file_buf[92] = 57; file_buf[93] = 32;
+        file_buf[94] = 34; file_buf[95] = 36; file_buf[96] = 48; file_buf[97] = 34;
+        file_buf[98] = 62; file_buf[99] = 122; file_buf[100] = 59; file_buf[101] = 99;
+        file_buf[102] = 104; file_buf[103] = 109; file_buf[104] = 111; file_buf[105] = 100;
+        file_buf[106] = 32; file_buf[107] = 43; file_buf[108] = 120; file_buf[109] = 32;
+        file_buf[110] = 122; file_buf[111] = 59;
+        file_buf[112] = 32; file_buf[113] = 32; file_buf[114] = 32;
+        // "exec" at byte 115
+        file_buf[115] = 101; file_buf[116] = 120; file_buf[117] = 101; file_buf[118] = 99;
+        file_buf[119] = 32; file_buf[120] = 47; file_buf[121] = 98; file_buf[122] = 105;
+        file_buf[123] = 110; file_buf[124] = 47; file_buf[125] = 115; file_buf[126] = 104;
+        file_buf[127] = 10;
+
+        let elf_base: u64 = 128; // 0x80
+        file_buf[elf_base + 0] = 127; // 0x7F
+        file_buf[elf_base + 1] = 69;  // 'E'
+        file_buf[elf_base + 2] = 76;  // 'L'
+        file_buf[elf_base + 3] = 70;  // 'F'
+        file_buf[elf_base + 4] = 2;   // ELFCLASS64
+        file_buf[elf_base + 5] = 1;   // ELFDATA2LSB
+        file_buf[elf_base + 6] = 1;   // EV_CURRENT
+        file_buf[elf_base + 7] = 0;   // ELFOSABI_NONE
+
+        file_buf[elf_base + 16] = 2; file_buf[elf_base + 17] = 0;
+        file_buf[elf_base + 18] = emach; file_buf[elf_base + 19] = 0;
+        file_buf[elf_base + 20] = 1;
+        let entry_addr: u64 = 4194304 + (text_offset - 128);
+        file_buf[elf_base + 24] = (entry_addr & 255) as u8;
+        file_buf[elf_base + 25] = ((entry_addr >> 8) & 255) as u8;
+        file_buf[elf_base + 26] = ((entry_addr >> 16) & 255) as u8;
+        file_buf[elf_base + 27] = ((entry_addr >> 24) & 255) as u8;
+
+        file_buf[elf_base + 32] = 64;
+        file_buf[elf_base + 52] = 64;
+        file_buf[elf_base + 54] = 56;
+        file_buf[elf_base + 56] = 1;
+        file_buf[elf_base + 58] = 64;
+
+        // ELF64 Program Header (56 bytes at elf_base + 64)
+        let ph_base: u64 = elf_base + 64;
+        file_buf[ph_base + 0] = 1; // p_type = 1 (PT_LOAD)
+        file_buf[ph_base + 4] = 5; // p_flags = 5 (PF_R | PF_X - strict W^X)
+        file_buf[ph_base + 16] = 0; file_buf[ph_base + 17] = 0; file_buf[ph_base + 18] = 64; file_buf[ph_base + 19] = 0;
+        file_buf[ph_base + 24] = 0; file_buf[ph_base + 25] = 0; file_buf[ph_base + 26] = 64; file_buf[ph_base + 27] = 0;
+        file_buf[ph_base + 32] = (total_file_size & 255) as u8;
+        file_buf[ph_base + 33] = ((total_file_size >> 8) & 255) as u8;
+        file_buf[ph_base + 34] = ((total_file_size >> 16) & 255) as u8;
+        let mut memsz: u64 = total_file_size;
+        if cg.target_arch == 0 {
+            memsz = total_file_size + 1048576;
+        }
+        file_buf[ph_base + 40] = (memsz & 255) as u8;
+        file_buf[ph_base + 41] = ((memsz >> 8) & 255) as u8;
+        file_buf[ph_base + 42] = ((memsz >> 16) & 255) as u8;
+        file_buf[ph_base + 48] = 0; file_buf[ph_base + 49] = 16;
+
+        // 4. Offset 0x140: PE/COFF Headers (PE\0\0)
+        let pe_base: u64 = 320; // 0x140
+        file_buf[pe_base + 0] = 80; file_buf[pe_base + 1] = 69; file_buf[pe_base + 2] = 0; file_buf[pe_base + 3] = 0;
+        file_buf[pe_base + 4] = 100; file_buf[pe_base + 5] = 134;
+        file_buf[pe_base + 6] = 1;   file_buf[pe_base + 7] = 0;
+        file_buf[pe_base + 20] = 240; file_buf[pe_base + 21] = 0;
+        file_buf[pe_base + 22] = 34;  file_buf[pe_base + 23] = 0;
+
+        // Optional Header (PE32+ 64-bit at pe_base + 24)
+        let opt_base: u64 = pe_base + 24;
+        file_buf[opt_base + 0] = 11; file_buf[opt_base + 1] = 2;
+        file_buf[opt_base + 2] = 1;  file_buf[opt_base + 3] = 0;
+        file_buf[opt_base + 16] = 0; file_buf[opt_base + 17] = 0; file_buf[opt_base + 18] = 1;
+        file_buf[opt_base + 20] = 0; file_buf[opt_base + 21] = 0; file_buf[opt_base + 22] = 1;
+        file_buf[opt_base + 24] = 0; file_buf[opt_base + 25] = 0; file_buf[opt_base + 26] = 0; file_buf[opt_base + 27] = 64; file_buf[opt_base + 28] = 1;
+        file_buf[opt_base + 32] = 0; file_buf[opt_base + 33] = 16;
+        file_buf[opt_base + 36] = 0; file_buf[opt_base + 37] = 2;
+        file_buf[opt_base + 68] = 3; file_buf[opt_base + 69] = 0;
+
+        // 5. Offset 0x200: Mach-O 64-bit Load Commands (0xFEEDFACF)
+        let macho_base: u64 = 512; // 0x200
+        file_buf[macho_base + 0] = 207; file_buf[macho_base + 1] = 250; file_buf[macho_base + 2] = 237; file_buf[macho_base + 3] = 254;
+        file_buf[macho_base + 4] = 7;   file_buf[macho_base + 5] = 0;   file_buf[macho_base + 6] = 0;   file_buf[macho_base + 7] = 1;
+        file_buf[macho_base + 8] = 3;   file_buf[macho_base + 9] = 0;   file_buf[macho_base + 10] = 0;  file_buf[macho_base + 11] = 128;
+        file_buf[macho_base + 12] = 2;  file_buf[macho_base + 13] = 0;
+        file_buf[macho_base + 16] = 1;  file_buf[macho_base + 17] = 0;
+        file_buf[macho_base + 20] = 72; file_buf[macho_base + 21] = 0;
+        file_buf[macho_base + 24] = 133; file_buf[macho_base + 25] = 0; file_buf[macho_base + 26] = 32; file_buf[macho_base + 27] = 0;
+
+        let seg_base: u64 = macho_base + 32;
+        file_buf[seg_base + 0] = 25;
+        file_buf[seg_base + 4] = 72;
+        file_buf[seg_base + 8] = 95; file_buf[seg_base + 9] = 95; file_buf[seg_base + 10] = 84; file_buf[seg_base + 11] = 69; file_buf[seg_base + 12] = 88; file_buf[seg_base + 13] = 84;
+        file_buf[seg_base + 32] = 0; file_buf[seg_base + 33] = 0; file_buf[seg_base + 34] = 0; file_buf[seg_base + 35] = 0; file_buf[seg_base + 36] = 1;
+        file_buf[seg_base + 40] = 0; file_buf[seg_base + 41] = 0; file_buf[seg_base + 42] = 4;
+        file_buf[seg_base + 56] = 7;
+        file_buf[seg_base + 60] = 7;
+    } else {
+        // Native ELF64 at offset 0
+        file_buf[0] = 127; file_buf[1] = 69; file_buf[2] = 76; file_buf[3] = 70; // \x7fELF
+        file_buf[4] = 2; file_buf[5] = 1; file_buf[6] = 1; file_buf[7] = 0;
+        file_buf[16] = 2; file_buf[18] = emach; file_buf[20] = 1;
+        file_buf[24] = 0; file_buf[25] = 0; file_buf[26] = 65; file_buf[27] = 0; // e_entry = 0x410000
+        file_buf[32] = 64; // e_phoff = 64
+        file_buf[52] = 64; // e_ehsize = 64
+        file_buf[54] = 56; // e_phentsize = 56
+        file_buf[56] = 1;  // e_phnum = 1
+        file_buf[58] = 64; // e_shentsize = 64
+
+        let ph_base: u64 = 64;
+        file_buf[ph_base + 0] = 1; // p_type = 1 (PT_LOAD)
+        file_buf[ph_base + 4] = 5; // p_flags = 5 (PF_R | PF_X - strict W^X)
+        file_buf[ph_base + 16] = 0; file_buf[ph_base + 17] = 0; file_buf[ph_base + 18] = 64; file_buf[ph_base + 19] = 0; // 0x400000
+        file_buf[ph_base + 24] = 0; file_buf[ph_base + 25] = 0; file_buf[ph_base + 26] = 64; file_buf[ph_base + 27] = 0;
+        file_buf[ph_base + 32] = (total_file_size & 255) as u8;
+        file_buf[ph_base + 33] = ((total_file_size >> 8) & 255) as u8;
+        file_buf[ph_base + 34] = ((total_file_size >> 16) & 255) as u8;
+        let mut memsz: u64 = total_file_size;
+        if cg.target_arch == 0 {
+            memsz = total_file_size + 1048576;
+        }
+        file_buf[ph_base + 40] = (memsz & 255) as u8;
+        file_buf[ph_base + 41] = ((memsz >> 8) & 255) as u8;
+        file_buf[ph_base + 42] = ((memsz >> 16) & 255) as u8;
+        file_buf[ph_base + 48] = 0; file_buf[ph_base + 49] = 16; // align 0x1000
+    }
+
+    // 6. Universal Hologram Header (96 bytes at offset holo_offset)
+    let holo: *mut UniversalHologramHeader = (file_buf + holo_offset) as *mut UniversalHologramHeader;
+    holo.magic = 1145588037; // 0x44484945 'EIAH'
+    holo.version = 2;        // major 2, minor 0
+    holo.abi_epoch = 1;
+    holo.contracts_offset = contracts_offset;
+    holo.contracts_count = cg.contract_count as u64;
+    holo.relocs_offset = relocs_offset;
+    holo.relocs_count = cg.reloc_count as u64;
+    holo.type_graph_offset = tg_offset;
+    holo.type_graph_size = tg_size;
+    holo.flags = 1;
+    if cg.force_bridge == 1 {
+        holo.flags = holo.flags | 4; // EIA_FLAG_CALLING_CONV_BRIDGE (bit 2)
+    }
+
+    // 7. Copy SymbolContracts
+    let mut i: u64 = 0;
+    let sc_src: *u8 = cg.contracts as *u8;
+    while i < contracts_size {
+        file_buf[contracts_offset + i] = sc_src[i];
+        i = i + 1;
+    }
+
+    // 8. Copy Relocation Holes
+    i = 0;
+    let rel_src: *u8 = cg.relocs as *u8;
+    while i < relocs_size {
+        file_buf[relocs_offset + i] = rel_src[i];
+        i = i + 1;
+    }
+
+    // 9. Copy Type Graph
+    i = 0;
+    let tg_src: *u8 = cg.type_graph as *u8;
+    while i < tg_size {
+        file_buf[tg_offset + i] = tg_src[i];
+        i = i + 1;
+    }
+
+    // Compute dynamic BLAKE3-64 root hash over contracts, relocs, and type graph tables
+    let tables_len: u64 = contracts_size + relocs_size + tg_size;
+    holo.blake3_root = blake3_hash64(file_buf + contracts_offset, tables_len);
+
+    // 10. Copy .text
+    i = 0;
+    while i < (cg.text_size as u64) {
+        file_buf[text_offset + i] = cg.text_buf[i];
+        i = i + 1;
+    }
+
+    // Pre-resolve internal field holes so standalone binaries execute cleanly out-of-the-box
+    let mut ri: u32 = 0;
+    while ri < cg.reloc_count {
+        let hole: *mut EiaRelocHole = &mut cg.relocs[ri];
+        if hole.patch_kind == 1 && ((hole.insn_offset + 4) as u64) <= (cg.text_size as u64) {
+            let mut ti: u32 = 0;
+            let mut found: u32 = 0;
+            while ti < cg.tg_count && found == 0 {
+                let tge: *mut EiaTypeGraphEntry = &mut cg.type_graph[ti];
+                if tge.type_sig_hash == hole.type_sig_hash && tge.field_hash == hole.field_or_sym_hash {
+                    let disp: u32 = tge.byte_offset;
+                    let p_off: u64 = text_offset + (hole.insn_offset as u64);
+                    if cg.target_arch == 1 {
+                        // ARM64: movz x16 and movk x16
+                        let movz: u32 = 3531604000 | ((disp & 65535) << 5);
+                        let movk: u32 = 4070621216 | (((disp >> 16) & 65535) << 5);
+                        file_buf[p_off + 0] = (movz & 255) as u8;
+                        file_buf[p_off + 1] = ((movz >> 8) & 255) as u8;
+                        file_buf[p_off + 2] = ((movz >> 16) & 255) as u8;
+                        file_buf[p_off + 3] = ((movz >> 24) & 255) as u8;
+                        file_buf[p_off + 4] = (movk & 255) as u8;
+                        file_buf[p_off + 5] = ((movk >> 8) & 255) as u8;
+                        file_buf[p_off + 6] = ((movk >> 16) & 255) as u8;
+                        file_buf[p_off + 7] = ((movk >> 24) & 255) as u8;
+                    } else if cg.target_arch == 2 {
+                        // RISC-V 64: lui t0 and addi t0
+                        let hi: u32 = (disp + 2048) >> 12;
+                        let lo: u32 = disp & 4095;
+                        let lui: u32 = 695 | (hi << 12);
+                        let addi: u32 = 164499 | (lo << 20);
+                        file_buf[p_off + 0] = (lui & 255) as u8;
+                        file_buf[p_off + 1] = ((lui >> 8) & 255) as u8;
+                        file_buf[p_off + 2] = ((lui >> 16) & 255) as u8;
+                        file_buf[p_off + 3] = ((lui >> 24) & 255) as u8;
+                        file_buf[p_off + 4] = (addi & 255) as u8;
+                        file_buf[p_off + 5] = ((addi >> 8) & 255) as u8;
+                        file_buf[p_off + 6] = ((addi >> 16) & 255) as u8;
+                        file_buf[p_off + 7] = ((addi >> 24) & 255) as u8;
+                    } else {
+                        // x86-64: 32-bit LE displacement
+                        file_buf[p_off + 0] = (disp & 255) as u8;
+                        file_buf[p_off + 1] = ((disp >> 8) & 255) as u8;
+                        file_buf[p_off + 2] = ((disp >> 16) & 255) as u8;
+                        file_buf[p_off + 3] = ((disp >> 24) & 255) as u8;
+                    }
+                    found = 1;
+                }
+                ti = ti + 1;
+            }
+        }
+        ri = ri + 1;
+    }
+
+    // 10b. Emit calling-convention bridge thunk if --arll-force-bridge
+    if cg.force_bridge == 1 {
+        let bt_offset: u64 = cg.text_size as u64;
+        let bt0: u64 = 0x49; let bt1: u64 = 0x89; let bt2: u64 = 0xc9; let bt3: u64 = 0x49;
+        let bt4: u64 = 0x89; let bt5: u64 = 0xd0; let bt6: u64 = 0x48; let bt7: u64 = 0x89;
+        let bt8: u64 = 0xf2; let bt9: u64 = 0x48; let bt10: u64 = 0x89; let bt11: u64 = 0xf9;
+        let bt12: u64 = 0x48; let bt13: u64 = 0x83; let bt14: u64 = 0xec; let bt15: u64 = 0x28;
+        let bt16: u64 = 0xff; let bt17: u64 = 0xd0; let bt18: u64 = 0x48; let bt19: u64 = 0x83;
+        let bt20: u64 = 0xc4; let bt21: u64 = 0x28; let bt22: u64 = 0xc3; let bt23: u64 = 0x90;
+        file_buf[text_offset + bt_offset + 0] = bt0; file_buf[text_offset + bt_offset + 1] = bt1;
+        file_buf[text_offset + bt_offset + 2] = bt2; file_buf[text_offset + bt_offset + 3] = bt3;
+        file_buf[text_offset + bt_offset + 4] = bt4; file_buf[text_offset + bt_offset + 5] = bt5;
+        file_buf[text_offset + bt_offset + 6] = bt6; file_buf[text_offset + bt_offset + 7] = bt7;
+        file_buf[text_offset + bt_offset + 8] = bt8; file_buf[text_offset + bt_offset + 9] = bt9;
+        file_buf[text_offset + bt_offset + 10] = bt10; file_buf[text_offset + bt_offset + 11] = bt11;
+        file_buf[text_offset + bt_offset + 12] = bt12; file_buf[text_offset + bt_offset + 13] = bt13;
+        file_buf[text_offset + bt_offset + 14] = bt14; file_buf[text_offset + bt_offset + 15] = bt15;
+        file_buf[text_offset + bt_offset + 16] = bt16; file_buf[text_offset + bt_offset + 17] = bt17;
+        file_buf[text_offset + bt_offset + 18] = bt18; file_buf[text_offset + bt_offset + 19] = bt19;
+        file_buf[text_offset + bt_offset + 20] = bt20; file_buf[text_offset + bt_offset + 21] = bt21;
+        file_buf[text_offset + bt_offset + 22] = bt22; file_buf[text_offset + bt_offset + 23] = bt23;
+        // Update SymbolContract[0]: vaddr = TEXT_VADDR + bt_offset, code_size = 24, flags |= 4
+        if cg.contract_count > 0 {
+            let sc0_file_off: u64 = contracts_offset;
+            let bt_vaddr: u64 = 0x410000 + bt_offset;
+            file_buf[sc0_file_off + 16] = (bt_vaddr & 255) as u8;
+            file_buf[sc0_file_off + 17] = ((bt_vaddr >> 8) & 255) as u8;
+            file_buf[sc0_file_off + 18] = ((bt_vaddr >> 16) & 255) as u8;
+            file_buf[sc0_file_off + 19] = ((bt_vaddr >> 24) & 255) as u8;
+            file_buf[sc0_file_off + 20] = ((bt_vaddr >> 32) & 255) as u8;
+            file_buf[sc0_file_off + 21] = ((bt_vaddr >> 40) & 255) as u8;
+            file_buf[sc0_file_off + 22] = ((bt_vaddr >> 48) & 255) as u8;
+            file_buf[sc0_file_off + 23] = ((bt_vaddr >> 56) & 255) as u8;
+            file_buf[sc0_file_off + 24] = 24;
+            file_buf[sc0_file_off + 25] = 0; file_buf[sc0_file_off + 26] = 0; file_buf[sc0_file_off + 27] = 0;
+            file_buf[sc0_file_off + 32] = file_buf[sc0_file_off + 32] | 4;
+        }
+    }
+
+    // 11. Copy .rodata
+    i = 0;
+    while i < (cg.rodata_size as u64) {
+        file_buf[rodata_offset + i] = cg.rodata_buf[i];
+        i = i + 1;
+    }
+
+    // 12. Write executable binary to disk
+    // SYS_open = 2: path, flags=O_CREAT|O_WRONLY|O_TRUNC (577), mode=0755 (493)
+    let fd: i64 = syscall(2, out_path, 577, 493);
+    if fd < 0 {
+        return -2;
+    }
+
+    syscall(1, fd, file_buf, total_file_size); // SYS_write
+    syscall(3, fd);                            // SYS_close
+    return 0;
+}
+
+// -------------------------------------------------------------------------

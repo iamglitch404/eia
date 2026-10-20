@@ -1,0 +1,90 @@
+//                         2. Memory & Arena Allocator
+// -------------------------------------------------------------------------
+
+struct Arena {
+    memory: *mut u8,
+    offset: u64,
+    capacity: u64,
+}
+
+fn mmap_alloc(size: u64) -> *mut u8 {
+    // SYS_mmap = 9: addr=0, len=size, prot=PROT_READ|PROT_WRITE (3), flags=MAP_PRIVATE|MAP_ANONYMOUS (34), fd=-1, off=0
+    let ptr: *mut u8 = syscall(9, 0, size, 3, 34, -1, 0) as *mut u8;
+    if (ptr as i64) <= 0 {
+        return 0 as *mut u8;
+    }
+    return ptr;
+}
+
+fn arena_init(arena: *mut Arena, size: u64) {
+    let mem: *mut u8 = mmap_alloc(size);
+    arena.memory = mem;
+    arena.offset = 0;
+    arena.capacity = size;
+}
+
+fn arena_alloc(arena: *mut Arena, bytes: u64) -> *mut u8 {
+    let aligned: u64 = ((bytes + 7) / 8) * 8;
+    let cur: u64 = arena.offset;
+    let next_off: u64 = cur + aligned;
+    arena.offset = next_off;
+    let ptr: *mut u8 = arena.memory + cur;
+    return ptr;
+}
+
+// -------------------------------------------------------------------------
+//                         3. Hasher & String Helpers
+// -------------------------------------------------------------------------
+
+fn hash_identifier(start: *u8, len: u32) -> u64 {
+    let mut h: u64 = 14695981039346656037;
+    let mut i: u32 = 0;
+    while i < len {
+        let b: u8 = start[i as u64];
+        h = h ^ (b as u64);
+        h = h * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn is_digit(c: u8) -> u32 {
+    if c >= 48 && c <= 57 { return 1; }
+    return 0;
+}
+
+fn is_alpha(c: u8) -> u32 {
+    if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 { return 1; }
+    return 0;
+}
+
+fn is_alnum(c: u8) -> u32 {
+    if is_alpha(c) == 1 || is_digit(c) == 1 { return 1; }
+    return 0;
+}
+
+fn classify_keyword(h: u64) -> u32 {
+    if h == 14058172984575203104 || h == 7938019069247444294 { return 10; } // struct or shape
+    if h == 619343937915704565   { return 11; } // fn
+    if h == 1329270083436697466 || h == 7334518323283222324  { return 12; } // let or const
+    if h == 569227173069198361   { return 13; } // mut
+    if h == 628023482707099174   { return 14; } // if
+    if h == 9163537027783908656  { return 15; } // else
+    if h == 14882043299657492846 { return 16; } // while
+    if h == 14251563519059995999 { return 17; } // return
+    if h == 6740575782527371194  { return 18; } // syscall
+    if h == 620464340264662349   { return 19; } // as
+    if h == 3089943341986682694  { return 20; } // i64
+    if h == 5563585020063213298  { return 21; } // u64
+    if h == 5560783464435099345  { return 22; } // u32
+    if h == 631772817358541784   { return 23; } // u8
+    if h == 3563412735833858527  { return 24; } // void
+    if h == 417800907370030071   { return 25; } // extern
+    if h == 3388837930293092456  { return 26; } // print
+    if h == 8602815819212105030  { return 27; } // println
+    if h == 15366675508848053990 { return 28; } // silicon
+    return 1; // TOK_IDENT
+}
+
+// -------------------------------------------------------------------------
+//                         4. Self-Hosted Lexer

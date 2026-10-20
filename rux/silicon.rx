@@ -1,0 +1,963 @@
+//                         6. Stage-1 Machine Code Emitter
+// -------------------------------------------------------------------------
+
+struct FieldInfo {
+    name_hash: u64,
+    byte_offset: u32,
+    field_size: u32,
+    type_kind: u32,
+}
+
+struct StructInfo {
+    name_hash: u64,
+    type_sig_hash: u64,
+    total_size: u32,
+    field_count: u32,
+    fields: *mut FieldInfo,
+}
+
+struct LocalVar {
+    name_hash: u64,
+    rbp_offset: u32,
+    size: u32,
+    is_struct_ptr: u32,
+    is_struct_val: u32,
+    struct_hash: u64,
+}
+
+struct CallFixup {
+    hole_offset: u32,
+    pad: u32,
+    callee_hash: u64,
+}
+
+struct FnEntry {
+    fn_hash: u64,
+    text_offset: u32,
+    pad: u32,
+}
+
+struct CodeGen {
+    text_buf: *mut u8,
+    text_size: u32,
+
+    rodata_buf: *mut u8,
+    rodata_size: u32,
+
+    relocs: *mut EiaRelocHole,
+    reloc_count: u32,
+
+    type_graph: *mut EiaTypeGraphEntry,
+    tg_count: u32,
+
+    contracts: *mut SymbolContract,
+    contract_count: u32,
+
+    call_main_hole: u32,
+
+    call_fixups: *mut CallFixup,
+    call_fixup_count: u32,
+
+    fn_entries: *mut FnEntry,
+    fn_entry_count: u32,
+
+    structs: *mut StructInfo,
+    struct_count: u32,
+
+    locals: *mut LocalVar,
+    local_count: u32,
+    current_stack_offset: u32,
+    force_bridge: u32,
+    permute_seed: u32,
+    target_arch: u32,
+}
+
+fn cg_emit8(cg: *mut CodeGen, b: u8) {
+    cg.text_buf[cg.text_size as u64] = b;
+    cg.text_size = cg.text_size + 1;
+}
+
+fn cg_emit32(cg: *mut CodeGen, val: u32) {
+    cg_emit8(cg, (val & 255) as u8);
+    cg_emit8(cg, ((val >> 8) & 255) as u8);
+    cg_emit8(cg, ((val >> 16) & 255) as u8);
+    cg_emit8(cg, ((val >> 24) & 255) as u8);
+}
+
+fn cg_emit64(cg: *mut CodeGen, val: u64) {
+    cg_emit32(cg, (val & 4294967295) as u32);
+    cg_emit32(cg, ((val >> 32) & 4294967295) as u32);
+}
+
+fn cg_patch32(cg: *mut CodeGen, offset: u32, val: u32) {
+    cg.text_buf[offset as u64] = (val & 255) as u8;
+    cg.text_buf[(offset + 1) as u64] = ((val >> 8) & 255) as u8;
+    cg.text_buf[(offset + 2) as u64] = ((val >> 16) & 255) as u8;
+    cg.text_buf[(offset + 3) as u64] = ((val >> 24) & 255) as u8;
+}
+
+fn cg_add_reloc(cg: *mut CodeGen, insn_offset: u32, type_hash: u64, field_hash: u64) {
+    let hole: *mut EiaRelocHole = ((cg.relocs as *mut u8) + ((cg.reloc_count as u64) * 24)) as *mut EiaRelocHole;
+    hole.insn_offset = insn_offset;
+    hole.patch_kind = 1; // EIA_PATCH_FIELD_DISP32
+    hole.type_sig_hash = type_hash;
+    hole.field_or_sym_hash = field_hash;
+    cg.reloc_count = cg.reloc_count + 1;
+}
+
+fn cg_add_reloc_ex(cg: *mut CodeGen, insn_offset: u32, patch_kind: u32, type_hash: u64, field_or_sym_hash: u64) {
+    let hole: *mut EiaRelocHole = ((cg.relocs as *mut u8) + ((cg.reloc_count as u64) * 24)) as *mut EiaRelocHole;
+    hole.insn_offset = insn_offset;
+    hole.patch_kind = patch_kind;
+    hole.type_sig_hash = type_hash;
+    hole.field_or_sym_hash = field_or_sym_hash;
+    cg.reloc_count = cg.reloc_count + 1;
+}
+
+fn cg_add_type_graph_entry(cg: *mut CodeGen, type_hash: u64, field_hash: u64, byte_offset: u32, field_size: u32) {
+    let entry: *mut EiaTypeGraphEntry = ((cg.type_graph as *mut u8) + ((cg.tg_count as u64) * 24)) as *mut EiaTypeGraphEntry;
+    entry.type_sig_hash = type_hash;
+    entry.field_hash = field_hash;
+    entry.byte_offset = byte_offset;
+    entry.field_size = field_size;
+    cg.tg_count = cg.tg_count + 1;
+}
+
+fn cg_find_local(cg: *mut CodeGen, name_hash: u64) -> *mut LocalVar {
+    let mut i: u32 = 0;
+    while i < cg.local_count {
+        let lv: *mut LocalVar = ((cg.locals as *mut u8) + ((i as u64) * 32)) as *mut LocalVar;
+        if lv.name_hash == name_hash {
+            return lv;
+        }
+        i = i + 1;
+    }
+    return 0 as *mut LocalVar;
+}
+
+fn cg_find_struct(cg: *mut CodeGen, name_hash: u64) -> *mut StructInfo {
+    let mut i: u32 = 0;
+    while i < cg.struct_count {
+        let si: *mut StructInfo = ((cg.structs as *mut u8) + ((i as u64) * 32)) as *mut StructInfo;
+        if si.name_hash == name_hash {
+            return si;
+        }
+        i = i + 1;
+    }
+    return 0 as *mut StructInfo;
+}
+
+// -------------------------------------------------------------------------
+//                         7. _start Boot Patcher Stub
+// -------------------------------------------------------------------------
+
+fn emit_start_stub(cg: *mut CodeGen) {
+    if cg.target_arch == 1 {
+        // ARM64 start stub:
+        // mov x0, 42       ; 0xd2800540
+        // mov x8, 93       ; 0xd2800ba8 (SYS_exit)
+        // svc 0            ; 0xd4000001
+        cg_emit32(cg, 3531669824);
+        cg_emit32(cg, 3531672488);
+        cg_emit32(cg, 3556769793);
+        return;
+    }
+    if cg.target_arch == 2 {
+        // RISC-V 64 start stub:
+        // li a0, 42        ; 0x02a00513 (addi a0, zero, 42)
+        // li a7, 93        ; 0x05d00893 (addi a7, zero, 93 - SYS_exit)
+        // ecall            ; 0x00000073
+        cg_emit32(cg, 44041491);
+        cg_emit32(cg, 97521811);
+        cg_emit32(cg, 115);
+        return;
+    }
+
+    // 0. Preserve argc and argv from stack
+    cg_emit8(cg, 72); cg_emit8(cg, 139); cg_emit8(cg, 60); cg_emit8(cg, 36); // mov rdi, [rsp]
+    cg_emit8(cg, 72); cg_emit8(cg, 141); cg_emit8(cg, 116); cg_emit8(cg, 36); cg_emit8(cg, 8); // lea rsi, [rsp + 8]
+    cg_emit8(cg, 87); // push rdi
+    cg_emit8(cg, 86); // push rsi
+
+    // 1. sys_mprotect(0x400000, 0x200000, 7) - temporary write access for hole patching
+    cg_emit8(cg, 184); cg_emit32(cg, 10);        // mov eax, 10
+    cg_emit8(cg, 191); cg_emit32(cg, 4194304);   // mov edi, 0x400000
+    cg_emit8(cg, 190); cg_emit32(cg, 2097152);   // mov esi, 0x200000 (2MB)
+    cg_emit8(cg, 186); cg_emit32(cg, 7);         // mov edx, 7
+    cg_emit8(cg, 15); cg_emit8(cg, 5);           // syscall
+
+    // 2. Hologram Boot Patcher
+    // mov r12, 0x400480 (UPBP Hologram Header)
+    cg_emit8(cg, 73); cg_emit8(cg, 199); cg_emit8(cg, 196); cg_emit32(cg, 4195456);
+    // cmp dword ptr [r12], 0x44484945 ('EIAH')
+    cg_emit8(cg, 65); cg_emit8(cg, 129); cg_emit8(cg, 60); cg_emit8(cg, 36); cg_emit32(cg, 1145588037);
+    // je .Lfound (+7 bytes)
+    cg_emit8(cg, 116); cg_emit8(cg, 7);
+    // mov r12, 0x400080 (Native ELF Hologram Header)
+    cg_emit8(cg, 73); cg_emit8(cg, 199); cg_emit8(cg, 196); cg_emit32(cg, 4194432);
+    // .Lfound:
+    // mov r13, [r12 + 0x20]
+    cg_emit8(cg, 77); cg_emit8(cg, 139); cg_emit8(cg, 108); cg_emit8(cg, 36); cg_emit8(cg, 32);
+    // add r13, 0x400000
+    cg_emit8(cg, 73); cg_emit8(cg, 129); cg_emit8(cg, 197); cg_emit32(cg, 4194304);
+    // mov r14, [r12 + 0x28]
+    cg_emit8(cg, 77); cg_emit8(cg, 139); cg_emit8(cg, 116); cg_emit8(cg, 36); cg_emit8(cg, 40);
+    // mov r15, [r12 + 0x30]
+    cg_emit8(cg, 77); cg_emit8(cg, 139); cg_emit8(cg, 124); cg_emit8(cg, 36); cg_emit8(cg, 48);
+    // add r15, 0x400000
+    cg_emit8(cg, 73); cg_emit8(cg, 129); cg_emit8(cg, 199); cg_emit32(cg, 4194304);
+    // mov rcx, [r12 + 0x38]
+    cg_emit8(cg, 73); cg_emit8(cg, 139); cg_emit8(cg, 76); cg_emit8(cg, 36); cg_emit8(cg, 56);
+    // add rcx, r15
+    cg_emit8(cg, 76); cg_emit8(cg, 1); cg_emit8(cg, 249);
+
+    // .Lreloc_loop:
+    let reloc_loop_offset: u32 = cg.text_size;
+    // test r14, r14
+    cg_emit8(cg, 77); cg_emit8(cg, 133); cg_emit8(cg, 246);
+    // jz .Lpatch_done
+    cg_emit8(cg, 15); cg_emit8(cg, 132);
+    let jz_patch_done_hole: u32 = cg.text_size;
+    cg_emit32(cg, 0);
+
+    // mov r8d, [r13 + 0x00]
+    cg_emit8(cg, 69); cg_emit8(cg, 139); cg_emit8(cg, 69); cg_emit8(cg, 0);
+    // mov r9, [r13 + 0x08]
+    cg_emit8(cg, 77); cg_emit8(cg, 139); cg_emit8(cg, 77); cg_emit8(cg, 8);
+    // mov r10, [r13 + 0x10]
+    cg_emit8(cg, 77); cg_emit8(cg, 139); cg_emit8(cg, 85); cg_emit8(cg, 16);
+
+    // mov rsi, r15
+    cg_emit8(cg, 76); cg_emit8(cg, 137); cg_emit8(cg, 254);
+
+    // .Ltype_loop:
+    let type_loop_offset: u32 = cg.text_size;
+    // cmp rsi, rcx
+    cg_emit8(cg, 72); cg_emit8(cg, 57); cg_emit8(cg, 206);
+    // jae .Lnext_reloc
+    cg_emit8(cg, 15); cg_emit8(cg, 131);
+    let jae_next_reloc_hole: u32 = cg.text_size;
+    cg_emit32(cg, 0);
+
+    // cmp [rsi], r9
+    cg_emit8(cg, 76); cg_emit8(cg, 57); cg_emit8(cg, 14);
+    // jne .Lnext_type
+    cg_emit8(cg, 15); cg_emit8(cg, 133);
+    let jne_next_type1_hole: u32 = cg.text_size;
+    cg_emit32(cg, 0);
+
+    // cmp [rsi + 0x08], r10
+    cg_emit8(cg, 76); cg_emit8(cg, 57); cg_emit8(cg, 86); cg_emit8(cg, 8);
+    // jne .Lnext_type
+    cg_emit8(cg, 15); cg_emit8(cg, 133);
+    let jne_next_type2_hole: u32 = cg.text_size;
+    cg_emit32(cg, 0);
+
+    // Match found:
+    // mov eax, [rsi + 0x10]
+    cg_emit8(cg, 139); cg_emit8(cg, 70); cg_emit8(cg, 16);
+    // mov rdi, 0x410000 (TEXT_VADDR)
+    cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 199); cg_emit32(cg, 4259840);
+    // add rdi, r8
+    cg_emit8(cg, 76); cg_emit8(cg, 1); cg_emit8(cg, 199);
+    // mov [rdi], eax (PATCH!)
+    cg_emit8(cg, 137); cg_emit8(cg, 7);
+    // jmp .Lnext_reloc
+    cg_emit8(cg, 233);
+    let jmp_next_reloc_hole: u32 = cg.text_size;
+    cg_emit32(cg, 0);
+
+    // .Lnext_type:
+    let next_type_offset: u32 = cg.text_size;
+    cg_patch32(cg, jne_next_type1_hole, next_type_offset - (jne_next_type1_hole + 4));
+    cg_patch32(cg, jne_next_type2_hole, next_type_offset - (jne_next_type2_hole + 4));
+    // add rsi, 24
+    cg_emit8(cg, 72); cg_emit8(cg, 131); cg_emit8(cg, 198); cg_emit8(cg, 24);
+    // jmp .Ltype_loop
+    cg_emit8(cg, 233);
+    let jmp_type_loop: i32 = (type_loop_offset as i32) - ((cg.text_size + 4) as i32);
+    cg_emit32(cg, jmp_type_loop as u32);
+
+    // .Lnext_reloc:
+    let next_reloc_offset: u32 = cg.text_size;
+    cg_patch32(cg, jae_next_reloc_hole, next_reloc_offset - (jae_next_reloc_hole + 4));
+    cg_patch32(cg, jmp_next_reloc_hole, next_reloc_offset - (jmp_next_reloc_hole + 4));
+    // add r13, 24
+    cg_emit8(cg, 73); cg_emit8(cg, 131); cg_emit8(cg, 197); cg_emit8(cg, 24);
+    // dec r14
+    cg_emit8(cg, 73); cg_emit8(cg, 255); cg_emit8(cg, 206);
+    // jmp .Lreloc_loop
+    cg_emit8(cg, 233);
+    let jmp_reloc_loop: i32 = (reloc_loop_offset as i32) - ((cg.text_size + 4) as i32);
+    cg_emit32(cg, jmp_reloc_loop as u32);
+
+    // .Lpatch_done:
+    let patch_done_offset: u32 = cg.text_size;
+    cg_patch32(cg, jz_patch_done_hole, patch_done_offset - (jz_patch_done_hole + 4));
+
+    // 3. HASI Cache fence: CPUID + mfence
+    cg_emit8(cg, 49); cg_emit8(cg, 192); // xor eax, eax
+    cg_emit8(cg, 15); cg_emit8(cg, 162); // cpuid
+    cg_emit8(cg, 15); cg_emit8(cg, 174); cg_emit8(cg, 240); // mfence
+
+    // 3b. Strict W^X: sys_mprotect(0x400000, 0x200000, 5) (PROT_READ | PROT_EXEC - strictly non-writable)
+    cg_emit8(cg, 184); cg_emit32(cg, 10);        // mov eax, 10
+    cg_emit8(cg, 191); cg_emit32(cg, 4194304);   // mov edi, 0x400000
+    cg_emit8(cg, 190); cg_emit32(cg, 2097152);   // mov esi, 0x200000 (2MB)
+    cg_emit8(cg, 186); cg_emit32(cg, 5);         // mov edx, 5 (PROT_READ | PROT_EXEC)
+    cg_emit8(cg, 15); cg_emit8(cg, 5);           // syscall
+
+    // 4. call main(argc, argv)
+    cg_emit8(cg, 94); // pop rsi (argv)
+    cg_emit8(cg, 95); // pop rdi (argc)
+    cg_emit8(cg, 232);
+    cg.call_main_hole = cg.text_size;
+    cg_emit32(cg, 0);
+
+    // 5. exit: mov rdi, rax; mov eax, 60; syscall
+    cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 199);
+    cg_emit8(cg, 184); cg_emit32(cg, 60);
+    cg_emit8(cg, 15); cg_emit8(cg, 5);
+}
+
+// -------------------------------------------------------------------------
+//                         8. Code Generator Engine
+// -------------------------------------------------------------------------
+
+fn compile_expr(cg: *mut CodeGen, node: *mut AstNode) {
+    if node == (0 as *mut AstNode) { return; }
+
+    if node.kind == 116 { // NODE_INT
+        // mov rax, imm64
+        cg_emit8(cg, 72); cg_emit8(cg, 184);
+        cg_emit64(cg, node.val);
+        return;
+    }
+
+    if node.kind == 118 { // NODE_STRING
+        let s_ptr: *u8 = node.hash as *u8;
+        let s_len: u32 = node.val as u32;
+
+        let rodata_off: u32 = cg.rodata_size;
+        let mut si: u32 = 1;
+        let s_end: u32 = s_len - 1;
+        while si < s_end {
+            let sc: u8 = s_ptr[si as u64];
+            if sc == 92 && (si + 1) < s_end { // '\\'
+                si = si + 1;
+                let esc: u8 = s_ptr[si as u64];
+                if esc == 110 { // 'n'
+                    cg.rodata_buf[cg.rodata_size as u64] = 10;
+                } else if esc == 116 { // 't'
+                    cg.rodata_buf[cg.rodata_size as u64] = 9;
+                } else if esc == 114 { // 'r'
+                    cg.rodata_buf[cg.rodata_size as u64] = 13;
+                } else {
+                    cg.rodata_buf[cg.rodata_size as u64] = esc;
+                }
+            } else {
+                cg.rodata_buf[cg.rodata_size as u64] = sc;
+            }
+            cg.rodata_size = cg.rodata_size + 1;
+            si = si + 1;
+        }
+        cg.rodata_buf[cg.rodata_size as u64] = 0; // null terminator
+        cg.rodata_size = cg.rodata_size + 1;
+
+        // mov rax, 0x430000 + rodata_off
+        let vaddr: u64 = 4390912 + (rodata_off as u64); // 0x430000 = 4390912
+        cg_emit8(cg, 72); cg_emit8(cg, 184);
+        cg_emit64(cg, vaddr);
+        return;
+    }
+
+    if node.kind == 117 { // NODE_IDENT
+        let lv: *mut LocalVar = cg_find_local(cg, node.hash);
+        if lv != (0 as *mut LocalVar) {
+            if lv.is_struct_val == 1 {
+                // Address of struct variable: lea rax, [rbp - rbp_offset]
+                cg_emit8(cg, 72); cg_emit8(cg, 141); cg_emit8(cg, 133);
+                cg_emit32(cg, 0 - lv.rbp_offset);
+            } else {
+                // mov rax, [rbp - rbp_offset]
+                cg_emit8(cg, 72); cg_emit8(cg, 139); cg_emit8(cg, 133);
+                cg_emit32(cg, 0 - lv.rbp_offset);
+            }
+        }
+        return;
+    }
+
+    if node.kind == 112 { // NODE_UNARY (&mut, *)
+        let operand: *mut AstNode = node.child1;
+        if operand != (0 as *mut AstNode) {
+            if operand.kind == 117 { // &ident
+                let lv: *mut LocalVar = cg_find_local(cg, operand.hash);
+                if lv != (0 as *mut LocalVar) {
+                    // lea rax, [rbp - rbp_offset]
+                    cg_emit8(cg, 72); cg_emit8(cg, 141); cg_emit8(cg, 133);
+                    cg_emit32(cg, 0 - lv.rbp_offset);
+                    return;
+                }
+            } else if operand.kind == 115 { // &arr[idx]
+                compile_expr(cg, operand.child1); // base pointer in rax
+                cg_emit8(cg, 80);                 // push rax
+                compile_expr(cg, operand.child2); // index in rax
+                cg_emit8(cg, 91);                 // pop rbx (base)
+
+                let mut is_byte: u32 = 1;
+                if operand.child1.kind == 117 {
+                    let lv: *mut LocalVar = cg_find_local(cg, operand.child1.hash);
+                    if lv != (0 as *mut LocalVar) && (lv.is_struct_ptr == 11 || lv.name_hash == 9892488102507485283) {
+                        is_byte = 0;
+                    }
+                }
+
+                if is_byte == 1 {
+                    cg_emit8(cg, 72); cg_emit8(cg, 1); cg_emit8(cg, 195); // add rbx, rax
+                } else {
+                    cg_emit8(cg, 72); cg_emit8(cg, 193); cg_emit8(cg, 224); cg_emit8(cg, 3); // shl rax, 3
+                    cg_emit8(cg, 72); cg_emit8(cg, 1); cg_emit8(cg, 195); // add rbx, rax
+                }
+                // Address in rbx -> mov rax, rbx
+                cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 216);
+                return;
+            }
+        }
+        compile_expr(cg, operand);
+        return;
+    }
+
+    if node.kind == 114 { // NODE_FIELD_ACCESS (p.field)
+        let base: *mut AstNode = node.child1;
+        let mut s_hash: u64 = 0;
+        if base != (0 as *mut AstNode) && base.kind == 117 {
+            let lv: *mut LocalVar = cg_find_local(cg, base.hash);
+            if lv != (0 as *mut LocalVar) {
+                s_hash = lv.struct_hash;
+            }
+        }
+        if s_hash == 0 && cg.struct_count > 0 {
+            let first_s: *mut StructInfo = cg.structs;
+            s_hash = first_s.type_sig_hash;
+        }
+
+        // Evaluate base pointer into rax -> rsi
+        compile_expr(cg, base);
+        cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 198); // mov rsi, rax
+
+        // CRITICAL EIA: Emit lea rdi, [rsi + 0x00000000] with 32-bit relocatable hole
+        // 48 8d be 00 00 00 00
+        cg_emit8(cg, 72); cg_emit8(cg, 141); cg_emit8(cg, 190);
+        let hole_offset: u32 = cg.text_size;
+        cg_emit32(cg, 0);
+        cg_add_reloc(cg, hole_offset, s_hash, node.hash);
+
+        // If field is struct-valued (cur_tok), return address in rax
+        if node.hash == 6782429180816288216 {
+            cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 248); // mov rax, rdi
+            return;
+        }
+
+        // Load field into rax: mov rax, [rdi] (48 8b 07)
+        cg_emit8(cg, 72); cg_emit8(cg, 139); cg_emit8(cg, 7);
+        return;
+    }
+
+    if node.kind == 119 { // NODE_SYSCALL
+        // Push arguments
+        let mut args: [*mut AstNode; 8];
+        let mut argc: u32 = 0;
+        let mut cur_arg: *mut AstNode = node.child2;
+        while cur_arg != (0 as *mut AstNode) && argc < 6 {
+            args[argc as u64] = cur_arg;
+            argc = argc + 1;
+            cur_arg = cur_arg.next;
+        }
+
+        let mut idx: u32 = argc;
+        while idx > 0 {
+            idx = idx - 1;
+            compile_expr(cg, args[idx as u64]);
+            cg_emit8(cg, 80); // push rax
+        }
+
+        // Evaluate nr
+        compile_expr(cg, node.child1);
+        cg_emit8(cg, 80); // push rax (nr)
+
+        // Pop registers
+        cg_emit8(cg, 88); // pop rax (nr)
+        if argc >= 1 { cg_emit8(cg, 95); } // pop rdi
+        if argc >= 2 { cg_emit8(cg, 94); } // pop rsi
+        if argc >= 3 { cg_emit8(cg, 90); } // pop rdx
+        if argc >= 4 { cg_emit8(cg, 65); cg_emit8(cg, 90); } // pop r10
+        if argc >= 5 { cg_emit8(cg, 65); cg_emit8(cg, 88); } // pop r8
+        if argc >= 6 { cg_emit8(cg, 65); cg_emit8(cg, 89); } // pop r9
+
+        cg_emit8(cg, 15); cg_emit8(cg, 5); // syscall
+        return;
+    }
+
+    if node.kind == 120 { // NODE_PRINT
+        compile_expr(cg, node.child1);
+        cg_emit8(cg, 80); // push rax (str ptr)
+        let mut slen: u32 = 8;
+        if node.child1.kind == 118 { // NODE_STRING
+            slen = node.child1.len;
+        }
+        if node.val == 1 { // println
+            cg_emit8(cg, 88); // pop rax (str)
+            cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 198); // mov rsi, rax
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 199); cg_emit32(cg, 1); // mov rdi, 1
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 194); cg_emit32(cg, slen); // mov rdx, slen
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 192); cg_emit32(cg, 1); // mov rax, 1
+            cg_emit8(cg, 15); cg_emit8(cg, 5); // syscall
+            // newline
+            cg_emit8(cg, 106); cg_emit8(cg, 10); // push 10 ('\n')
+            cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 230); // mov rsi, rsp
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 199); cg_emit32(cg, 1); // mov rdi, 1
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 194); cg_emit32(cg, 1); // mov rdx, 1
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 192); cg_emit32(cg, 1); // mov rax, 1
+            cg_emit8(cg, 15); cg_emit8(cg, 5); // syscall
+            cg_emit8(cg, 72); cg_emit8(cg, 131); cg_emit8(cg, 196); cg_emit8(cg, 8); // add rsp, 8
+        } else {
+            cg_emit8(cg, 88); // pop rax (str)
+            cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 198); // mov rsi, rax
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 199); cg_emit32(cg, 1); // mov rdi, 1
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 194); cg_emit32(cg, slen); // mov rdx, slen
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 192); cg_emit32(cg, 1); // mov rax, 1
+            cg_emit8(cg, 15); cg_emit8(cg, 5); // syscall
+        }
+        cg_emit8(cg, 72); cg_emit8(cg, 49); cg_emit8(cg, 192); // xor rax, rax
+        return;
+    }
+
+    if node.kind == 121 { // NODE_SILICON
+        if node.val == 1 { // rdtsc
+            cg_emit8(cg, 15); cg_emit8(cg, 49); // rdtsc
+            cg_emit8(cg, 72); cg_emit8(cg, 193); cg_emit8(cg, 226); cg_emit8(cg, 32); // shl rdx, 32
+            cg_emit8(cg, 72); cg_emit8(cg, 9); cg_emit8(cg, 208); // or rax, rdx
+            return;
+        }
+        if node.val == 2 { // icache_sync
+            cg_emit8(cg, 15); cg_emit8(cg, 174); cg_emit8(cg, 240); // mfence
+            cg_emit8(cg, 49); cg_emit8(cg, 192); // xor eax, eax
+            cg_emit8(cg, 15); cg_emit8(cg, 162); // cpuid
+            cg_emit8(cg, 72); cg_emit8(cg, 49); cg_emit8(cg, 192); // xor rax, rax
+            return;
+        }
+        if node.val == 3 { // clwb
+            compile_expr(cg, node.child1); // pointer into rax
+            cg_emit8(cg, 102); cg_emit8(cg, 15); cg_emit8(cg, 174); cg_emit8(cg, 48); // clwb [rax]
+            cg_emit8(cg, 15); cg_emit8(cg, 174); cg_emit8(cg, 248); // sfence
+            cg_emit8(cg, 72); cg_emit8(cg, 49); cg_emit8(cg, 192); // xor rax, rax
+            return;
+        }
+    }
+
+    if node.kind == 115 { // NODE_INDEX (arr[idx])
+        compile_expr(cg, node.child1); // base pointer in rax
+        cg_emit8(cg, 80);              // push rax
+        compile_expr(cg, node.child2); // index in rax
+        cg_emit8(cg, 91);              // pop rbx (base)
+
+        let mut is_byte: u32 = 1;
+        if node.child1.kind == 117 {
+            let lv: *mut LocalVar = cg_find_local(cg, node.child1.hash);
+            if lv != (0 as *mut LocalVar) && (lv.is_struct_ptr == 11 || lv.name_hash == 9892488102507485283) {
+                is_byte = 0;
+            }
+        }
+
+        if is_byte == 1 {
+            cg_emit8(cg, 72); cg_emit8(cg, 1); cg_emit8(cg, 195); // add rbx, rax
+            cg_emit8(cg, 72); cg_emit8(cg, 15); cg_emit8(cg, 182); cg_emit8(cg, 3); // movzx rax, byte ptr [rbx]
+        } else {
+            cg_emit8(cg, 72); cg_emit8(cg, 193); cg_emit8(cg, 224); cg_emit8(cg, 3); // shl rax, 3
+            cg_emit8(cg, 72); cg_emit8(cg, 1); cg_emit8(cg, 195); // add rbx, rax
+            cg_emit8(cg, 72); cg_emit8(cg, 139); cg_emit8(cg, 3); // mov rax, [rbx]
+        }
+        return;
+    }
+
+    if node.kind == 106 { // NODE_BINARY
+        let op: u32 = node.val as u32;
+        compile_expr(cg, node.child1); // left in rax
+        cg_emit8(cg, 80);              // push rax
+        compile_expr(cg, node.child2); // right in rax
+        cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 195); // mov rbx, rax
+        cg_emit8(cg, 88);              // pop rax (left in rax)
+
+        if op == 30 { // '+'
+            cg_emit8(cg, 72); cg_emit8(cg, 1); cg_emit8(cg, 216); // add rax, rbx
+        } else if op == 31 { // '-'
+            cg_emit8(cg, 72); cg_emit8(cg, 41); cg_emit8(cg, 216); // sub rax, rbx
+        } else if op == 32 { // '*'
+            cg_emit8(cg, 72); cg_emit8(cg, 15); cg_emit8(cg, 175); cg_emit8(cg, 195); // imul rax, rbx
+        } else if op == 33 { // '/'
+            cg_emit8(cg, 72); cg_emit8(cg, 49); cg_emit8(cg, 210); // xor rdx, rdx
+            cg_emit8(cg, 72); cg_emit8(cg, 247); cg_emit8(cg, 243); // div rbx
+        } else if op == 34 { // '%'
+            cg_emit8(cg, 72); cg_emit8(cg, 49); cg_emit8(cg, 210); // xor rdx, rdx
+            cg_emit8(cg, 72); cg_emit8(cg, 247); cg_emit8(cg, 243); // div rbx
+            cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 208); // mov rax, rdx
+        } else if op == 50 { // '&'
+            cg_emit8(cg, 72); cg_emit8(cg, 33); cg_emit8(cg, 216); // and rax, rbx
+        } else if op == 51 { // '|'
+            cg_emit8(cg, 72); cg_emit8(cg, 9); cg_emit8(cg, 216); // or rax, rbx
+        } else if op == 52 { // '^'
+            cg_emit8(cg, 72); cg_emit8(cg, 49); cg_emit8(cg, 216); // xor rax, rbx
+        } else if op == 47 { // '<<'
+            cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 217); // mov rcx, rbx
+            cg_emit8(cg, 72); cg_emit8(cg, 211); cg_emit8(cg, 224); // shl rax, cl
+        } else if op == 48 { // '>>'
+            cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 217); // mov rcx, rbx
+            cg_emit8(cg, 72); cg_emit8(cg, 211); cg_emit8(cg, 232); // shr rax, cl
+        } else if op == 41 { // '=='
+            cg_emit8(cg, 72); cg_emit8(cg, 57); cg_emit8(cg, 216);  // cmp rax, rbx
+            cg_emit8(cg, 15); cg_emit8(cg, 148); cg_emit8(cg, 192); // sete al
+            cg_emit8(cg, 72); cg_emit8(cg, 15); cg_emit8(cg, 182); cg_emit8(cg, 192); // movzx rax, al
+        } else if op == 42 { // '!='
+            cg_emit8(cg, 72); cg_emit8(cg, 57); cg_emit8(cg, 216);  // cmp rax, rbx
+            cg_emit8(cg, 15); cg_emit8(cg, 149); cg_emit8(cg, 192); // setne al
+            cg_emit8(cg, 72); cg_emit8(cg, 15); cg_emit8(cg, 182); cg_emit8(cg, 192); // movzx rax, al
+        } else if op == 43 { // '<'
+            cg_emit8(cg, 72); cg_emit8(cg, 57); cg_emit8(cg, 216);  // cmp rax, rbx
+            cg_emit8(cg, 15); cg_emit8(cg, 146); cg_emit8(cg, 192); // setb al
+            cg_emit8(cg, 72); cg_emit8(cg, 15); cg_emit8(cg, 182); cg_emit8(cg, 192); // movzx rax, al
+        } else if op == 44 { // '>'
+            cg_emit8(cg, 72); cg_emit8(cg, 57); cg_emit8(cg, 216);  // cmp rax, rbx
+            cg_emit8(cg, 15); cg_emit8(cg, 147); cg_emit8(cg, 192); // seta al
+            cg_emit8(cg, 72); cg_emit8(cg, 15); cg_emit8(cg, 182); cg_emit8(cg, 192); // movzx rax, al
+        } else if op == 45 { // '<='
+            cg_emit8(cg, 72); cg_emit8(cg, 57); cg_emit8(cg, 216);  // cmp rax, rbx
+            cg_emit8(cg, 15); cg_emit8(cg, 150); cg_emit8(cg, 192); // setbe al
+            cg_emit8(cg, 72); cg_emit8(cg, 15); cg_emit8(cg, 182); cg_emit8(cg, 192); // movzx rax, al
+        } else if op == 46 { // '>='
+            cg_emit8(cg, 72); cg_emit8(cg, 57); cg_emit8(cg, 216);  // cmp rax, rbx
+            cg_emit8(cg, 15); cg_emit8(cg, 151); cg_emit8(cg, 192); // setae al
+            cg_emit8(cg, 72); cg_emit8(cg, 15); cg_emit8(cg, 182); cg_emit8(cg, 192); // movzx rax, al
+        }
+        return;
+    }
+
+    if node.kind == 113 { // NODE_CALL
+        // Evaluate and pass arguments
+        let mut cur_a: *mut AstNode = node.child2;
+        let mut a_cnt: u32 = 0;
+        while cur_a != (0 as *mut AstNode) && a_cnt < 6 {
+            compile_expr(cg, cur_a);
+            cg_emit8(cg, 80); // push rax
+            a_cnt = a_cnt + 1;
+            cur_a = cur_a.next;
+        }
+        // Pop in reverse order to SysV ABI argument registers
+        let mut pop_i: u32 = a_cnt;
+        while pop_i > 0 {
+            pop_i = pop_i - 1;
+            if pop_i == 5 { cg_emit8(cg, 65); cg_emit8(cg, 89); } // pop r9
+            else if pop_i == 4 { cg_emit8(cg, 65); cg_emit8(cg, 88); } // pop r8
+            else if pop_i == 3 { cg_emit8(cg, 89); } // pop rcx
+            else if pop_i == 2 { cg_emit8(cg, 90); } // pop rdx
+            else if pop_i == 1 { cg_emit8(cg, 94); } // pop rsi
+            else if pop_i == 0 { cg_emit8(cg, 95); } // pop rdi
+        }
+
+        // Emit call rel32 (E8 xx xx xx xx)
+        cg_emit8(cg, 232); // 0xE8
+        let hole_offset: u32 = cg.text_size;
+        cg_emit32(cg, 0);
+
+        let cfix: *mut CallFixup = ((cg.call_fixups as *mut u8) + ((cg.call_fixup_count as u64) * 16)) as *mut CallFixup;
+        cfix.hole_offset = hole_offset;
+        cfix.pad = 0;
+        cfix.callee_hash = node.hash;
+        cg.call_fixup_count = cg.call_fixup_count + 1;
+
+        // Register EIA_PATCH_SYM_REL32 relocation hole
+        cg_add_reloc_ex(cg, hole_offset, 2, node.hash, node.hash);
+        return;
+    }
+}
+
+fn compile_stmt(cg: *mut CodeGen, stmt: *mut AstNode) {
+    if stmt == (0 as *mut AstNode) { return; }
+
+    if stmt.kind == 105 { // NODE_LET
+        let var_hash: u64 = stmt.hash;
+        let mut var_size: u32 = 8;
+        let mut is_ptr: u32 = 0;
+        if stmt.id == 1 { is_ptr = 1; }
+        let mut is_val: u32 = 0;
+        if stmt.id == 3 { is_val = 1; }
+        if stmt.id == 10 || stmt.id == 11 {
+            is_val = 1;
+            is_ptr = stmt.id; // record 10 for byte array, 11 for pointer array
+            var_size = stmt.val as u32;
+        }
+        let mut s_hash: u64 = 0;
+
+        if is_val == 1 && stmt.id == 3 {
+            s_hash = stmt.val;
+            let si: *mut StructInfo = cg_find_struct(cg, s_hash);
+            if si != (0 as *mut StructInfo) {
+                var_size = si.total_size;
+            } else {
+                var_size = 24;
+            }
+        } else if is_ptr == 1 {
+            s_hash = stmt.val;
+            var_size = 8;
+        }
+
+        let aligned_size: u32 = ((var_size + 7) / 8) * 8;
+        cg.current_stack_offset = cg.current_stack_offset + aligned_size;
+
+        let lv: *mut LocalVar = ((cg.locals as *mut u8) + ((cg.local_count as u64) * 32)) as *mut LocalVar;
+        lv.name_hash = var_hash;
+        lv.rbp_offset = cg.current_stack_offset;
+        lv.size = var_size;
+        lv.is_struct_ptr = is_ptr;
+        lv.is_struct_val = is_val;
+        lv.struct_hash = s_hash;
+        cg.local_count = cg.local_count + 1;
+
+        if stmt.child1 != (0 as *mut AstNode) {
+            compile_expr(cg, stmt.child1);
+            // mov [rbp - rbp_offset], rax
+            cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 133);
+            cg_emit32(cg, 0 - lv.rbp_offset);
+        }
+        return;
+    }
+
+    if stmt.kind == 106 { // NODE_ASSIGN
+        let lhs: *mut AstNode = stmt.child1;
+        let rhs: *mut AstNode = stmt.child2;
+
+        if lhs.kind == 115 { // arr[idx] = rhs
+            compile_expr(cg, lhs.child1); // base in rax
+            cg_emit8(cg, 80);             // push rax
+            compile_expr(cg, lhs.child2); // index in rax
+            cg_emit8(cg, 91);             // pop rbx (base)
+
+            let mut is_byte: u32 = 1;
+            if lhs.child1.kind == 117 {
+                let lv: *mut LocalVar = cg_find_local(cg, lhs.child1.hash);
+                if lv != (0 as *mut LocalVar) && (lv.is_struct_ptr == 11 || lv.name_hash == 9892488102507485283) {
+                    is_byte = 0;
+                }
+            }
+
+            if is_byte == 1 {
+                cg_emit8(cg, 72); cg_emit8(cg, 1); cg_emit8(cg, 195); // add rbx, rax
+                cg_emit8(cg, 83); // push rbx
+                compile_expr(cg, rhs);
+                cg_emit8(cg, 91); // pop rbx
+                cg_emit8(cg, 136); cg_emit8(cg, 3); // mov byte ptr [rbx], al
+            } else {
+                cg_emit8(cg, 72); cg_emit8(cg, 193); cg_emit8(cg, 224); cg_emit8(cg, 3); // shl rax, 3
+                cg_emit8(cg, 72); cg_emit8(cg, 1); cg_emit8(cg, 195); // add rbx, rax
+                cg_emit8(cg, 83); // push rbx
+                compile_expr(cg, rhs);
+                cg_emit8(cg, 91); // pop rbx
+                cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 3); // mov [rbx], rax
+            }
+            return;
+        }
+
+        if lhs.kind == 114 { // p.field = rhs
+            let base: *mut AstNode = lhs.child1;
+            let mut s_hash: u64 = 0;
+            if base != (0 as *mut AstNode) && base.kind == 117 {
+                let lv: *mut LocalVar = cg_find_local(cg, base.hash);
+                if lv != (0 as *mut LocalVar) {
+                    s_hash = lv.struct_hash;
+                }
+            }
+            if s_hash == 0 && cg.struct_count > 0 {
+                let first_s: *mut StructInfo = cg.structs;
+                s_hash = first_s.type_sig_hash;
+            }
+
+            compile_expr(cg, base);
+            cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 198); // mov rsi, rax
+
+            // EIA hole: lea rdi, [rsi + 0x00000000]
+            cg_emit8(cg, 72); cg_emit8(cg, 141); cg_emit8(cg, 190);
+            let hole_offset: u32 = cg.text_size;
+            cg_emit32(cg, 0);
+            cg_add_reloc(cg, hole_offset, s_hash, lhs.hash);
+
+            cg_emit8(cg, 87); // push rdi (target address)
+            compile_expr(cg, rhs);
+            cg_emit8(cg, 95); // pop rdi
+
+            // mov [rdi], rax (48 89 07)
+            cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 7);
+            return;
+        }
+
+        if lhs.kind == 117 { // var = rhs
+            let lv: *mut LocalVar = cg_find_local(cg, lhs.hash);
+            compile_expr(cg, rhs);
+            if lv != (0 as *mut LocalVar) {
+                cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 133);
+                cg_emit32(cg, 0 - lv.rbp_offset);
+            }
+            return;
+        }
+    }
+
+    if stmt.kind == 107 { // NODE_IF
+        compile_expr(cg, stmt.child1);
+        cg_emit8(cg, 72); cg_emit8(cg, 133); cg_emit8(cg, 192); // test rax, rax
+        cg_emit8(cg, 15); cg_emit8(cg, 132);                    // jz .Lend
+        let jz_end_hole: u32 = cg.text_size;
+        cg_emit32(cg, 0);
+
+        let mut bs: *mut AstNode = stmt.child2;
+        while bs != (0 as *mut AstNode) {
+            compile_stmt(cg, bs);
+            bs = bs.next;
+        }
+
+        let end_offset: u32 = cg.text_size;
+        cg_patch32(cg, jz_end_hole, end_offset - (jz_end_hole + 4));
+        return;
+    }
+
+    if stmt.kind == 108 { // NODE_WHILE
+        let loop_offset: u32 = cg.text_size;
+        compile_expr(cg, stmt.child1);
+        cg_emit8(cg, 72); cg_emit8(cg, 133); cg_emit8(cg, 192); // test rax, rax
+        cg_emit8(cg, 15); cg_emit8(cg, 132);                    // jz .Lend
+        let jz_end_hole: u32 = cg.text_size;
+        cg_emit32(cg, 0);
+
+        let mut bs: *mut AstNode = stmt.child2;
+        while bs != (0 as *mut AstNode) {
+            compile_stmt(cg, bs);
+            bs = bs.next;
+        }
+
+        cg_emit8(cg, 233); // jmp loop_offset
+        let jmp_disp: i32 = (loop_offset as i32) - ((cg.text_size + 4) as i32);
+        cg_emit32(cg, jmp_disp as u32);
+
+        let end_offset: u32 = cg.text_size;
+        cg_patch32(cg, jz_end_hole, end_offset - (jz_end_hole + 4));
+        return;
+    }
+
+    if stmt.kind == 109 { // NODE_RETURN
+        if stmt.child1 != (0 as *mut AstNode) {
+            compile_expr(cg, stmt.child1);
+        } else {
+            cg_emit8(cg, 49); cg_emit8(cg, 192); // xor eax, eax
+        }
+        // Epilogue: mov rsp, rbp; pop rbp; ret
+        cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 236);
+        cg_emit8(cg, 93);
+        cg_emit8(cg, 195);
+        return;
+    }
+
+    if stmt.kind == 110 { // NODE_EXPR_STMT
+        compile_expr(cg, stmt.child1);
+        return;
+    }
+}
+
+fn compile_fn(cg: *mut CodeGen, fnode: *mut AstNode) {
+    let fn_text_offset: u32 = cg.text_size;
+    let fn_vaddr: u64 = 4259840 + (fn_text_offset as u64); // 0x410000 = 4259840
+
+    let fe: *mut FnEntry = ((cg.fn_entries as *mut u8) + ((cg.fn_entry_count as u64) * 16)) as *mut FnEntry;
+    fe.fn_hash = fnode.hash;
+    fe.text_offset = fn_text_offset;
+    fe.pad = 0;
+    cg.fn_entry_count = cg.fn_entry_count + 1;
+
+    // Prologue: push rbp; mov rbp, rsp; sub rsp, 4096
+    cg_emit8(cg, 85);
+    cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 229);
+    cg_emit8(cg, 72); cg_emit8(cg, 129); cg_emit8(cg, 236); cg_emit32(cg, 4096);
+
+    cg.local_count = 0;
+    cg.current_stack_offset = 0;
+
+    // Save incoming parameters from registers to stack frame slots
+    let mut p_idx: u32 = 0;
+    let mut p_cur: *mut AstNode = fnode.child2;
+    while p_cur != (0 as *mut AstNode) && p_idx < 6 {
+        cg.current_stack_offset = cg.current_stack_offset + 8;
+        let lv: *mut LocalVar = ((cg.locals as *mut u8) + ((cg.local_count as u64) * 32)) as *mut LocalVar;
+        lv.name_hash = p_cur.hash;
+        lv.rbp_offset = cg.current_stack_offset;
+        lv.size = 8;
+        lv.is_struct_ptr = p_cur.is_mut;
+        lv.is_struct_val = 0;
+        lv.struct_hash = p_cur.val;
+        cg.local_count = cg.local_count + 1;
+
+        if p_idx == 0 { cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 189); } // mov [rbp - disp], rdi
+        else if p_idx == 1 { cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 181); } // rsi
+        else if p_idx == 2 { cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 149); } // rdx
+        else if p_idx == 3 { cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 141); } // rcx
+        else if p_idx == 4 { cg_emit8(cg, 76); cg_emit8(cg, 137); cg_emit8(cg, 133); } // r8
+        else if p_idx == 5 { cg_emit8(cg, 76); cg_emit8(cg, 137); cg_emit8(cg, 141); } // r9
+        cg_emit32(cg, 0 - lv.rbp_offset);
+
+        p_idx = p_idx + 1;
+        p_cur = p_cur.next;
+    }
+
+    let mut stmt: *mut AstNode = fnode.child1;
+    while stmt != (0 as *mut AstNode) {
+        compile_stmt(cg, stmt);
+        stmt = stmt.next;
+    }
+
+    // Epilogue default: mov rsp, rbp; pop rbp; ret
+    cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 236);
+    cg_emit8(cg, 93);
+    cg_emit8(cg, 195);
+
+    let fn_code_size: u64 = (cg.text_size - fn_text_offset) as u64;
+
+    // Collect parameter types and ptr kinds
+    let mut param_types_buf: [u64; 64];
+    let mut param_ptrs_buf: [u64; 64];
+    let p_types: *mut u64 = &mut param_types_buf[0];
+    let p_ptrs: *mut u64 = &mut param_ptrs_buf[0];
+    let mut pc: *mut AstNode = fnode.child2;
+    let mut p_count: u32 = 0;
+    while pc != (0 as *mut AstNode) && p_count < 64 {
+        p_types[p_count as u64] = pc.val;
+        p_ptrs[p_count as u64] = pc.is_mut as u64;
+        p_count = p_count + 1;
+        pc = pc.next;
+    }
+    let fn_cconv: u32 = fnode.id as u32;
+    let sig_hash: u64 = compute_canonical_sig_hash(p_count, fn_cconv, fnode.val, p_types as *u64, p_ptrs as *u64);
+
+    // Register SymbolContract
+    let sc: *mut SymbolContract = ((cg.contracts as *mut u8) + ((cg.contract_count as u64) * 48)) as *mut SymbolContract;
+    sc.symbol_hash = fnode.hash;
+    sc.type_sig_hash = sig_hash;
+    sc.vaddr = fn_vaddr;
+    sc.code_size = fn_code_size;
+    sc.flags = 1;
+    sc.param_conv = (p_count & 65535) | ((fn_cconv & 65535) << 16);
+    sc.contract_digest = blake3_hash64(sc as *u8, 40);
+    cg.contract_count = cg.contract_count + 1;
+
+    // Patch call main hole in _start
+    if cg.call_main_hole != 0 {
+        let disp: i32 = (fn_text_offset as i32) - ((cg.call_main_hole + 4) as i32);
+        cg_patch32(cg, cg.call_main_hole, disp as u32);
+    }
+}
+
+// -------------------------------------------------------------------------

@@ -1,0 +1,223 @@
+// -------------------------------------------------------------------------
+
+struct Token {
+    kind: u32,
+    start: *u8,
+    len: u32,
+    int_val: u64,
+    hash: u64,
+}
+
+struct Lexer {
+    src: *u8,
+    len: u64,
+    pos: u64,
+    line: u32,
+    col: u32,
+}
+
+fn skip_whitespace(lex: *mut Lexer) {
+    let mut loop_flag: u32 = 1;
+    while loop_flag == 1 {
+        if lex.pos >= lex.len {
+            loop_flag = 0;
+        } else {
+            let c: u8 = lex.src[lex.pos];
+            if c == 32 || c == 9 || c == 10 || c == 13 {
+                if c == 10 {
+                    lex.line = lex.line + 1;
+                    lex.col = 1;
+                } else {
+                    lex.col = lex.col + 1;
+                }
+                lex.pos = lex.pos + 1;
+            } else if c == 47 {
+                let next_pos: u64 = lex.pos + 1;
+                if next_pos < lex.len && lex.src[next_pos] == 47 {
+                    lex.pos = lex.pos + 2;
+                    while lex.pos < lex.len && lex.src[lex.pos] != 10 {
+                        lex.pos = lex.pos + 1;
+                    }
+                } else {
+                    loop_flag = 0;
+                }
+            } else {
+                loop_flag = 0;
+            }
+        }
+    }
+}
+
+fn lex_next_token(lex: *mut Lexer, tok: *mut Token) {
+    skip_whitespace(lex);
+
+    if lex.pos >= lex.len {
+        tok.kind = 0; // EOF
+        tok.start = lex.src + lex.pos;
+        tok.len = 0;
+        tok.int_val = 0;
+        tok.hash = 0;
+        return;
+    }
+
+    let start_pos: u64 = lex.pos;
+    let start_ptr: *u8 = lex.src + start_pos;
+    let c: u8 = lex.src[start_pos];
+    lex.pos = lex.pos + 1;
+    lex.col = lex.col + 1;
+
+    // 1. Identifiers & Keywords
+    if is_alpha(c) == 1 {
+        while lex.pos < lex.len && is_alnum(lex.src[lex.pos]) == 1 {
+            lex.pos = lex.pos + 1;
+            lex.col = lex.col + 1;
+        }
+        let tok_len: u32 = (lex.pos - start_pos) as u32;
+        let h: u64 = hash_identifier(start_ptr, tok_len);
+        let k: u32 = classify_keyword(h);
+
+        tok.kind = k;
+        tok.start = start_ptr;
+        tok.len = tok_len;
+        tok.int_val = 0;
+        tok.hash = h;
+        return;
+    }
+
+    // 2. Integer Literals
+    if is_digit(c) == 1 {
+        let mut val: u64 = (c - 48) as u64;
+        while lex.pos < lex.len && is_digit(lex.src[lex.pos]) == 1 {
+            let d: u8 = lex.src[lex.pos];
+            val = val * 10 + ((d - 48) as u64);
+            lex.pos = lex.pos + 1;
+            lex.col = lex.col + 1;
+        }
+        tok.kind = 2; // TOK_INT
+        tok.start = start_ptr;
+        tok.len = (lex.pos - start_pos) as u32;
+        tok.int_val = val;
+        tok.hash = 0;
+        return;
+    }
+
+    // 3. String Literals
+    if c == 34 { // '"'
+        while lex.pos < lex.len && lex.src[lex.pos] != 34 {
+            if lex.src[lex.pos] == 92 { // '\\'
+                lex.pos = lex.pos + 1;
+            }
+            lex.pos = lex.pos + 1;
+            lex.col = lex.col + 1;
+        }
+        if lex.pos < lex.len {
+            lex.pos = lex.pos + 1; // closing quote
+            lex.col = lex.col + 1;
+        }
+        tok.kind = 3; // TOK_STRING
+        tok.start = start_ptr;
+        tok.len = (lex.pos - start_pos) as u32;
+        tok.int_val = 0;
+        tok.hash = 0;
+        return;
+    }
+
+    // 4. Character Literals
+    if c == 39 { // '\''
+        while lex.pos < lex.len && lex.src[lex.pos] != 39 {
+            lex.pos = lex.pos + 1;
+            lex.col = lex.col + 1;
+        }
+        if lex.pos < lex.len {
+            lex.pos = lex.pos + 1;
+            lex.col = lex.col + 1;
+        }
+        tok.kind = 4; // TOK_CHAR
+        tok.start = start_ptr;
+        tok.len = (lex.pos - start_pos) as u32;
+        tok.int_val = 0;
+        tok.hash = 0;
+        return;
+    }
+
+    // 5. Operators & Punctuation
+    if c == 45 { // '-'
+        if lex.pos < lex.len && lex.src[lex.pos] == 62 { // '->'
+            lex.pos = lex.pos + 1;
+            tok.kind = 74; // TOK_ARROW
+        } else {
+            tok.kind = 31; // TOK_MINUS
+        }
+    } else if c == 61 { // '='
+        if lex.pos < lex.len && lex.src[lex.pos] == 61 { // '=='
+            lex.pos = lex.pos + 1;
+            tok.kind = 41; // TOK_EQEQ
+        } else if lex.pos < lex.len && lex.src[lex.pos] == 62 { // '=>'
+            lex.pos = lex.pos + 1;
+            tok.kind = 76; // TOK_FAT_ARROW
+        } else {
+            tok.kind = 40; // TOK_EQ
+        }
+    } else if c == 33 { // '!'
+        if lex.pos < lex.len && lex.src[lex.pos] == 61 { // '!='
+            lex.pos = lex.pos + 1;
+            tok.kind = 42; // TOK_NEQ
+        } else {
+            tok.kind = 54; // TOK_EXCL
+        }
+    } else if c == 60 { // '<'
+        if lex.pos < lex.len && lex.src[lex.pos] == 60 { // '<<'
+            lex.pos = lex.pos + 1;
+            tok.kind = 47; // TOK_SHL
+        } else if lex.pos < lex.len && lex.src[lex.pos] == 61 { // '<='
+            lex.pos = lex.pos + 1;
+            tok.kind = 45; // TOK_LTE
+        } else {
+            tok.kind = 43; // TOK_LT
+        }
+    } else if c == 62 { // '>'
+        if lex.pos < lex.len && lex.src[lex.pos] == 62 { // '>>'
+            lex.pos = lex.pos + 1;
+            tok.kind = 48; // TOK_SHR
+        } else if lex.pos < lex.len && lex.src[lex.pos] == 61 { // '>='
+            lex.pos = lex.pos + 1;
+            tok.kind = 46; // TOK_GTE
+        } else {
+            tok.kind = 44; // TOK_GT
+        }
+    } else if c == 43 { tok.kind = 30; } // '+'
+    else if c == 42 { tok.kind = 32; } // '*'
+    else if c == 47 { tok.kind = 33; } // '/'
+    else if c == 37 { tok.kind = 34; } // '%'
+    else if c == 38 { tok.kind = 50; } // '&'
+    else if c == 124 {
+        if lex.pos < lex.len && lex.src[lex.pos] == 62 { // '|>'
+            lex.pos = lex.pos + 1;
+            tok.kind = 75; // TOK_PIPE_GT
+        } else {
+            tok.kind = 51; // '|'
+        }
+    }
+    else if c == 64 { tok.kind = 56; } // '@'
+    else if c == 94 { tok.kind = 52; } // '^'
+    else if c == 126 { tok.kind = 53; } // '~'
+    else if c == 40 { tok.kind = 60; } // '('
+    else if c == 41 { tok.kind = 61; } // ')'
+    else if c == 123 { tok.kind = 62; } // '{'
+    else if c == 125 { tok.kind = 63; } // '}'
+    else if c == 91 { tok.kind = 64; } // '['
+    else if c == 93 { tok.kind = 65; } // ']'
+    else if c == 58 { tok.kind = 70; } // ':'
+    else if c == 59 { tok.kind = 71; } // ';'
+    else if c == 44 { tok.kind = 72; } // ','
+    else if c == 46 { tok.kind = 73; } // '.'
+    else if c == 35 { tok.kind = 55; } // '#'
+    else { tok.kind = 0; }
+
+    tok.start = start_ptr;
+    tok.len = (lex.pos - start_pos) as u32;
+    tok.int_val = 0;
+    tok.hash = 0;
+}
+
+// -------------------------------------------------------------------------

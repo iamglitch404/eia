@@ -1,0 +1,114 @@
+(* ========================================================================= *)
+(*                     RUX (.rux) FORMAL EBNF GRAMMAR                        *)
+(*               Holographic Continuum Programming Paradigm                  *)
+(* ========================================================================= *)
+
+Module              ::= TopLevelItem* EOF ;
+
+TopLevelItem        ::= Decorator* ( ShapeDef | StructDef | FnDef | ConstDecl | ExternFnDecl ) Delimiter* ;
+
+Delimiter           ::= ";" | NEWLINE ;
+
+(* ---------------------------- Decorators --------------------------------- *)
+Decorator           ::= "@" Identifier ( "(" ( DecoratorArg ( "," DecoratorArg )* ","? )? ")" )? ;
+DecoratorArg        ::= Identifier ":" ( StringLiteral | IntegerLiteral | BooleanLiteral | Identifier ) ;
+
+(* -------------------------- Shape & Struct ------------------------------- *)
+ShapeDef            ::= ( "shape" | "struct" ) Identifier "{" ( FieldDef ( ( "," | Delimiter ) FieldDef )* ( "," | Delimiter )? )? "}" ;
+FieldDef            ::= Identifier ":" Type ;
+
+(* ------------------------- Function Definition --------------------------- *)
+FnDef               ::= "fn" Identifier "(" ( Param ( "," Param )* ","? )? ")" ( "->" Type )? ( Block | ArrowBody ) ;
+ArrowBody           ::= "=>" Expr ;
+ExternFnDecl        ::= "extern" "fn" Identifier "(" ( Param ( "," Param )* ","? )? ")" ( "->" Type )? Delimiter ;
+Param               ::= Identifier ":" Type ;
+
+(* ------------------------------ Type System ------------------------------ *)
+Type                ::= PrimitiveType
+                      | PointerType
+                      | ArrayType
+                      | NamedType ;
+
+PrimitiveType       ::= "i64" | "u64" | "i32" | "u32" | "u16" | "u8" | "bool" | "void" ;
+PointerType         ::= "*" "mut"? Type ;
+ArrayType           ::= "[" Type ";" IntegerLiteral "]" ;
+NamedType           ::= Identifier ;
+
+(* ------------------------------ Statements ------------------------------- *)
+Block               ::= "{" Statement* "}" ;
+
+Statement           ::= ( LetStmt
+                        | MutStmt
+                        | ConstDecl
+                        | AssignStmt
+                        | IfStmt
+                        | WhileStmt
+                        | ReturnStmt
+                        | PrintStmt
+                        | ExprStmt ) Delimiter* ;
+
+LetStmt             ::= "let" "mut"? Identifier ( ":" Type )? ( "=" Expr )? ;
+MutStmt             ::= "mut" Identifier ( ":" Type )? ( "=" Expr )? ;
+ConstDecl           ::= "const" Identifier ( ":" Type )? "=" Expr ;
+AssignStmt          ::= LValue ( "=" | "+=" | "-=" | "*=" | "/=" ) Expr ;
+IfStmt              ::= "if" Expr Block ( "else" ( IfStmt | Block ) )? ;
+WhileStmt           ::= "while" Expr Block ;
+ReturnStmt          ::= "return" Expr? ;
+PrintStmt           ::= ( "print" | "println" ) "(" ( Expr ( "," Expr )* )? ")" ;
+ExprStmt            ::= Expr ;
+
+LValue              ::= Identifier
+                      | "*" LValue
+                      | PostfixExpr "." Identifier
+                      | PostfixExpr "[" Expr "]" ;
+
+(* ----------------------------- Expressions ------------------------------- *)
+Expr                ::= PipeExpr ;
+
+PipeExpr            ::= LogicalOrExpr ( "|>" PipeTarget )* ;
+PipeTarget          ::= Identifier ( "(" ( Expr ( "," Expr )* )? ")" )? ;
+
+LogicalOrExpr       ::= LogicalAndExpr ( "||" LogicalAndExpr )* ;
+LogicalAndExpr      ::= BitwiseOrExpr ( "&&" BitwiseOrExpr )* ;
+BitwiseOrExpr       ::= BitwiseXorExpr ( "|" BitwiseXorExpr )* ;
+BitwiseXorExpr      ::= BitwiseAndExpr ( "^" BitwiseAndExpr )* ;
+BitwiseAndExpr      ::= EqualityExpr ( "&" EqualityExpr )* ;
+
+EqualityExpr        ::= RelationalExpr ( ( "==" | "!=" ) RelationalExpr )* ;
+RelationalExpr      ::= ShiftExpr ( ( "<" | "<=" | ">" | ">=" ) ShiftExpr )* ;
+ShiftExpr           ::= AdditiveExpr ( ( "<<" | ">>" ) AdditiveExpr )* ;
+AdditiveExpr        ::= MultiplicativeExpr ( ( "+" | "-" ) MultiplicativeExpr )* ;
+MultiplicativeExpr  ::= CastExpr ( ( "*" | "/" | "%" ) CastExpr )* ;
+
+CastExpr            ::= UnaryExpr ( "as" Type )* ;
+
+UnaryExpr           ::= ( "-" | "!" | "~" | "*" | "&" | "&mut" ) UnaryExpr
+                      | PostfixExpr ;
+
+PostfixExpr         ::= PrimaryExpr ( CallSuffix | MemberSuffix | IndexSuffix )* ;
+CallSuffix          ::= "(" ( Expr ( "," Expr )* ","? )? ")" ;
+MemberSuffix        ::= "." Identifier ;
+IndexSuffix         ::= "[" Expr "]" ;
+
+PrimaryExpr         ::= Identifier
+                      | IntegerLiteral
+                      | StringLiteral
+                      | CharacterLiteral
+                      | BooleanLiteral
+                      | BuiltinSyscall
+                      | BuiltinSilicon
+                      | "(" Expr ")" ;
+
+BooleanLiteral      ::= "true" | "false" ;
+
+BuiltinSyscall      ::= "syscall" "(" Expr ( "," Expr )* ")" ;
+BuiltinSilicon      ::= "silicon" "." ( "rdtsc" "(" ")"
+                                      | "icache_sync" "(" ")"
+                                      | "clwb" "(" Expr ")"
+                                      | "syscall" "(" Expr ( "," Expr )* ")" ) ;
+
+(* -------------------------- Lexical Elements ------------------------------ *)
+Identifier          ::= [a-zA-Z_] [a-zA-Z0-9_]* ;
+IntegerLiteral      ::= [0-9]+ | "0x" [0-9a-fA-F]+ | "0b" [01]+ ;
+StringLiteral       ::= '"' ( [^"\\] | '\\' . )* '"' ;
+CharacterLiteral    ::= "'" ( [^'\\] | '\\' . ) "'" ;

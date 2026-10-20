@@ -1,0 +1,50 @@
+// =========================================================================
+//            STAGE-1 SELF-HOSTED RUX COMPILER (rux.rx)
+//              Governed by Eternal Interface Architecture (EIA)
+// =========================================================================
+
+// -------------------------------------------------------------------------
+//                         1. EIA Core Structures
+// -------------------------------------------------------------------------
+
+struct UniversalHologramHeader {
+    magic: u32,
+    version: u32,
+    abi_epoch: u64,
+    contracts_offset: u64,
+    contracts_count: u64,
+    relocs_offset: u64,
+    relocs_count: u64,
+    type_graph_offset: u64,
+    type_graph_size: u64,
+    blake3_root: u64,
+    flags: u64,
+    reserved0: u64,
+    reserved1: u64,
+}
+
+struct SymbolContract {
+    symbol_hash: u64,
+    type_sig_hash: u64,
+    vaddr: u64,
+    code_size: u64,
+    flags: u32,
+    param_conv: u32,
+    contract_digest: u64,
+}
+
+struct EiaRelocHole {
+    insn_offset: u32,
+    patch_kind: u32,
+    type_sig_hash: u64,
+    field_or_sym_hash: u64,
+}
+
+struct EiaTypeGraphEntry {
+    type_sig_hash: u64,
+    field_hash: u64,
+    byte_offset: u32,
+    field_size: u32,
+}
+
+// -------------------------------------------------------------------------

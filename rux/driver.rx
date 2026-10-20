@@ -1,0 +1,442 @@
+//                         10. Main Stage-1 Sovereign Compiler Driver
+// -------------------------------------------------------------------------
+
+fn main(argc: u64, argv: *mut *mut u8) -> i64 {
+    // 1. Initialize Arenas (16MB each)
+    let mut parse_arena: Arena;
+    arena_init(&mut parse_arena, 16777216);
+
+    let mut cg_arena: Arena;
+    arena_init(&mut cg_arena, 16777216);
+
+    // 2. Parse Command Line Arguments
+    let mut in_path: *u8 = "tests/hello_eia.rx";
+    let mut out_path: *u8 = "bin/hello_from_core1";
+    let mut permute_seed: u64 = 0;
+    let mut force_bridge: u32 = 0;
+    let mut is_upbp: u32 = 0;
+    let mut target_arch: u64 = 0;
+    let mut is_run_mode: u32 = 0;
+
+    let mut arg_i: u64 = 1;
+    while arg_i < argc {
+        let arg: *u8 = argv[arg_i];
+        if arg[0] == 114 && arg[1] == 117 && arg[2] == 110 && arg[3] == 0 { // "run"
+            is_run_mode = 1;
+            out_path = "/tmp/rux_exec";
+        } else if arg[0] == 98 && arg[1] == 117 && arg[2] == 105 && arg[3] == 108 && arg[4] == 100 && arg[5] == 0 { // "build"
+            // skip build keyword
+        } else if arg[0] == 45 && arg[1] == 111 && arg[2] == 0 { // "-o"
+            arg_i = arg_i + 1;
+            if arg_i < argc {
+                out_path = argv[arg_i];
+            }
+        } else if arg[0] == 45 && arg[1] == 45 { // starts with "--"
+            let seed_prefix: *u8 = "--eia-permute-seed=";
+            let mut is_seed: u32 = 1;
+            let mut si: u64 = 0;
+            while si < 19 {
+                if arg[si] != seed_prefix[si] {
+                    is_seed = 0;
+                }
+                si = si + 1;
+            }
+            if is_seed == 1 {
+                let val_ptr: *u8 = arg + 19;
+                let mut v: u64 = 0;
+                let mut vi: u64 = 0;
+                if val_ptr[0] == 48 && (val_ptr[1] == 120 || val_ptr[1] == 88) { // "0x"
+                    vi = 2;
+                    while val_ptr[vi] != 0 {
+                        let c: u8 = val_ptr[vi];
+                        let mut digit: u64 = 0;
+                        if c >= 48 && c <= 57 { digit = (c - 48) as u64; }
+                        else if c >= 97 && c <= 102 { digit = ((c - 97) + 10) as u64; }
+                        else if c >= 65 && c <= 70 { digit = ((c - 65) + 10) as u64; }
+                        v = (v * 16) + digit;
+                        vi = vi + 1;
+                    }
+                } else {
+                    while val_ptr[vi] != 0 {
+                        let c: u8 = val_ptr[vi];
+                        if c >= 48 && c <= 57 {
+                            v = (v * 16) + ((c - 48) as u64);
+                        } else if c >= 65 && c <= 70 {
+                            v = (v * 16) + ((c - 55) as u64);
+                        } else if c >= 97 && c <= 102 {
+                            v = (v * 16) + ((c - 87) as u64);
+                        }
+                        vi = vi + 1;
+                    }
+                }
+                permute_seed = v;
+            } else {
+                let bridge_flag: *u8 = "--arll-force-bridge";
+                let mut is_bridge: u32 = 1;
+                let mut bi: u64 = 0;
+                while bi < 17 {
+                    if arg[bi] != bridge_flag[bi] {
+                        is_bridge = 0;
+                    }
+                    bi = bi + 1;
+                }
+                if is_bridge == 1 {
+                    force_bridge = 1;
+                }
+
+                let upbp_flag: *u8 = "--upbp";
+                let mut is_upbp_arg: u32 = 1;
+                let mut ui: u64 = 0;
+                while ui < 5 {
+                    if arg[ui] != upbp_flag[ui] {
+                        is_upbp_arg = 0;
+                    }
+                    ui = ui + 1;
+                }
+                if is_upbp_arg == 1 {
+                    is_upbp = 1;
+                }
+
+                let elf_flag: *u8 = "--elf";
+                let mut is_elf_arg: u32 = 1;
+                let mut ei: u64 = 0;
+                while ei < 5 {
+                    if arg[ei] != elf_flag[ei] {
+                        is_elf_arg = 0;
+                    }
+                    ei = ei + 1;
+                }
+                if is_elf_arg == 1 {
+                    is_upbp = 0;
+                }
+
+                let target_flag: *u8 = "--target=";
+                let mut is_target_arg: u32 = 1;
+                let mut ti: u64 = 0;
+                while ti < 9 {
+                    if arg[ti] != target_flag[ti] {
+                        is_target_arg = 0;
+                    }
+                    ti = ti + 1;
+                }
+                if is_target_arg == 1 {
+                    let targ_val: *u8 = arg + 9;
+                    if targ_val[0] == 97 && targ_val[1] == 114 && targ_val[2] == 109 && targ_val[3] == 54 && targ_val[4] == 52 {
+                        // "arm64"
+                        target_arch = 1;
+                    } else if targ_val[0] == 114 && targ_val[1] == 105 && targ_val[2] == 115 && targ_val[3] == 99 && targ_val[4] == 118 && targ_val[5] == 54 && targ_val[6] == 52 {
+                        // "riscv64"
+                        target_arch = 2;
+                    } else {
+                        // "x86_64" default
+                        target_arch = 0;
+                    }
+                }
+            }
+        } else {
+            in_path = arg;
+        }
+        arg_i = arg_i + 1;
+    }
+
+    if permute_seed != 0 {
+        let dummy_pad: u64 = (permute_seed % 64) * 8;
+        arena_alloc(&mut parse_arena, dummy_pad as u32);
+        arena_alloc(&mut cg_arena, dummy_pad as u32);
+    }
+
+    if force_bridge == 1 {
+        let mut b: CallingConventionBridge;
+        arll_negotiate_calling_convention(&mut b, 1, 2);
+        arll_negotiate_calling_convention(&mut b, 2, 1);
+    }
+
+    // 3. Open input source file
+    let fd: i64 = syscall(2, in_path, 0, 0); // SYS_open
+    if fd < 0 {
+        let err1: *u8 = "ERROR: Failed to open input file\n";
+        syscall(1, 2, err1, 32);
+        syscall(60, 1);
+        return 1;
+    }
+
+    let src_buf: *mut u8 = mmap_alloc(2097152); // 2MB
+    let nread: i64 = syscall(0, fd, src_buf, 2097152); // SYS_read
+    syscall(3, fd);
+
+    if nread <= 0 {
+        let err2: *u8 = "ERROR: Failed to read input file\n";
+        syscall(1, 2, err2, 32);
+        syscall(60, 2);
+        return 2;
+    }
+
+    // 4. Initialize Lexer & Parser
+    let mut lexer: Lexer;
+    lexer.src = src_buf;
+    lexer.len = nread as u64;
+    lexer.pos = 0;
+    lexer.line = 1;
+    lexer.col = 1;
+
+    let mut parser: Parser;
+    parser.lex = &mut lexer;
+    parser.arena = &mut parse_arena;
+    parser.node_count = 0;
+    parser.struct_count = 0;
+    parser.fn_count = 0;
+
+    lex_next_token(parser.lex, &mut parser.cur_tok);
+
+    // 5. Initialize CodeGen
+    let mut cg: CodeGen;
+    cg.text_buf = arena_alloc(&mut cg_arena, 1048576);
+    cg.text_size = 0;
+    cg.rodata_buf = arena_alloc(&mut cg_arena, 1048576);
+    cg.rodata_size = 0;
+    cg.relocs = arena_alloc(&mut cg_arena, 1048576) as *mut EiaRelocHole;
+    cg.reloc_count = 0;
+    cg.type_graph = arena_alloc(&mut cg_arena, 1048576) as *mut EiaTypeGraphEntry;
+    cg.tg_count = 0;
+    cg.contracts = arena_alloc(&mut cg_arena, 1048576) as *mut SymbolContract;
+    cg.contract_count = 0;
+    cg.call_main_hole = 0;
+    cg.force_bridge = force_bridge as u32;
+    cg.permute_seed = permute_seed as u32;
+    cg.target_arch = target_arch as u32;
+
+    cg.call_fixups = arena_alloc(&mut cg_arena, 262144) as *mut CallFixup;
+    cg.call_fixup_count = 0;
+    cg.fn_entries = arena_alloc(&mut cg_arena, 262144) as *mut FnEntry;
+    cg.fn_entry_count = 0;
+
+    cg.structs = arena_alloc(&mut cg_arena, 262144) as *mut StructInfo;
+    cg.struct_count = 0;
+    cg.locals = arena_alloc(&mut cg_arena, 262144) as *mut LocalVar;
+    cg.local_count = 0;
+    cg.current_stack_offset = 0;
+
+    // 6. Emit _start boot patcher stub
+    emit_start_stub(&mut cg);
+
+    // 7. Parse and Compile Top-Level Items
+    let mut pending_cconv: u32 = 0;
+    while parser.cur_tok.kind != 0 {
+        if parser.cur_tok.kind == 55 { // '#'
+            parser_expect(&mut parser, 55);
+            parser_expect(&mut parser, 64); // '['
+            if parser.cur_tok.kind == 1 { // ident "abi"
+                parser_expect(&mut parser, 1);
+                parser_expect(&mut parser, 60); // '('
+                if parser.cur_tok.kind == 3 { // string
+                    let s_ptr: *u8 = parser.cur_tok.start;
+                    let s_len: u32 = parser.cur_tok.len;
+                    let mut si: u32 = 0;
+                    while (si + 5) <= s_len {
+                        if s_ptr[si] == 119 && s_ptr[si+1] == 105 && s_ptr[si+2] == 110 && s_ptr[si+3] == 54 && s_ptr[si+4] == 52 {
+                            pending_cconv = 1; // Win64
+                        }
+                        si = si + 1;
+                    }
+                    si = 0;
+                    while (si + 4) <= s_len {
+                        if s_ptr[si] == 115 && s_ptr[si+1] == 121 && s_ptr[si+2] == 115 && s_ptr[si+3] == 118 {
+                            pending_cconv = 0; // SysV
+                        }
+                        si = si + 1;
+                    }
+                    si = 0;
+                    while (si + 3) <= s_len {
+                        if s_ptr[si] == 101 && s_ptr[si+1] == 105 && s_ptr[si+2] == 97 {
+                            pending_cconv = 2; // EIA
+                        }
+                        si = si + 1;
+                    }
+                    lex_next_token(parser.lex, &mut parser.cur_tok);
+                }
+                parser_expect(&mut parser, 61); // ')'
+            }
+            parser_expect(&mut parser, 65); // ']'
+        }
+
+        if parser.cur_tok.kind == 10 { // TOK_STRUCT
+            pending_cconv = 0;
+            let snode: *mut AstNode = parse_struct(&mut parser);
+
+            let sinfo: *mut StructInfo = ((cg.structs as *mut u8) + ((cg.struct_count as u64) * 32)) as *mut StructInfo;
+            sinfo.name_hash = snode.hash;
+            sinfo.type_sig_hash = snode.hash;
+            sinfo.field_count = 0;
+            sinfo.total_size = 0;
+
+            let mut cur_offset: u32 = 0;
+            let mut f: *mut AstNode = snode.child1;
+
+            // Count fields first
+            let mut fcount: u32 = 0;
+            let mut f_temp: *mut AstNode = snode.child1;
+            while f_temp != (0 as *mut AstNode) {
+                fcount = fcount + 1;
+                f_temp = f_temp.next;
+            }
+
+            // Permute field order if permute_seed != 0
+            // Guard wire-format descriptor structs from permutation
+            let mut is_wire_struct: u32 = 0;
+            if sinfo.name_hash == 6275339306359764668 { is_wire_struct = 1; }
+            if sinfo.name_hash == 6723681229567792751 { is_wire_struct = 1; }
+            if sinfo.name_hash == 17134799602928510233 { is_wire_struct = 1; }
+            if sinfo.name_hash == 1914818511609369086 { is_wire_struct = 1; }
+
+            if cg.permute_seed != 0 && fcount >= 2 && is_wire_struct == 0 {
+                let f1: *mut AstNode = snode.child1;
+                let f2: *mut AstNode = f1.next;
+                if f1 != (0 as *mut AstNode) && f2 != (0 as *mut AstNode) {
+                    let f2_next: *mut AstNode = f2.next;
+                    snode.child1 = f2;
+                    f1.next = f2_next;
+                    f2.next = f1;
+                    f = f2; // f now points to new first field
+                }
+            }
+
+            while f != (0 as *mut AstNode) {
+                let mut f_size: u32 = 8;
+                if f.val == 23 { f_size = 1; }
+                else if f.val == 22 { f_size = 4; }
+                let f_align: u32 = f_size;
+                if (cur_offset % f_align) != 0 {
+                    cur_offset = cur_offset + (f_align - (cur_offset % f_align));
+                }
+
+                let byte_offset: u32 = cur_offset;
+                cur_offset = cur_offset + f_size;
+
+                cg_add_type_graph_entry(&mut cg, sinfo.type_sig_hash, f.hash, byte_offset, f_size);
+                sinfo.field_count = sinfo.field_count + 1;
+                f = f.next;
+            }
+
+            if (cur_offset % 8) != 0 {
+                cur_offset = cur_offset + (8 - (cur_offset % f_align));
+            }
+            sinfo.total_size = cur_offset;
+            cg.struct_count = cg.struct_count + 1;
+
+        } else if parser.cur_tok.kind == 11 { // TOK_FN
+            let fnode: *mut AstNode = parse_fn(&mut parser, pending_cconv);
+            pending_cconv = 0;
+            compile_fn(&mut cg, fnode);
+        } else if parser.cur_tok.kind == 25 { // TOK_EXTERN
+            let cur_cconv: u32 = pending_cconv;
+            pending_cconv = 0;
+            parser_expect(&mut parser, 25);
+            parser_expect(&mut parser, 11); // fn
+            let ext_name_hash: u64 = parser.cur_tok.hash;
+            parser_expect(&mut parser, 1);  // ident
+            parser_expect(&mut parser, 60); // (
+            let mut param_types_buf: [u64; 64];
+            let mut param_ptrs_buf: [u64; 64];
+            let p_types: *mut u64 = &mut param_types_buf[0];
+            let p_ptrs: *mut u64 = &mut param_ptrs_buf[0];
+            let mut param_cnt: u32 = 0;
+            while parser.cur_tok.kind != 61 && parser.cur_tok.kind != 0 {
+                parser_expect(&mut parser, 1);  // param name
+                parser_expect(&mut parser, 70); // :
+                let mut is_ptr: u32 = 0;
+                if parser.cur_tok.kind == 50 { parser_expect(&mut parser, 50); is_ptr = 1; } // &
+                if parser.cur_tok.kind == 13 { parser_expect(&mut parser, 13); is_ptr = 2; } // mut
+                if parser.cur_tok.kind == 32 { parser_expect(&mut parser, 32); is_ptr = 1; } // *
+                if parser.cur_tok.kind == 13 { parser_expect(&mut parser, 13); is_ptr = 2; } // mut
+                let p_type_hash: u64 = parser.cur_tok.hash;
+                lex_next_token(parser.lex, &mut parser.cur_tok); // type
+                if param_cnt < 64 {
+                    p_types[param_cnt as u64] = p_type_hash;
+                    p_ptrs[param_cnt as u64] = is_ptr as u64;
+                }
+                param_cnt = param_cnt + 1;
+                if parser.cur_tok.kind == 72 { parser_expect(&mut parser, 72); } // ,
+            }
+            parser_expect(&mut parser, 61); // )
+            let mut ret_type_hash: u64 = 3563412735833858527; // "void"
+            if parser.cur_tok.kind == 74 { // ->
+                parser_expect(&mut parser, 74);
+                ret_type_hash = parser.cur_tok.hash;
+                lex_next_token(parser.lex, &mut parser.cur_tok);
+            }
+            if parser.cur_tok.kind == 71 { // ;
+                parser_expect(&mut parser, 71);
+            }
+
+            let ext_sig_hash: u64 = compute_canonical_sig_hash(param_cnt, cur_cconv, ret_type_hash, p_types as *u64, p_ptrs as *u64);
+
+            // Register SymbolContract (EIA_SYM_FLAG_IMPORT = 2)
+            let sc: *mut SymbolContract = ((cg.contracts as *mut u8) + ((cg.contract_count as u64) * 48)) as *mut SymbolContract;
+            sc.symbol_hash = ext_name_hash;
+            sc.type_sig_hash = ext_sig_hash;
+            sc.vaddr = 0;
+            sc.code_size = 0;
+            sc.flags = 2; // EIA_SYM_FLAG_IMPORT
+            sc.param_conv = (param_cnt & 65535) | ((cur_cconv & 65535) << 16);
+            sc.contract_digest = blake3_hash64(sc as *u8, 40);
+            cg.contract_count = cg.contract_count + 1;
+        } else {
+            lex_next_token(parser.lex, &mut parser.cur_tok);
+        }
+    }
+
+    // GATE 3 FIX: Removed the post-pass type graph swap.
+    // The parse-time field swap (above, at struct definition time) already correctly
+    // reorders fields and recalculates byte offsets in the type graph.
+    // The post-pass swap was swapping byte_offset values AGAIN, undoing the parse-time
+    // reorder and making the chaos binary identical to the baseline (both permutations
+    // cancelled each other out), causing Gate 3's chaos binary to segfault or be identical.
+
+    // Resolve all internal function call fixups
+    let mut cfi: u32 = 0;
+    while cfi < cg.call_fixup_count {
+        let cfix: *mut CallFixup = ((cg.call_fixups as *mut u8) + ((cfi as u64) * 16)) as *mut CallFixup;
+        let mut fei: u32 = 0;
+        while fei < cg.fn_entry_count {
+            let fe: *mut FnEntry = ((cg.fn_entries as *mut u8) + ((fei as u64) * 16)) as *mut FnEntry;
+            if fe.fn_hash == cfix.callee_hash {
+                let disp: i32 = (fe.text_offset as i32) - ((cfix.hole_offset + 4) as i32);
+                cg_patch32(&mut cg, cfix.hole_offset, disp as u32);
+                fei = cg.fn_entry_count;
+            }
+            fei = fei + 1;
+        }
+        cfi = cfi + 1;
+    }
+
+    // 8. Write Standalone Binary (UPBP or Native ELF)
+    let write_res: i64 = write_elf64_binary(&mut cg, out_path, is_upbp);
+    if write_res < 0 {
+        let err3: *u8 = "ERROR: Failed to write ELF binary\n";
+        syscall(1, 2, err3, 33);
+        syscall(60, 3);
+        return 3;
+    }
+
+    if is_run_mode == 1 {
+        let pid: i64 = syscall(57); // SYS_fork
+        if pid == 0 {
+            let mut c_argv: [*mut u8; 2];
+            c_argv[0] = out_path;
+            c_argv[1] = 0 as *mut u8;
+            let mut c_envp: [*mut u8; 1];
+            c_envp[0] = 0 as *mut u8;
+            syscall(59, out_path, &c_argv[0], &c_envp[0]); // SYS_execve
+            syscall(60, 127); // SYS_exit
+        }
+        let mut status: i64 = 0;
+        syscall(61, pid, &status, 0, 0); // SYS_wait4
+        syscall(87, out_path); // SYS_unlink
+        let code: i64 = (status >> 8) & 255;
+        return code;
+    }
+
+    let msg: *u8 = "STAGE1 CORE1 COMPILER OK\n";
+    syscall(1, 1, msg, 25);
+    return 0;
+}

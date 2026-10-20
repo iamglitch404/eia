@@ -1,0 +1,19 @@
+shape Player {
+    id: u64
+    score: u64
+    level: u32
+}
+
+fn boost(val: u64, bonus: u64) => val + bonus
+
+fn main() {
+    println("Welcome to Rux!")
+    mut p: Player
+    p.id = 1
+    p.score = 30 |> boost(12)
+    p.level = 5
+    if p.score == 42 {
+        println("Kids & JS Devs Love Rux!")
+    }
+    return p.score as i64
+}

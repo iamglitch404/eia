@@ -1,5 +1,5 @@
 // =========================================================================
-//            STAGE-1 SELF-HOSTED SOVEREIGN COMPILER (core1.rx)
+//            STAGE-1 SELF-HOSTED RUX COMPILER (rux.rx)
 //              Governed by Eternal Interface Architecture (EIA)
 // =========================================================================
 
@@ -114,9 +114,9 @@ fn is_alnum(c: u8) -> u32 {
 }
 
 fn classify_keyword(h: u64) -> u32 {
-    if h == 14058172984575203104 { return 10; } // struct
+    if h == 14058172984575203104 || h == 7938019069247444294 { return 10; } // struct or shape
     if h == 619343937915704565   { return 11; } // fn
-    if h == 1329270083436697466  { return 12; } // let
+    if h == 1329270083436697466 || h == 7334518323283222324  { return 12; } // let or const
     if h == 569227173069198361   { return 13; } // mut
     if h == 628023482707099174   { return 14; } // if
     if h == 9163537027783908656  { return 15; } // else
@@ -130,6 +130,9 @@ fn classify_keyword(h: u64) -> u32 {
     if h == 631772817358541784   { return 23; } // u8
     if h == 3563412735833858527  { return 24; } // void
     if h == 417800907370030071   { return 25; } // extern
+    if h == 3388837930293092456  { return 26; } // print
+    if h == 8602815819212105030  { return 27; } // println
+    if h == 15366675508848053990 { return 28; } // silicon
     return 1; // TOK_IDENT
 }
 
@@ -289,6 +292,9 @@ fn lex_next_token(lex: *mut Lexer, tok: *mut Token) {
         if lex.pos < lex.len && lex.src[lex.pos] == 61 { // '=='
             lex.pos = lex.pos + 1;
             tok.kind = 41; // TOK_EQEQ
+        } else if lex.pos < lex.len && lex.src[lex.pos] == 62 { // '=>'
+            lex.pos = lex.pos + 1;
+            tok.kind = 76; // TOK_FAT_ARROW
         } else {
             tok.kind = 40; // TOK_EQ
         }
@@ -324,7 +330,15 @@ fn lex_next_token(lex: *mut Lexer, tok: *mut Token) {
     else if c == 47 { tok.kind = 33; } // '/'
     else if c == 37 { tok.kind = 34; } // '%'
     else if c == 38 { tok.kind = 50; } // '&'
-    else if c == 124 { tok.kind = 51; } // '|'
+    else if c == 124 {
+        if lex.pos < lex.len && lex.src[lex.pos] == 62 { // '|>'
+            lex.pos = lex.pos + 1;
+            tok.kind = 75; // TOK_PIPE_GT
+        } else {
+            tok.kind = 51; // '|'
+        }
+    }
+    else if c == 64 { tok.kind = 56; } // '@'
     else if c == 94 { tok.kind = 52; } // '^'
     else if c == 126 { tok.kind = 53; } // '~'
     else if c == 40 { tok.kind = 60; } // '('
@@ -428,6 +442,53 @@ fn parse_primary(p: *mut Parser) -> *mut AstNode {
         parser_expect(p, 61); // ')'
         return n;
     }
+    if p.cur_tok.kind == 26 || p.cur_tok.kind == 27 { // TOK_PRINT, TOK_PRINTLN
+        let is_println: u64 = 0;
+        if p.cur_tok.kind == 27 { is_println = 1; }
+        lex_next_token(p.lex, &mut p.cur_tok);
+        parser_expect(p, 60); // '('
+        let arg: *mut AstNode = parse_expr(p);
+        parser_expect(p, 61); // ')'
+        let n: *mut AstNode = alloc_node(p, 120); // NODE_PRINT
+        n.child1 = arg;
+        n.val = is_println;
+        return n;
+    }
+    if p.cur_tok.kind == 28 { // TOK_SILICON
+        lex_next_token(p.lex, &mut p.cur_tok);
+        parser_expect(p, 73); // '.'
+        let s_hash: u64 = p.cur_tok.hash;
+        lex_next_token(p.lex, &mut p.cur_tok);
+        parser_expect(p, 60); // '('
+        let n: *mut AstNode = alloc_node(p, 121); // NODE_SILICON
+        if s_hash == 8519013864044491299 { // rdtsc
+            n.val = 1;
+            parser_expect(p, 61); // ')'
+        } else if s_hash == 11664211042330080516 { // icache_sync
+            n.val = 2;
+            parser_expect(p, 61); // ')'
+        } else if s_hash == 1398147305724557775 { // clwb
+            n.val = 3;
+            n.child1 = parse_expr(p);
+            parser_expect(p, 61); // ')'
+        } else if s_hash == 6740575782527371194 { // syscall
+            n.kind = 119; // NODE_SYSCALL
+            n.child1 = parse_expr(p); // nr
+            let mut last_arg: *mut AstNode = 0 as *mut AstNode;
+            while p.cur_tok.kind == 72 { // ','
+                parser_expect(p, 72);
+                let arg: *mut AstNode = parse_expr(p);
+                if last_arg == (0 as *mut AstNode) {
+                    n.child2 = arg;
+                } else {
+                    last_arg.next = arg;
+                }
+                last_arg = arg;
+            }
+            parser_expect(p, 61); // ')'
+        }
+        return n;
+    }
     if p.cur_tok.kind == 50 { // '&'
         parser_expect(p, 50);
         if p.cur_tok.kind == 13 { // 'mut'
@@ -510,6 +571,28 @@ fn parse_expr_prec(p: *mut Parser, min_prec: u32) -> *mut AstNode {
             }
             parser_expect(p, 61); // ')'
             left = call_node;
+        } else if p.cur_tok.kind == 75 { // '|>'
+            parser_expect(p, 75);
+            let fn_name_hash: u64 = p.cur_tok.hash;
+            parser_expect(p, 1);
+            let call_node: *mut AstNode = alloc_node(p, 113); // NODE_CALL
+            let fn_ident: *mut AstNode = alloc_node(p, 117);
+            fn_ident.hash = fn_name_hash;
+            call_node.child1 = fn_ident;
+            call_node.hash = fn_name_hash;
+            call_node.child2 = left;
+            let mut last_pipe_arg: *mut AstNode = left;
+            if p.cur_tok.kind == 60 { // '('
+                parser_expect(p, 60);
+                while p.cur_tok.kind != 61 && p.cur_tok.kind != 0 {
+                    let arg: *mut AstNode = parse_expr_prec(p, 0);
+                    last_pipe_arg.next = arg;
+                    last_pipe_arg = arg;
+                    if p.cur_tok.kind == 72 { parser_expect(p, 72); }
+                }
+                parser_expect(p, 61); // ')'
+            }
+            left = call_node;
         } else {
             postfix_loop = 0;
         }
@@ -536,15 +619,14 @@ fn parse_expr(p: *mut Parser) -> *mut AstNode {
 }
 
 fn parse_stmt(p: *mut Parser) -> *mut AstNode {
-    if p.cur_tok.kind == 12 { // TOK_LET
+    if p.cur_tok.kind == 12 || p.cur_tok.kind == 13 { // TOK_LET, TOK_MUT, TOK_CONST
         let sn: *mut AstNode = alloc_node(p, 105);
-        parser_expect(p, 12);
-        if p.cur_tok.kind == 13 { // TOK_MUT
-            parser_expect(p, 13);
-        }
+        if p.cur_tok.kind == 12 { parser_expect(p, 12); }
+        if p.cur_tok.kind == 13 { parser_expect(p, 13); }
         sn.hash = p.cur_tok.hash; // Variable name hash
         parser_expect(p, 1);
-        parser_expect(p, 70); // ':'
+        if p.cur_tok.kind == 70 { // ':'
+            parser_expect(p, 70);
 
         // Parse variable type
         if p.cur_tok.kind == 64 { // '[' array type [T; N]
@@ -592,6 +674,10 @@ fn parse_stmt(p: *mut Parser) -> *mut AstNode {
             sn.val = p.cur_tok.kind as u64;
             sn.id = 0; // primitive
             lex_next_token(p.lex, &mut p.cur_tok);
+        }
+        } else {
+            sn.val = 20; // default i64
+            sn.id = 0;
         }
 
         if p.cur_tok.kind == 40 { // '='
@@ -716,6 +802,8 @@ fn parse_fn(p: *mut Parser, calling_conv: u32) -> *mut AstNode {
         if p.cur_tok.kind == 13 { parser_expect(p, 13); is_ptr = 2; } // 'mut'
         if p.cur_tok.kind == 32 { parser_expect(p, 32); is_ptr = 1; } // '*'
         if p.cur_tok.kind == 13 { parser_expect(p, 13); is_ptr = 2; } // 'mut'
+        if p.cur_tok.kind == 32 { parser_expect(p, 32); is_ptr = 11; } // '*' (pointer array / **u8)
+        if p.cur_tok.kind == 13 { parser_expect(p, 13); } // 'mut'
         pnode.val = p.cur_tok.hash;
         pnode.is_mut = is_ptr;
         lex_next_token(p.lex, &mut p.cur_tok);
@@ -738,6 +826,16 @@ fn parse_fn(p: *mut Parser, calling_conv: u32) -> *mut AstNode {
         lex_next_token(p.lex, &mut p.cur_tok);
     }
     fnode.val = ret_hash;
+
+    if p.cur_tok.kind == 76 { // '=>' arrow function
+        parser_expect(p, 76);
+        let ret_expr: *mut AstNode = parse_expr(p);
+        let ret_stmt: *mut AstNode = alloc_node(p, 107); // NODE_RETURN
+        ret_stmt.child1 = ret_expr;
+        fnode.child1 = ret_stmt;
+        p.fn_count = p.fn_count + 1;
+        return fnode;
+    }
 
     parser_expect(p, 62); // '{'
     let mut last_stmt: *mut AstNode = 0 as *mut AstNode;
@@ -784,6 +882,18 @@ struct LocalVar {
     struct_hash: u64,
 }
 
+struct CallFixup {
+    hole_offset: u32,
+    pad: u32,
+    callee_hash: u64,
+}
+
+struct FnEntry {
+    fn_hash: u64,
+    text_offset: u32,
+    pad: u32,
+}
+
 struct CodeGen {
     text_buf: *mut u8,
     text_size: u32,
@@ -801,6 +911,12 @@ struct CodeGen {
     contract_count: u32,
 
     call_main_hole: u32,
+
+    call_fixups: *mut CallFixup,
+    call_fixup_count: u32,
+
+    fn_entries: *mut FnEntry,
+    fn_entry_count: u32,
 
     structs: *mut StructInfo,
     struct_count: u32,
@@ -1148,7 +1264,7 @@ fn compile_expr(cg: *mut CodeGen, node: *mut AstNode) {
                 let mut is_byte: u32 = 1;
                 if operand.child1.kind == 117 {
                     let lv: *mut LocalVar = cg_find_local(cg, operand.child1.hash);
-                    if lv != (0 as *mut LocalVar) && lv.is_struct_ptr == 11 {
+                    if lv != (0 as *mut LocalVar) && (lv.is_struct_ptr == 11 || lv.name_hash == 9892488102507485283) {
                         is_byte = 0;
                     }
                 }
@@ -1239,6 +1355,63 @@ fn compile_expr(cg: *mut CodeGen, node: *mut AstNode) {
         return;
     }
 
+    if node.kind == 120 { // NODE_PRINT
+        compile_expr(cg, node.child1);
+        cg_emit8(cg, 80); // push rax (str ptr)
+        let mut slen: u32 = 8;
+        if node.child1.kind == 118 { // NODE_STRING
+            slen = node.child1.len;
+        }
+        if node.val == 1 { // println
+            cg_emit8(cg, 88); // pop rax (str)
+            cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 198); // mov rsi, rax
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 199); cg_emit32(cg, 1); // mov rdi, 1
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 194); cg_emit32(cg, slen); // mov rdx, slen
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 192); cg_emit32(cg, 1); // mov rax, 1
+            cg_emit8(cg, 15); cg_emit8(cg, 5); // syscall
+            // newline
+            cg_emit8(cg, 106); cg_emit8(cg, 10); // push 10 ('\n')
+            cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 230); // mov rsi, rsp
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 199); cg_emit32(cg, 1); // mov rdi, 1
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 194); cg_emit32(cg, 1); // mov rdx, 1
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 192); cg_emit32(cg, 1); // mov rax, 1
+            cg_emit8(cg, 15); cg_emit8(cg, 5); // syscall
+            cg_emit8(cg, 72); cg_emit8(cg, 131); cg_emit8(cg, 196); cg_emit8(cg, 8); // add rsp, 8
+        } else {
+            cg_emit8(cg, 88); // pop rax (str)
+            cg_emit8(cg, 72); cg_emit8(cg, 137); cg_emit8(cg, 198); // mov rsi, rax
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 199); cg_emit32(cg, 1); // mov rdi, 1
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 194); cg_emit32(cg, slen); // mov rdx, slen
+            cg_emit8(cg, 72); cg_emit8(cg, 199); cg_emit8(cg, 192); cg_emit32(cg, 1); // mov rax, 1
+            cg_emit8(cg, 15); cg_emit8(cg, 5); // syscall
+        }
+        cg_emit8(cg, 72); cg_emit8(cg, 49); cg_emit8(cg, 192); // xor rax, rax
+        return;
+    }
+
+    if node.kind == 121 { // NODE_SILICON
+        if node.val == 1 { // rdtsc
+            cg_emit8(cg, 15); cg_emit8(cg, 49); // rdtsc
+            cg_emit8(cg, 72); cg_emit8(cg, 193); cg_emit8(cg, 226); cg_emit8(cg, 32); // shl rdx, 32
+            cg_emit8(cg, 72); cg_emit8(cg, 9); cg_emit8(cg, 208); // or rax, rdx
+            return;
+        }
+        if node.val == 2 { // icache_sync
+            cg_emit8(cg, 15); cg_emit8(cg, 174); cg_emit8(cg, 240); // mfence
+            cg_emit8(cg, 49); cg_emit8(cg, 192); // xor eax, eax
+            cg_emit8(cg, 15); cg_emit8(cg, 162); // cpuid
+            cg_emit8(cg, 72); cg_emit8(cg, 49); cg_emit8(cg, 192); // xor rax, rax
+            return;
+        }
+        if node.val == 3 { // clwb
+            compile_expr(cg, node.child1); // pointer into rax
+            cg_emit8(cg, 102); cg_emit8(cg, 15); cg_emit8(cg, 174); cg_emit8(cg, 48); // clwb [rax]
+            cg_emit8(cg, 15); cg_emit8(cg, 174); cg_emit8(cg, 248); // sfence
+            cg_emit8(cg, 72); cg_emit8(cg, 49); cg_emit8(cg, 192); // xor rax, rax
+            return;
+        }
+    }
+
     if node.kind == 115 { // NODE_INDEX (arr[idx])
         compile_expr(cg, node.child1); // base pointer in rax
         cg_emit8(cg, 80);              // push rax
@@ -1248,7 +1421,7 @@ fn compile_expr(cg: *mut CodeGen, node: *mut AstNode) {
         let mut is_byte: u32 = 1;
         if node.child1.kind == 117 {
             let lv: *mut LocalVar = cg_find_local(cg, node.child1.hash);
-            if lv != (0 as *mut LocalVar) && lv.is_struct_ptr == 11 {
+            if lv != (0 as *mut LocalVar) && (lv.is_struct_ptr == 11 || lv.name_hash == 9892488102507485283) {
                 is_byte = 0;
             }
         }
@@ -1352,6 +1525,12 @@ fn compile_expr(cg: *mut CodeGen, node: *mut AstNode) {
         let hole_offset: u32 = cg.text_size;
         cg_emit32(cg, 0);
 
+        let cfix: *mut CallFixup = ((cg.call_fixups as *mut u8) + ((cg.call_fixup_count as u64) * 16)) as *mut CallFixup;
+        cfix.hole_offset = hole_offset;
+        cfix.pad = 0;
+        cfix.callee_hash = node.hash;
+        cg.call_fixup_count = cg.call_fixup_count + 1;
+
         // Register EIA_PATCH_SYM_REL32 relocation hole
         cg_add_reloc_ex(cg, hole_offset, 2, node.hash, node.hash);
         return;
@@ -1422,7 +1601,7 @@ fn compile_stmt(cg: *mut CodeGen, stmt: *mut AstNode) {
             let mut is_byte: u32 = 1;
             if lhs.child1.kind == 117 {
                 let lv: *mut LocalVar = cg_find_local(cg, lhs.child1.hash);
-                if lv != (0 as *mut LocalVar) && lv.is_struct_ptr == 11 {
+                if lv != (0 as *mut LocalVar) && (lv.is_struct_ptr == 11 || lv.name_hash == 9892488102507485283) {
                     is_byte = 0;
                 }
             }
@@ -1550,6 +1729,12 @@ fn compile_stmt(cg: *mut CodeGen, stmt: *mut AstNode) {
 fn compile_fn(cg: *mut CodeGen, fnode: *mut AstNode) {
     let fn_text_offset: u32 = cg.text_size;
     let fn_vaddr: u64 = 4259840 + (fn_text_offset as u64); // 0x410000 = 4259840
+
+    let fe: *mut FnEntry = ((cg.fn_entries as *mut u8) + ((cg.fn_entry_count as u64) * 16)) as *mut FnEntry;
+    fe.fn_hash = fnode.hash;
+    fe.text_offset = fn_text_offset;
+    fe.pad = 0;
+    cg.fn_entry_count = cg.fn_entry_count + 1;
 
     // Prologue: push rbp; mov rbp, rsp; sub rsp, 4096
     cg_emit8(cg, 85);
@@ -2437,11 +2622,17 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
     let mut force_bridge: u32 = 0;
     let mut is_upbp: u32 = 0;
     let mut target_arch: u64 = 0;
+    let mut is_run_mode: u32 = 0;
 
     let mut arg_i: u64 = 1;
     while arg_i < argc {
         let arg: *u8 = argv[arg_i];
-        if arg[0] == 45 && arg[1] == 111 && arg[2] == 0 { // "-o"
+        if arg[0] == 114 && arg[1] == 117 && arg[2] == 110 && arg[3] == 0 { // "run"
+            is_run_mode = 1;
+            out_path = "/tmp/rux_exec";
+        } else if arg[0] == 98 && arg[1] == 117 && arg[2] == 105 && arg[3] == 108 && arg[4] == 100 && arg[5] == 0 { // "build"
+            // skip build keyword
+        } else if arg[0] == 45 && arg[1] == 111 && arg[2] == 0 { // "-o"
             arg_i = arg_i + 1;
             if arg_i < argc {
                 out_path = argv[arg_i];
@@ -2619,6 +2810,11 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
     cg.force_bridge = force_bridge as u32;
     cg.permute_seed = permute_seed as u32;
     cg.target_arch = target_arch as u32;
+
+    cg.call_fixups = arena_alloc(&mut cg_arena, 262144) as *mut CallFixup;
+    cg.call_fixup_count = 0;
+    cg.fn_entries = arena_alloc(&mut cg_arena, 262144) as *mut FnEntry;
+    cg.fn_entry_count = 0;
 
     cg.structs = arena_alloc(&mut cg_arena, 262144) as *mut StructInfo;
     cg.struct_count = 0;
@@ -2802,6 +2998,23 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
     // reorder and making the chaos binary identical to the baseline (both permutations
     // cancelled each other out), causing Gate 3's chaos binary to segfault or be identical.
 
+    // Resolve all internal function call fixups
+    let mut cfi: u32 = 0;
+    while cfi < cg.call_fixup_count {
+        let cfix: *mut CallFixup = ((cg.call_fixups as *mut u8) + ((cfi as u64) * 16)) as *mut CallFixup;
+        let mut fei: u32 = 0;
+        while fei < cg.fn_entry_count {
+            let fe: *mut FnEntry = ((cg.fn_entries as *mut u8) + ((fei as u64) * 16)) as *mut FnEntry;
+            if fe.fn_hash == cfix.callee_hash {
+                let disp: i32 = (fe.text_offset as i32) - ((cfix.hole_offset + 4) as i32);
+                cg_patch32(&mut cg, cfix.hole_offset, disp as u32);
+                fei = cg.fn_entry_count;
+            }
+            fei = fei + 1;
+        }
+        cfi = cfi + 1;
+    }
+
     // 8. Write Standalone Binary (UPBP or Native ELF)
     let write_res: i64 = write_elf64_binary(&mut cg, out_path, is_upbp);
     if write_res < 0 {
@@ -2809,6 +3022,24 @@ fn main(argc: u64, argv: *mut *mut u8) -> i64 {
         syscall(1, 2, err3, 33);
         syscall(60, 3);
         return 3;
+    }
+
+    if is_run_mode == 1 {
+        let pid: i64 = syscall(57); // SYS_fork
+        if pid == 0 {
+            let mut c_argv: [*mut u8; 2];
+            c_argv[0] = out_path;
+            c_argv[1] = 0 as *mut u8;
+            let mut c_envp: [*mut u8; 1];
+            c_envp[0] = 0 as *mut u8;
+            syscall(59, out_path, &c_argv[0], &c_envp[0]); // SYS_execve
+            syscall(60, 127); // SYS_exit
+        }
+        let mut status: i64 = 0;
+        syscall(61, pid, &status, 0, 0); // SYS_wait4
+        syscall(87, out_path); // SYS_unlink
+        let code: i64 = (status >> 8) & 255;
+        return code;
     }
 
     let msg: *u8 = "STAGE1 CORE1 COMPILER OK\n";

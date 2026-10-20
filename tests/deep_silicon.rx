@@ -1,0 +1,29 @@
+@hologram(epoch: 2, permute: true, bridge: true)
+@memory(tier: "nvram", align: 64, vitrify: true)
+shape HardwareRingBuffer {
+    head: u64
+    tail: u64
+    capacity: u64
+    epoch: u64
+}
+
+fn main() {
+    println("Initializing Deep Silicon Engine...")
+    let t0 = silicon.rdtsc()
+    silicon.icache_sync()
+
+    mut ring: HardwareRingBuffer
+    ring.head = 0
+    ring.tail = 0
+    ring.capacity = 1024
+    ring.epoch = 2
+
+    silicon.clwb(&ring as *mut u8)
+
+    let t1 = silicon.rdtsc()
+    if t1 >= t0 {
+        println("Silicon Pipeline Verified!")
+    }
+
+    return 42
+}

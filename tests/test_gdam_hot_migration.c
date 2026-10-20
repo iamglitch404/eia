@@ -16,133 +16,7 @@
 #include <stdatomic.h>
 #include "spark0.h"
 
-uint64_t spark0_hash_str(const char *str) {
-    if (!str) return 0;
-    uint64_t h = 0xcbf29ce484222325ULL;
-    while (*str) {
-        h ^= (uint8_t)(*str++);
-        h *= 0x100000001b3ULL;
-    }
-    return h;
-}
-
-/* Implementation of GDAM lifecycle routines declared in spark0.h */
-void gdam_init(ConcurrentGdamState *gdam, GdamGeneration *init_gen) {
-    memset(gdam, 0, sizeof(*gdam));
-    atomic_init(&gdam->active_readers, 0);
-    atomic_init(&gdam->active_generation, init_gen);
-}
-
-GdamGeneration *gdam_reader_enter(ConcurrentGdamState *gdam) {
-    if (!gdam) return NULL;
-    atomic_fetch_add_explicit(&gdam->active_readers, 1, memory_order_acquire);
-    return atomic_load_explicit(&gdam->active_generation, memory_order_acquire);
-}
-
-void gdam_reader_leave(ConcurrentGdamState *gdam) {
-    if (!gdam) return;
-    atomic_fetch_sub_explicit(&gdam->active_readers, 1, memory_order_release);
-}
-
-uint64_t gdam_atomic_publish(ConcurrentGdamState *gdam, GdamGeneration *new_gen) {
-    if (!gdam || !new_gen) return 0;
-    gdam->previous_generation = atomic_load(&gdam->active_generation);
-    atomic_store_explicit(&gdam->active_generation, new_gen, memory_order_release);
-    return new_gen->epoch ? new_gen->epoch : 1;
-}
-
-int gdam_rollback(ConcurrentGdamState *gdam) {
-    if (!gdam || !gdam->previous_generation) return -1;
-    atomic_store_explicit(&gdam->active_generation, gdam->previous_generation, memory_order_release);
-    return 0;
-}
-
-void gdam_retire_record(ConcurrentGdamState *gdam, uint8_t *old_rec) {
-    if (!gdam || !old_rec) return;
-    if (gdam->retired_count < MAX_LOADED_PROVIDERS + 1) {
-        gdam->retired_records[gdam->retired_count++] = old_rec;
-    }
-}
-
-void gdam_reclaim_retired(ConcurrentGdamState *gdam) {
-    if (!gdam) return;
-    while (atomic_load_explicit(&gdam->active_readers, memory_order_acquire) > 0) {
-        usleep(100);
-    }
-    for (size_t i = 0; i < gdam->retired_count; ++i) {
-        if (gdam->retired_records[i]) {
-            free(gdam->retired_records[i]);
-            gdam->retired_records[i] = NULL;
-        }
-    }
-    gdam->retired_count = 0;
-}
-
-size_t gdam_migrate_record(
-    const uint8_t *old_buf, const GdamFieldEntry *old_tg, size_t old_count,
-    uint8_t *new_buf, const GdamFieldEntry *new_tg, size_t new_count,
-    uint64_t type_hash
-) {
-    size_t migrated = 0;
-    for (size_t ni = 0; ni < new_count; ++ni) {
-        if (new_tg[ni].type_sig_hash == type_hash) {
-            for (size_t oi = 0; oi < old_count; ++oi) {
-                if (old_tg[oi].type_sig_hash == type_hash &&
-                    old_tg[oi].field_hash == new_tg[ni].field_hash) {
-                    uint32_t copy_sz = old_tg[oi].field_size < new_tg[ni].field_size ?
-                                       old_tg[oi].field_size : new_tg[ni].field_size;
-                    memcpy(new_buf + new_tg[ni].byte_offset,
-                           old_buf + old_tg[oi].byte_offset, copy_sz);
-                    if (new_tg[ni].field_size > old_tg[oi].field_size) {
-                        memset(new_buf + new_tg[ni].byte_offset + copy_sz, 0,
-                               new_tg[ni].field_size - copy_sz);
-                    }
-                    migrated++;
-                    break;
-                }
-            }
-        }
-    }
-    return migrated;
-}
-
-int eia_gdam_stage_upgrade(ConcurrentGdamState *gdam, GdamGeneration *next_gen) {
-    if (!gdam || !next_gen) return -1;
-    gdam->staged_generation = next_gen;
-    return 0;
-}
-
-uint64_t eia_gdam_commit_upgrade(ConcurrentGdamState *gdam, GdamGeneration *new_gen, uint64_t type_hash) {
-    if (!gdam || !new_gen) return 0;
-    GdamGeneration *prev_gen = atomic_load(&gdam->active_generation);
-    if (prev_gen && prev_gen->record_buf && new_gen->count > 0 && new_gen->schema) {
-        size_t new_sz = 0;
-        for (size_t f = 0; f < new_gen->count; ++f) {
-            uint32_t end = new_gen->schema[f].byte_offset + new_gen->schema[f].field_size;
-            if (end > new_sz) new_sz = end;
-        }
-        if (new_sz > 0) {
-            uint8_t *migrated_buf = (uint8_t *)calloc(new_sz, 1);
-            if (migrated_buf) {
-                gdam_migrate_record(
-                    prev_gen->record_buf, prev_gen->schema, prev_gen->count,
-                    migrated_buf, new_gen->schema, new_gen->count,
-                    type_hash
-                );
-                new_gen->record_buf = migrated_buf;
-                gdam_retire_record(gdam, (uint8_t *)prev_gen->record_buf);
-                prev_gen->record_buf = NULL;
-            }
-        }
-    }
-    uint64_t pub_epoch = gdam_atomic_publish(gdam, new_gen);
-    gdam->staged_generation = NULL;
-    return pub_epoch;
-}
-
-int eia_gdam_rollback_upgrade(ConcurrentGdamState *gdam) {
-    return gdam_rollback(gdam);
-}
+/* Production GDAM routines are directly linked from src/eia_loader.c */
 
 /* ------------------------------------------------------------------------- */
 /* Concurrent Reader / Upgrade Simulation Test                              */
@@ -341,6 +215,71 @@ int main(void) {
     printf("\n[RESULTS] Total Concurrent Reader Operations: %lu\n", (unsigned long)total_reads);
     printf("          Total Invariant Violations / Data Races: %lu\n", (unsigned long)total_errors);
     assert(total_errors == 0 && "Concurrent data race detected during live migration!");
+
+    /* [PHASE 6] Production Multi-Object Graph Live Migration & Thread Registration */
+    printf("\n[PHASE 6] Multi-Thread Dynamic Registration & Arbitrary Object Graph Live Migration...\n");
+    ConcurrentGdamState app_gdam;
+    gdam_init(&app_gdam, &gen1);
+
+    /* Allocate application objects:
+     * 1. A single Account struct (v1 layout: id at 0, balance at 8, size 16)
+     * 2. An array of 100 Account structs
+     */
+    void *app_single_account = calloc(16, 1);
+    *(uint64_t *)((uint8_t *)app_single_account + 0) = 4242; /* id */
+    *(uint64_t *)((uint8_t *)app_single_account + 8) = 9999; /* balance */
+
+    size_t arr_count = 100;
+    void *app_account_array = calloc(16 * arr_count, 1);
+    for (size_t a = 0; a < arr_count; ++a) {
+        *(uint64_t *)((uint8_t *)app_account_array + a * 16 + 0) = 1000 + a;
+        *(uint64_t *)((uint8_t *)app_account_array + a * 16 + 8) = (a + 1) * 10;
+    }
+
+    /* Register application objects into GDAM object graph */
+    assert(eia_gdam_register_object(&app_gdam, &app_single_account, acct_type_hash, 1, 16) == 0);
+    assert(eia_gdam_register_object(&app_gdam, &app_account_array, acct_type_hash, arr_count, 16) == 0);
+
+    /* Register worker threads */
+    uint64_t worker_tid1 = 1001;
+    uint64_t worker_tid2 = 1002;
+    assert(eia_gdam_register_thread(&app_gdam, worker_tid1) == 0);
+    assert(eia_gdam_register_thread(&app_gdam, worker_tid2) == 0);
+
+    /* Thread enters critical section */
+    eia_gdam_thread_enter(&app_gdam, worker_tid1);
+    eia_gdam_thread_leave(&app_gdam, worker_tid1);
+
+    /* Live migrate the entire application object graph from Gen 1 to Gen 2! */
+    uint64_t migrated_objs = eia_gdam_migrate_object_graph(&app_gdam, &gen2, acct_type_hash);
+    assert(migrated_objs == 2);
+    printf("  [PASS] Migrated %lu arbitrary application object nodes to Generation 2!\n", (unsigned long)migrated_objs);
+
+    /* Verify single account migrated to Gen 2 layout (balance at 16, id at 24, size 32) */
+    assert(*(uint64_t *)((uint8_t *)app_single_account + 24) == 4242);
+    assert(*(uint64_t *)((uint8_t *)app_single_account + 16) == 9999);
+
+    /* Verify all 100 elements in the array migrated cleanly to Gen 2 layout! */
+    for (size_t a = 0; a < arr_count; ++a) {
+        assert(*(uint64_t *)((uint8_t *)app_account_array + a * 32 + 24) == (1000 + a));
+        assert(*(uint64_t *)((uint8_t *)app_account_array + a * 32 + 16) == ((a + 1) * 10));
+    }
+    printf("  [PASS] Verified 100-element array of structs and single object preserved all invariant fields!\n");
+
+    /* Live migrate again to Gen 3! */
+    uint64_t migrated_objs2 = eia_gdam_migrate_object_graph(&app_gdam, &gen3, acct_type_hash);
+    assert(migrated_objs2 == 2);
+    assert(*(uint64_t *)((uint8_t *)app_single_account + 24) == 4242);
+    assert(*(uint64_t *)((uint8_t *)app_single_account + 16) == 9999);
+    printf("  [PASS] Successfully live migrated object graph to Generation 3!\n");
+
+    /* Cleanup application object graph and threads */
+    assert(eia_gdam_unregister_object(&app_gdam, &app_single_account) == 0);
+    assert(eia_gdam_unregister_object(&app_gdam, &app_account_array) == 0);
+    assert(eia_gdam_unregister_thread(&app_gdam, worker_tid1) == 0);
+    assert(eia_gdam_unregister_thread(&app_gdam, worker_tid2) == 0);
+    free(app_single_account);
+    free(app_account_array);
 
     printf("\n============================================================\n");
     printf(">>> ALL GDAM CONCURRENT HOT MIGRATION TESTS PASSED (100%%)    \n");

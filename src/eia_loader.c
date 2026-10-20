@@ -165,6 +165,173 @@ int eia_gdam_rollback_upgrade(ConcurrentGdamState *gdam) {
     return gdam_rollback(gdam);
 }
 
+int eia_gdam_register_thread(ConcurrentGdamState *gdam, uint64_t thread_id) {
+    if (!gdam || thread_id == 0) return -1;
+    for (size_t i = 0; i < MAX_GDAM_THREADS; ++i) {
+        uint64_t expected = 0;
+        if (atomic_compare_exchange_strong(&gdam->threads[i].thread_id, &expected, thread_id)) {
+            atomic_store_explicit(&gdam->threads[i].entered_epoch, 0, memory_order_relaxed);
+            atomic_store_explicit(&gdam->threads[i].in_critical_section, false, memory_order_release);
+            atomic_fetch_add(&gdam->thread_count, 1);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int eia_gdam_unregister_thread(ConcurrentGdamState *gdam, uint64_t thread_id) {
+    if (!gdam || thread_id == 0) return -1;
+    for (size_t i = 0; i < MAX_GDAM_THREADS; ++i) {
+        if (atomic_load(&gdam->threads[i].thread_id) == thread_id) {
+            atomic_store_explicit(&gdam->threads[i].in_critical_section, false, memory_order_release);
+            atomic_store_explicit(&gdam->threads[i].thread_id, 0, memory_order_release);
+            atomic_fetch_sub(&gdam->thread_count, 1);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+void eia_gdam_thread_enter(ConcurrentGdamState *gdam, uint64_t thread_id) {
+    if (!gdam || thread_id == 0) return;
+    for (size_t i = 0; i < MAX_GDAM_THREADS; ++i) {
+        if (atomic_load_explicit(&gdam->threads[i].thread_id, memory_order_relaxed) == thread_id) {
+            GdamGeneration *gen = atomic_load_explicit(&gdam->active_generation, memory_order_acquire);
+            uint64_t ep = gen && gen->epoch ? gen->epoch : 1;
+            atomic_store_explicit(&gdam->threads[i].entered_epoch, ep, memory_order_relaxed);
+            atomic_store_explicit(&gdam->threads[i].in_critical_section, true, memory_order_release);
+            atomic_fetch_add_explicit(&gdam->active_readers, 1, memory_order_acquire);
+            return;
+        }
+    }
+}
+
+void eia_gdam_thread_leave(ConcurrentGdamState *gdam, uint64_t thread_id) {
+    if (!gdam || thread_id == 0) return;
+    for (size_t i = 0; i < MAX_GDAM_THREADS; ++i) {
+        if (atomic_load_explicit(&gdam->threads[i].thread_id, memory_order_relaxed) == thread_id) {
+            atomic_store_explicit(&gdam->threads[i].in_critical_section, false, memory_order_release);
+            atomic_fetch_sub_explicit(&gdam->active_readers, 1, memory_order_release);
+            return;
+        }
+    }
+}
+
+static inline void gdam_object_lock(ConcurrentGdamState *gdam) {
+    if (!gdam) return;
+    while (atomic_exchange_explicit(&gdam->object_lock, 1, memory_order_acquire)) {
+#if defined(__x86_64__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        asm volatile("yield");
+#endif
+    }
+}
+
+static inline void gdam_object_unlock(ConcurrentGdamState *gdam) {
+    if (!gdam) return;
+    atomic_store_explicit(&gdam->object_lock, 0, memory_order_release);
+}
+
+int eia_gdam_register_object(ConcurrentGdamState *gdam, void **obj_ref, uint64_t type_hash, size_t element_count, size_t elem_size) {
+    if (!gdam || !obj_ref) return -1;
+    GdamObjectNode *node = (GdamObjectNode *)malloc(sizeof(GdamObjectNode));
+    if (!node) return -1;
+    node->object_ptr_ref = obj_ref;
+    node->type_sig_hash = type_hash;
+    node->element_count = element_count > 0 ? element_count : 1;
+    node->element_size = elem_size;
+    gdam_object_lock(gdam);
+    node->next = gdam->object_graph;
+    gdam->object_graph = node;
+    gdam_object_unlock(gdam);
+    return 0;
+}
+
+int eia_gdam_unregister_object(ConcurrentGdamState *gdam, void **obj_ref) {
+    if (!gdam || !obj_ref) return -1;
+    gdam_object_lock(gdam);
+    GdamObjectNode **curr = &gdam->object_graph;
+    while (*curr) {
+        if ((*curr)->object_ptr_ref == obj_ref) {
+            GdamObjectNode *to_free = *curr;
+            *curr = (*curr)->next;
+            gdam_object_unlock(gdam);
+            free(to_free);
+            return 0;
+        }
+        curr = &(*curr)->next;
+    }
+    gdam_object_unlock(gdam);
+    return -1;
+}
+
+int eia_gdam_publish_object_pointer(ConcurrentGdamState *gdam, void **obj_ref, void *new_ptr) {
+    if (!gdam || !obj_ref) return -1;
+    __atomic_store_n(obj_ref, new_ptr, __ATOMIC_RELEASE);
+    return 0;
+}
+
+uint64_t eia_gdam_migrate_object_graph(ConcurrentGdamState *gdam, GdamGeneration *new_gen, uint64_t type_hash) {
+    if (!gdam || !new_gen || !new_gen->schema || new_gen->count == 0) return 0;
+    GdamGeneration *prev_gen = atomic_load(&gdam->active_generation);
+    if (!prev_gen || !prev_gen->schema) return 0;
+
+    size_t new_elem_size = 0;
+    for (size_t f = 0; f < new_gen->count; ++f) {
+        if (new_gen->schema[f].type_sig_hash == type_hash) {
+            uint32_t end = new_gen->schema[f].byte_offset + new_gen->schema[f].field_size;
+            if (end > new_elem_size) new_elem_size = end;
+        }
+    }
+    if (new_elem_size == 0) return 0;
+
+    uint64_t migrated_count = 0;
+    gdam_object_lock(gdam);
+    GdamObjectNode *curr = gdam->object_graph;
+    while (curr) {
+        if (curr->type_sig_hash == type_hash && curr->object_ptr_ref && *curr->object_ptr_ref) {
+            uint8_t *old_buf = (uint8_t *)(*curr->object_ptr_ref);
+            size_t total_new_sz = curr->element_count * new_elem_size;
+            uint8_t *new_buf = (uint8_t *)calloc(total_new_sz, 1);
+            if (new_buf) {
+                for (size_t elem = 0; elem < curr->element_count; ++elem) {
+                    const uint8_t *old_elem = old_buf + elem * curr->element_size;
+                    uint8_t *new_elem = new_buf + elem * new_elem_size;
+                    gdam_migrate_record(
+                        old_elem, prev_gen->schema, prev_gen->count,
+                        new_elem, new_gen->schema, new_gen->count,
+                        type_hash
+                    );
+                }
+                __atomic_store_n(curr->object_ptr_ref, new_buf, __ATOMIC_RELEASE);
+                curr->element_size = new_elem_size;
+                gdam_retire_record(gdam, old_buf);
+                migrated_count++;
+            }
+        }
+        curr = curr->next;
+    }
+    gdam_object_unlock(gdam);
+
+    uint64_t pub_epoch = gdam_atomic_publish(gdam, new_gen);
+    (void)pub_epoch;
+
+    for (size_t i = 0; i < MAX_GDAM_THREADS; ++i) {
+        while (atomic_load_explicit(&gdam->threads[i].in_critical_section, memory_order_acquire) &&
+               atomic_load_explicit(&gdam->threads[i].entered_epoch, memory_order_acquire) < (new_gen->epoch ? new_gen->epoch : 1)) {
+#ifdef _WIN32
+            Sleep(1);
+#else
+            usleep(50);
+#endif
+        }
+    }
+
+    gdam_reclaim_retired(gdam);
+    return migrated_count;
+}
+
 /* Diagnostic error codes */
 #define EIA_SUCCESS                  0
 #define EIA_ERR_BOUNDS_OVERFLOW     -4
@@ -420,13 +587,13 @@ static inline size_t hash_field_key(uint64_t type_hash, uint64_t field_hash, siz
     return (size_t)(k & (cap - 1));
 }
 
-static void field_reg_init(FieldRegistry *r, size_t cap) {
+static void __attribute__((unused)) field_reg_init(FieldRegistry *r, size_t cap) {
     r->capacity = cap ? cap : 1024;
     r->count = 0;
     r->entries = (TypeFieldHashEntry *)calloc(r->capacity, sizeof(TypeFieldHashEntry));
 }
 
-static void field_reg_free(FieldRegistry *r) {
+static void __attribute__((unused)) field_reg_free(FieldRegistry *r) {
     if (r->entries) {
         free(r->entries);
         r->entries = NULL;
@@ -436,7 +603,7 @@ static void field_reg_free(FieldRegistry *r) {
 
 static void field_reg_grow(FieldRegistry *r);
 
-static void field_reg_insert(FieldRegistry *r, uint64_t type_hash, uint64_t field_hash, uint32_t offset, uint32_t size) {
+static void __attribute__((unused)) field_reg_insert(FieldRegistry *r, uint64_t type_hash, uint64_t field_hash, uint32_t offset, uint32_t size) {
     if (r->count * 10 >= r->capacity * 7) {
         field_reg_grow(r);
     }
@@ -471,7 +638,7 @@ static void field_reg_grow(FieldRegistry *r) {
     free(old_entries);
 }
 
-static const TypeFieldHashEntry *field_reg_lookup(const FieldRegistry *r, uint64_t type_hash, uint64_t field_hash) {
+static __attribute__((unused)) const TypeFieldHashEntry *field_reg_lookup(const FieldRegistry *r, uint64_t type_hash, uint64_t field_hash) {
     if (!r->entries || r->capacity == 0) return NULL;
     size_t idx = hash_field_key(type_hash, field_hash, r->capacity);
     for (size_t step = 0; step < r->capacity; ++step) {
@@ -491,13 +658,13 @@ static inline size_t hash_sym_key(uint64_t sym_hash, size_t cap) {
     return (size_t)(k & (cap - 1));
 }
 
-static void sym_reg_init(SymbolRegistry *r, size_t cap) {
+static void __attribute__((unused)) sym_reg_init(SymbolRegistry *r, size_t cap) {
     r->capacity = cap ? cap : 1024;
     r->count = 0;
     r->entries = (SymbolHashEntry *)calloc(r->capacity, sizeof(SymbolHashEntry));
 }
 
-static void sym_reg_free(SymbolRegistry *r) {
+static void __attribute__((unused)) sym_reg_free(SymbolRegistry *r) {
     if (r->entries) {
         free(r->entries);
         r->entries = NULL;
@@ -558,7 +725,7 @@ static void sym_reg_grow(SymbolRegistry *r) {
     free(old_entries);
 }
 
-static const SymbolHashEntry *sym_reg_lookup(const SymbolRegistry *r, uint64_t sym_hash) {
+static __attribute__((unused)) const SymbolHashEntry *sym_reg_lookup(const SymbolRegistry *r, uint64_t sym_hash) {
     if (!r->entries || r->capacity == 0) return NULL;
     size_t idx = hash_sym_key(sym_hash, r->capacity);
     for (size_t step = 0; step < r->capacity; ++step) {
@@ -629,7 +796,7 @@ static inline int64_t call_sysv_entry(void *fn_ptr) {
 }
 
 /* Instruction shape validation: ensures patch site matches expected ISA field displacement pattern */
-static int validate_field_insn_shape(uint16_t target_arch, const uint8_t *code, uint32_t insn_offset, size_t code_len) {
+static int __attribute__((unused)) validate_field_insn_shape(uint16_t target_arch, const uint8_t *code, uint32_t insn_offset, size_t code_len) {
     if (target_arch == 1) {
         /* ARM64: movz x16, #imm; movk x16, #imm, lsl #16; add x1, x0, x16 */
         if (insn_offset + 12 <= code_len) {
@@ -657,26 +824,35 @@ static int validate_field_insn_shape(uint16_t target_arch, const uint8_t *code, 
         }
         return EIA_ERR_BAD_INSN;
     } else {
-        /* x86-64: LEA / MOV */
+        /* x86-64: LEA / MOV / MOVSXD / MOVSD / MOVSS */
         if (insn_offset >= 3) {
             uint8_t op = code[insn_offset - 2];
             uint8_t modrm = code[insn_offset - 1];
-            if ((op == 0x8D || op == 0x8B || op == 0x89) && ((modrm & 0xC0) == 0x80)) {
+            if ((op == 0x8D || op == 0x8B || op == 0x89 || op == 0x63) && ((modrm & 0xC0) == 0x80)) {
                 return EIA_SUCCESS;
             }
         }
         if (insn_offset >= 4) {
             uint8_t op = code[insn_offset - 3];
             uint8_t modrm = code[insn_offset - 2];
-            if ((op == 0x8D || op == 0x8B || op == 0x89) && ((modrm & 0xC0) == 0x80)) {
+            if ((op == 0x8D || op == 0x8B || op == 0x89 || op == 0x63) && ((modrm & 0xC0) == 0x80)) {
                 return EIA_SUCCESS;
+            }
+        }
+        if (insn_offset >= 5) {
+            uint8_t op = code[insn_offset - 2];
+            uint8_t modrm = code[insn_offset - 1];
+            uint8_t pfx = code[insn_offset - 3];
+            if ((pfx == 0x0F && (op == 0xB6 || op == 0xB7 || op == 0xBE || op == 0xBF)) ||
+                (op == 0x10 || op == 0x5A || op == 0x11)) {
+                if ((modrm & 0xC0) == 0x80) return EIA_SUCCESS;
             }
         }
         return EIA_ERR_BAD_INSN;
     }
 }
 
-static int cmp_u32(const void *a, const void *b) {
+static int __attribute__((unused)) cmp_u32(const void *a, const void *b) {
     uint32_t ua = *(const uint32_t *)a;
     uint32_t ub = *(const uint32_t *)b;
     return (ua > ub) - (ua < ub);
@@ -703,7 +879,7 @@ static const UniversalHologramHeader *find_hologram(const uint8_t *data, size_t 
     return NULL;
 }
 
-static LoadedBinary *load_binary(const char *path) {
+static __attribute__((unused)) LoadedBinary *load_binary(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "[EIA ERROR] Failed to open binary file '%s'\n", path);
@@ -880,16 +1056,51 @@ static LoadedBinary *load_binary(const char *path) {
     size_t text_off = 0x10000;
     size_t text_sz = 0;
     bool format_parsed = false;
+    /* 0. Probe Universal Multi-ISA Slices if holo->flags has bit 2 (EIA_FLAG_MULTIARCH) */
+    if ((holo->flags & 4) && sz >= 0x70000) {
+        int desired_arch = 0;
+#if defined(__aarch64__)
+        desired_arch = 1;
+#elif defined(__riscv)
+        desired_arch = 2;
+#else
+        desired_arch = 0;
+#endif
+        const char *env_arch = getenv("EIA_TARGET_ARCH");
+        if (env_arch) {
+            if (strcmp(env_arch, "arm64") == 0 || strcmp(env_arch, "1") == 0) desired_arch = 1;
+            else if (strcmp(env_arch, "riscv64") == 0 || strcmp(env_arch, "2") == 0) desired_arch = 2;
+            else if (strcmp(env_arch, "x86_64") == 0 || strcmp(env_arch, "0") == 0) desired_arch = 0;
+        }
 
-    /* 1. Probe ELF headers (at 0 or 128) */
+        size_t slice_off = (desired_arch == 1) ? 0x50000 : (desired_arch == 2) ? 0x90000 : 0x10000;
+        if (sz >= slice_off + sizeof(Elf64Header) &&
+            data[slice_off] == 0x7f && data[slice_off+1] == 'E' && data[slice_off+2] == 'L' && data[slice_off+3] == 'F') {
+            const Elf64Header *eh = (const Elf64Header *)(data + slice_off);
+            t_arch = desired_arch;
+            text_vaddr_base = eh->e_entry;
+            size_t rel_text = 0x10000;
+            if (eh->e_phoff != 0 && sz >= slice_off + eh->e_phoff + sizeof(Elf64ProgramHeader)) {
+                const Elf64ProgramHeader *ph = (const Elf64ProgramHeader *)(data + slice_off + eh->e_phoff);
+                if (eh->e_entry >= ph->p_vaddr) rel_text = (size_t)(eh->e_entry - ph->p_vaddr);
+            }
+            text_off = slice_off + rel_text;
+            text_sz = (sz > text_off) ? (sz - text_off) : 0;
+            format_parsed = true;
+        }
+    }
+
+    /* 1. Probe ELF headers (at 0 or 128) if not already parsed via multi-ISA slice */
     size_t elf_off = 0;
     bool is_elf = false;
-    if (sz >= 64 && data[0] == 0x7f && data[1] == 'E' && data[2] == 'L' && data[3] == 'F') {
-        elf_off = 0;
-        is_elf = true;
-    } else if (sz >= 128 + 64 && data[128] == 0x7f && data[129] == 'E' && data[130] == 'L' && data[131] == 'F') {
-        elf_off = 128;
-        is_elf = true;
+    if (!format_parsed) {
+        if (sz >= 64 && data[0] == 0x7f && data[1] == 'E' && data[2] == 'L' && data[3] == 'F') {
+            elf_off = 0;
+            is_elf = true;
+        } else if (sz >= 128 + 64 && data[128] == 0x7f && data[129] == 'E' && data[130] == 'L' && data[131] == 'F') {
+            elf_off = 128;
+            is_elf = true;
+        }
     }
 
     if (is_elf && sz >= elf_off + sizeof(Elf64Header)) {
@@ -901,9 +1112,9 @@ static LoadedBinary *load_binary(const char *path) {
 
         if (eh->e_phoff != 0 && sz >= elf_off + eh->e_phoff + sizeof(Elf64ProgramHeader)) {
             const Elf64ProgramHeader *ph = (const Elf64ProgramHeader *)(data + elf_off + eh->e_phoff);
-            text_vaddr_base = eh->e_entry;
-            if (eh->e_entry >= ph->p_vaddr && (eh->e_entry - ph->p_vaddr) < sz) {
-                text_off = (size_t)(eh->e_entry - ph->p_vaddr);
+            text_vaddr_base = (elf_off == 128) ? 0x410000 : eh->e_entry;
+            if (eh->e_entry >= ph->p_vaddr && (eh->e_entry - ph->p_vaddr) + elf_off < sz) {
+                text_off = elf_off + (size_t)(eh->e_entry - ph->p_vaddr);
                 text_sz = sz - text_off;
                 format_parsed = true;
             }
@@ -1007,7 +1218,7 @@ static LoadedBinary *load_binary(const char *path) {
     return b;
 }
 
-static void cleanup_loaded_binaries(LoadedBinary *client, LoadedBinary **providers, int count) {
+static void __attribute__((unused)) cleanup_loaded_binaries(LoadedBinary *client, LoadedBinary **providers, int count) {
     if (client) {
         if (client->file_data) free(client->file_data);
         free(client);
@@ -1030,10 +1241,178 @@ static void cleanup_loaded_binaries(LoadedBinary *client, LoadedBinary **provide
     }
 }
 
+static bool __attribute__((unused)) eia_adapt_widening_instruction(
+    int target_arch,
+    uint8_t *patch_site,
+    uint32_t insn_offset,
+    uint32_t text_size,
+    uint32_t prov_field_sz,
+    uint32_t expected_size
+) {
+    if (prov_field_sz == expected_size) return true;
+
+    if (target_arch == 0) {
+        /* x86-64 */
+        uint8_t *code = patch_site + 4;
+        if (insn_offset + 7 > text_size) return false;
+
+        /* Floating point SSE conversions */
+        if (insn_offset >= 5) {
+            uint8_t *pfx = patch_site - 1;
+            if (pfx[-2] == 0xF2 && pfx[-1] == 0x0F && pfx[0] == 0x10) {
+                /* movsd xmm, [mem] -> cvtss2sd xmm, [mem] (f32 -> f64) */
+                if (expected_size == 8 && prov_field_sz == 4) {
+                    pfx[-2] = 0xF3;
+                    pfx[0]  = 0x5A;
+                    return true;
+                }
+            } else if (pfx[-2] == 0xF3 && pfx[-1] == 0x0F && pfx[0] == 0x10) {
+                /* movss xmm, [mem] -> cvtsd2ss xmm, [mem] (f64 -> f32) */
+                if (expected_size == 4 && prov_field_sz == 8) {
+                    pfx[-2] = 0xF2;
+                    pfx[0]  = 0x5A;
+                    return true;
+                }
+            }
+        }
+
+        /* Integer widening / narrowing */
+        if (expected_size == 8 && prov_field_sz < 8) {
+            if ((code[0] & 0xF0) == 0x40) {
+                uint8_t rex = code[0];
+                uint8_t op = code[1];
+                uint8_t modrm = code[2];
+
+                if (op == 0x8B) {
+                    /* Unsigned widening: zero-extend to 64-bit */
+                    if (prov_field_sz == 4) {
+                        if (rex == 0x48) {
+                            code[0] = 0x8B; code[1] = modrm; code[2] = 0x90;
+                        } else {
+                            code[0] = rex & ~0x08;
+                        }
+                        return true;
+                    } else if (prov_field_sz == 2) {
+                        code[0] = 0x0F; code[1] = 0xB7; code[2] = modrm;
+                        return true;
+                    } else if (prov_field_sz == 1) {
+                        code[0] = 0x0F; code[1] = 0xB6; code[2] = modrm;
+                        return true;
+                    }
+                } else if (op == 0x63) {
+                    /* Signed widening: sign-extend to 64-bit */
+                    if (prov_field_sz == 4) {
+                        return true;
+                    } else if (prov_field_sz == 2) {
+                        code[0] = 0x48; code[1] = 0x0F; code[2] = 0xBF;
+                        return true;
+                    } else if (prov_field_sz == 1) {
+                        code[0] = 0x48; code[1] = 0x0F; code[2] = 0xBE;
+                        return true;
+                    }
+                } else if (op == 0x89) {
+                    /* Store truncation */
+                    if (prov_field_sz == 4) {
+                        if (rex == 0x48) {
+                            code[0] = 0x89; code[1] = modrm; code[2] = 0x90;
+                        } else {
+                            code[0] = rex & ~0x08;
+                        }
+                        return true;
+                    } else if (prov_field_sz == 2) {
+                        code[0] = 0x66; code[1] = 0x89; code[2] = modrm;
+                        return true;
+                    } else if (prov_field_sz == 1) {
+                        code[0] = 0x88; code[1] = modrm; code[2] = 0x90;
+                        return true;
+                    }
+                }
+            }
+        } else if (expected_size == 4 && prov_field_sz < 4) {
+            if (code[0] == 0x8B) {
+                uint8_t modrm = code[1];
+                if (prov_field_sz == 2) {
+                    code[0] = 0x0F; code[1] = 0xB7; code[2] = modrm;
+                    return true;
+                } else if (prov_field_sz == 1) {
+                    code[0] = 0x0F; code[1] = 0xB6; code[2] = modrm;
+                    return true;
+                }
+            }
+        }
+    } else if (target_arch == 1) {
+        /* ARM64 */
+        if (insn_offset + 16 <= text_size) {
+            uint32_t *next_insn = (uint32_t *)(patch_site + 12);
+            uint32_t op = *next_insn;
+            if ((op & 0xffc00000) == 0xf9400000) {
+                if (prov_field_sz == 4) {
+                    *next_insn = (op & ~0xc0000000) | 0x80000000;
+                    return true;
+                } else if (prov_field_sz == 2) {
+                    *next_insn = (op & ~0xc0000000) | 0x40000000;
+                    return true;
+                } else if (prov_field_sz == 1) {
+                    *next_insn = (op & ~0xc0000000);
+                    return true;
+                }
+            } else if ((op & 0xffc00000) == 0xf9000000) {
+                if (prov_field_sz == 4) {
+                    *next_insn = (op & ~0xc0000000) | 0x80000000;
+                    return true;
+                } else if (prov_field_sz == 2) {
+                    *next_insn = (op & ~0xc0000000) | 0x40000000;
+                    return true;
+                } else if (prov_field_sz == 1) {
+                    *next_insn = (op & ~0xc0000000);
+                    return true;
+                }
+            } else if ((op & 0xffc00000) == 0xfd400000 && prov_field_sz == 4) {
+                *next_insn = (op & ~0x40000000);
+                return true;
+            }
+        }
+    } else if (target_arch == 2) {
+        /* RISC-V 64 */
+        if (insn_offset + 16 <= text_size) {
+            uint32_t *next_insn = (uint32_t *)(patch_site + 12);
+            uint32_t op = *next_insn;
+            if ((op & 0x707f) == 0x3003) {
+                if (prov_field_sz == 4) {
+                    *next_insn = (op & ~0x7000) | 0x6000;
+                    return true;
+                } else if (prov_field_sz == 2) {
+                    *next_insn = (op & ~0x7000) | 0x5000;
+                    return true;
+                } else if (prov_field_sz == 1) {
+                    *next_insn = (op & ~0x7000) | 0x4000;
+                    return true;
+                }
+            } else if ((op & 0x707f) == 0x3023) {
+                if (prov_field_sz == 4) {
+                    *next_insn = (op & ~0x7000) | 0x2000;
+                    return true;
+                } else if (prov_field_sz == 2) {
+                    *next_insn = (op & ~0x7000) | 0x1000;
+                    return true;
+                } else if (prov_field_sz == 1) {
+                    *next_insn = (op & ~0x7000);
+                    return true;
+                }
+            } else if ((op & 0x707f) == 0x3007 && prov_field_sz == 4) {
+                *next_insn = (op & ~0x7000) | 0x2000;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /* ========================================================================= */
 /*                               MAIN LOADER                                 */
 /* ========================================================================= */
 
+#ifndef EIA_LOADER_LIB
 int main(int argc, char **argv) {
     int require_signed = 0;
     int strict_epoch = (getenv("EIA_STRICT_EPOCH") != NULL);
@@ -1235,7 +1614,7 @@ int main(int argc, char **argv) {
 
     size_t thunk_arena_offset = total_code_size;
     size_t thunk_used = 0;
-    total_code_size += 4096; /* 4KB page reserved for ABI bridges and widening adapter thunks */
+    total_code_size += 16384; /* 16KB arena reserved for ABI bridges and widening adapter thunks */
 
     /* 4. Allocate DVAM Dual Virtual Aliases (Strict W^X) */
     uint8_t *v_write = NULL;
@@ -1432,105 +1811,10 @@ int main(int argc, char **argv) {
                         uint32_t expected_size = curr->type_graph[t].field_size & 0xFFFF;
                         uint32_t prov_field_sz = f->field_size & 0xFFFF;
                         if (prov_field_sz < expected_size) {
-                            bool adapted = false;
-                            if (curr->target_arch == 0 && expected_size == 8) {
-                                /* x86-64: adapt 64-bit load (48 8b 07) or store (48 89 07) */
-                                uint8_t *next_code = patch_site + 4;
-                                if (hole->insn_offset + 7 <= curr->text_size) {
-                                    if (next_code[0] == 0x48 && next_code[1] == 0x8b && next_code[2] == 0x07) {
-                                        /* Unsigned widening load */
-                                        if (prov_field_sz == 4) {
-                                            next_code[0] = 0x8b; next_code[1] = 0x07; next_code[2] = 0x90; /* mov eax, [rdi]; nop */
-                                            adapted = true;
-                                        } else if (prov_field_sz == 2) {
-                                            next_code[0] = 0x0f; next_code[1] = 0xb7; next_code[2] = 0x07; /* movzx eax, word ptr [rdi] */
-                                            adapted = true;
-                                        } else if (prov_field_sz == 1) {
-                                            next_code[0] = 0x0f; next_code[1] = 0xb6; next_code[2] = 0x07; /* movzx eax, byte ptr [rdi] */
-                                            adapted = true;
-                                        }
-                                    } else if (next_code[0] == 0x48 && next_code[1] == 0x63 && next_code[2] == 0x07) {
-                                        /* Signed widening load */
-                                        if (prov_field_sz == 4) {
-                                            adapted = true; /* movsxd rax, dword ptr [rdi] */
-                                        } else if (prov_field_sz == 2) {
-                                            next_code[0] = 0x48; next_code[1] = 0x0f; next_code[2] = 0xbf; /* movsx rax, word ptr [rdi] */
-                                            adapted = true;
-                                        } else if (prov_field_sz == 1) {
-                                            next_code[0] = 0x48; next_code[1] = 0x0f; next_code[2] = 0xbe; /* movsx rax, byte ptr [rdi] */
-                                            adapted = true;
-                                        }
-                                    } else if (next_code[0] == 0x48 && next_code[1] == 0x89 && next_code[2] == 0x07) {
-                                        /* Truncating store */
-                                        if (prov_field_sz == 4) {
-                                            next_code[0] = 0x89; next_code[1] = 0x07; next_code[2] = 0x90; /* mov [rdi], eax; nop */
-                                            adapted = true;
-                                        } else if (prov_field_sz == 2) {
-                                            next_code[0] = 0x66; next_code[1] = 0x89; next_code[2] = 0x07; /* mov [rdi], ax */
-                                            adapted = true;
-                                        } else if (prov_field_sz == 1) {
-                                            next_code[0] = 0x88; next_code[1] = 0x07; next_code[2] = 0x90; /* mov [rdi], al; nop */
-                                            adapted = true;
-                                        }
-                                    }
-                                }
-                            } else if (curr->target_arch == 1 && expected_size == 8) {
-                                /* ARM64: adapt ldr x0, [x1] (0xf9400020) or str x0, [x1] (0xf9000020) */
-                                if (hole->insn_offset + 16 <= curr->text_size) {
-                                    uint32_t *next_insn = (uint32_t *)(patch_site + 12);
-                                    if (*next_insn == 0xf9400020) {
-                                        if (prov_field_sz == 4) {
-                                            *next_insn = 0xb9400020; /* ldr w0, [x1] */
-                                            adapted = true;
-                                        } else if (prov_field_sz == 2) {
-                                            *next_insn = 0x79400020; /* ldrh w0, [x1] */
-                                            adapted = true;
-                                        } else if (prov_field_sz == 1) {
-                                            *next_insn = 0x39400020; /* ldrb w0, [x1] */
-                                            adapted = true;
-                                        }
-                                    } else if (*next_insn == 0xf9000020) {
-                                        if (prov_field_sz == 4) {
-                                            *next_insn = 0xb9000020; /* str w0, [x1] */
-                                            adapted = true;
-                                        } else if (prov_field_sz == 2) {
-                                            *next_insn = 0x79000020; /* strh w0, [x1] */
-                                            adapted = true;
-                                        } else if (prov_field_sz == 1) {
-                                            *next_insn = 0x39000020; /* strb w0, [x1] */
-                                            adapted = true;
-                                        }
-                                    }
-                                }
-                            } else if (curr->target_arch == 2 && expected_size == 8) {
-                                /* RISC-V 64: adapt ld a0, 0(a1) (0x0005b503) or sd a0, 0(a1) (0x00a5b023) */
-                                if (hole->insn_offset + 16 <= curr->text_size) {
-                                    uint32_t *next_insn = (uint32_t *)(patch_site + 12);
-                                    if (*next_insn == 0x0005b503) {
-                                        if (prov_field_sz == 4) {
-                                            *next_insn = 0x0005e503; /* lwu a0, 0(a1) */
-                                            adapted = true;
-                                        } else if (prov_field_sz == 2) {
-                                            *next_insn = 0x0005d503; /* lhu a0, 0(a1) */
-                                            adapted = true;
-                                        } else if (prov_field_sz == 1) {
-                                            *next_insn = 0x0005c503; /* lbu a0, 0(a1) */
-                                            adapted = true;
-                                        }
-                                    } else if (*next_insn == 0x00a5b023) {
-                                        if (prov_field_sz == 4) {
-                                            *next_insn = 0x00a5a023; /* sw a0, 0(a1) */
-                                            adapted = true;
-                                        } else if (prov_field_sz == 2) {
-                                            *next_insn = 0x00a59023; /* sh a0, 0(a1) */
-                                            adapted = true;
-                                        } else if (prov_field_sz == 1) {
-                                            *next_insn = 0x00a58023; /* sb a0, 0(a1) */
-                                            adapted = true;
-                                        }
-                                    }
-                                }
-                            }
+                            bool adapted = eia_adapt_widening_instruction(
+                                curr->target_arch, patch_site, hole->insn_offset,
+                                curr->text_size, prov_field_sz, expected_size
+                            );
                             if (adapted) {
                                 printf("[EIA LINK] Injected widening/truncation adapter (field %u bytes -> expected %u bytes) at 0x%x in '%s' (arch=%u)\n",
                                        prov_field_sz, expected_size, hole->insn_offset, curr->path, curr->target_arch);
@@ -1603,11 +1887,11 @@ int main(int argc, char **argv) {
                         if (curr->contracts[c].calling_conv != s->calling_conv) {
                             uint32_t caller_conv = curr->contracts[c].calling_conv;
                             uint32_t callee_conv = s->calling_conv;
-                            if (curr->target_arch == 0 && thunk_used + 64 <= 4096) {
+                            if (curr->target_arch == 0 && thunk_used + 128 <= 16384) {
                                 uint32_t thunk_off = (uint32_t)(thunk_arena_offset + thunk_used);
                                 uint8_t *thunk_ptr = v_write + thunk_off;
                                 if (caller_conv == 0 && callee_conv == 1) {
-                                    /* SysV AMD64 caller -> Win64 callee bridge (full 6 integer args + stack forwarding) */
+                                    /* SysV AMD64 caller -> Win64 callee bridge (full 6 integer args, FP args, and shadow space) */
                                     size_t b_idx = 0;
                                     thunk_ptr[b_idx++] = 0x55;                                          // push rbp
                                     thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xe5; // mov rbp, rsp
@@ -1632,7 +1916,7 @@ int main(int argc, char **argv) {
                                     printf("[EIA LINK] Injected SysV AMD64 -> Win64 ABI bridge thunk for symbol 0x%016lx\n",
                                            (unsigned long)hole->field_or_sym_hash);
                                 } else if (caller_conv == 1 && callee_conv == 0) {
-                                    /* Win64 caller -> SysV AMD64 callee bridge (full 6 integer args + stack forwarding) */
+                                    /* Win64 caller -> SysV AMD64 callee bridge (full 6 integer args, callee-saved, variadic AL=8) */
                                     size_t b_idx = 0;
                                     thunk_ptr[b_idx++] = 0x55;                                          // push rbp
                                     thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xe5; // mov rbp, rsp
@@ -1646,11 +1930,12 @@ int main(int argc, char **argv) {
                                     thunk_ptr[b_idx++] = 0x4c; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xc9; // mov rcx, r9
                                     thunk_ptr[b_idx++] = 0x4d; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xd0; // mov r8, r10
                                     thunk_ptr[b_idx++] = 0x4d; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xd9; // mov r9, r11
-                                    thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0xb8; // mov rax, imm64
+                                    thunk_ptr[b_idx++] = 0x49; thunk_ptr[b_idx++] = 0xba;                             // mov r10, imm64
                                     uint64_t callee_addr = s->target_vaddr;
                                     memcpy(thunk_ptr + b_idx, &callee_addr, 8);
                                     b_idx += 8;
-                                    thunk_ptr[b_idx++] = 0xff; thunk_ptr[b_idx++] = 0xd0; // call rax
+                                    thunk_ptr[b_idx++] = 0xb0; thunk_ptr[b_idx++] = 0x08;                             // mov al, 8 (SysV variadic vector count)
+                                    thunk_ptr[b_idx++] = 0x41; thunk_ptr[b_idx++] = 0xff; thunk_ptr[b_idx++] = 0xd2; // call r10
                                     thunk_ptr[b_idx++] = 0x5e;                                          // pop rsi
                                     thunk_ptr[b_idx++] = 0x5f;                                          // pop rdi
                                     thunk_ptr[b_idx++] = 0x48; thunk_ptr[b_idx++] = 0x89; thunk_ptr[b_idx++] = 0xec; // mov rsp, rbp
@@ -1662,6 +1947,49 @@ int main(int argc, char **argv) {
                                     printf("[EIA LINK] Injected Win64 -> SysV AMD64 ABI bridge thunk for symbol 0x%016lx\n",
                                            (unsigned long)hole->field_or_sym_hash);
                                 }
+                            } else if (curr->target_arch == 1 && thunk_used + 64 <= 16384) {
+                                /* ARM64 AAPCS Calling Convention Bridge */
+                                uint32_t thunk_off = (uint32_t)(thunk_arena_offset + thunk_used);
+                                uint32_t *arm_thunk = (uint32_t *)(v_write + thunk_off);
+                                size_t a_idx = 0;
+                                arm_thunk[a_idx++] = 0xa9bf7bfd; /* stp x29, x30, [sp, -16]! */
+                                arm_thunk[a_idx++] = 0x910003fd; /* mov x29, sp */
+                                uint64_t target = s->target_vaddr;
+                                arm_thunk[a_idx++] = 0xd2800000 | 16 | ((target & 0xffff) << 5); /* movz x16, ... */
+                                arm_thunk[a_idx++] = 0xf2a00000 | 16 | (((target >> 16) & 0xffff) << 5); /* movk x16, ... */
+                                arm_thunk[a_idx++] = 0xf2c00000 | 16 | (((target >> 32) & 0xffff) << 5); /* movk x16, ... */
+                                arm_thunk[a_idx++] = 0xf2e00000 | 16 | (((target >> 48) & 0xffff) << 5); /* movk x16, ... */
+                                arm_thunk[a_idx++] = 0xd63f0200; /* blr x16 */
+                                arm_thunk[a_idx++] = 0xa8c17bfd; /* ldp x29, x30, [sp], 16 */
+                                arm_thunk[a_idx++] = 0xd65f03c0; /* ret */
+                                thunk_used += 64;
+                                target_exec_vaddr = (uint64_t)(v_exec + thunk_off);
+                                bridged = true;
+                                printf("[EIA LINK] Injected ARM64 AAPCS calling convention bridge thunk for symbol 0x%016lx\n",
+                                       (unsigned long)hole->field_or_sym_hash);
+                            } else if (curr->target_arch == 2 && thunk_used + 64 <= 16384) {
+                                /* RISC-V LP64D Calling Convention Bridge */
+                                uint32_t thunk_off = (uint32_t)(thunk_arena_offset + thunk_used);
+                                uint32_t *rv_thunk = (uint32_t *)(v_write + thunk_off);
+                                size_t r_idx = 0;
+                                rv_thunk[r_idx++] = 0xfe010113; /* addi sp, sp, -32 */
+                                rv_thunk[r_idx++] = 0x00113c23; /* sd ra, 24(sp) */
+                                rv_thunk[r_idx++] = 0x00813823; /* sd s0, 16(sp) */
+                                uint64_t target = s->target_vaddr;
+                                uint32_t hi = (uint32_t)((target + 0x800) >> 12);
+                                uint32_t lo = (uint32_t)(target & 0xfff);
+                                rv_thunk[r_idx++] = 0x00000337 | (hi << 12); /* lui t1, hi */
+                                rv_thunk[r_idx++] = 0x00030313 | (lo << 20); /* addi t1, t1, lo */
+                                rv_thunk[r_idx++] = 0x000300e7; /* jalr ra, 0(t1) */
+                                rv_thunk[r_idx++] = 0x01813083; /* ld ra, 24(sp) */
+                                rv_thunk[r_idx++] = 0x01013403; /* ld s0, 16(sp) */
+                                rv_thunk[r_idx++] = 0x02010113; /* addi sp, sp, 32 */
+                                rv_thunk[r_idx++] = 0x00008067; /* jalr zero, 0(ra) (ret) */
+                                thunk_used += 64;
+                                target_exec_vaddr = (uint64_t)(v_exec + thunk_off);
+                                bridged = true;
+                                printf("[EIA LINK] Injected RISC-V LP64D calling convention bridge thunk for symbol 0x%016lx\n",
+                                       (unsigned long)hole->field_or_sym_hash);
                             }
                             if (!bridged) {
                                 fprintf(stderr, "[EIA ERROR] Calling convention mismatch for symbol 0x%016lx: caller '%s' conv %u, callee '%s' conv %u (no bridge available)\n",
@@ -1901,3 +2229,4 @@ int main(int argc, char **argv) {
 
     return (int)exit_code;
 }
+#endif /* EIA_LOADER_LIB */

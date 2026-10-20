@@ -251,6 +251,98 @@ static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
         emit32_le(u, 0x00000073); /* ecall */
         return;
     }
+    if (u->target_arch == 3) {
+        /* Multiboot 1 + Baremetal Firmware Boot Stub:
+         * 1. Short jump over Multiboot 1 header:
+         *    jmp .Lentry (+12 bytes) -> 0xeb, 0x0c, 0x90, 0x90 (4 bytes)
+         * 2. Multiboot 1 header:
+         *    magic:    0x1BADB002
+         *    flags:    0x00000003 (PAGE_ALIGN | MEMINFO)
+         *    checksum: 0xE4524FFE (-(0x1BADB002 + 0x00000003))
+         * 3. .Lentry:
+         *    cli; cld; mov rsp, 0x90000 (safe stack below 640KB)
+         * 4. 16550 UART COM1 (0x3F8) serial initialization
+         * 5. VGA text buffer @ 0xB8000: write "[EIA_OK]"
+         * 6. call main()
+         * 7. Output return code / QEMU ISA debug-exit / halt loop
+         */
+        emit8(u, 0xeb); emit8(u, 0x0e); emit8(u, 0x90); emit8(u, 0x90); /* jmp +14 (IP 2 + 14 = 16: lands exactly after Multiboot block) */
+        emit32_le(u, 0x1BADB002);                                       /* Multiboot magic */
+        emit32_le(u, 0x00000003);                                       /* Multiboot flags */
+        emit32_le(u, 0xE4524FFB);                                       /* Checksum: -(0x1BADB002 + 3) */
+
+        emit8(u, 0xfa);                                                 /* cli */
+        emit8(u, 0xfc);                                                 /* cld */
+        emit8(u, 0x48); emit8(u, 0xc7); emit8(u, 0xc4); emit32_le(u, 0x00090000); /* mov rsp, 0x90000 */
+
+        /* 16550 UART COM1 (0x3F8) */
+        emit8(u, 0xba); emit8(u, 0xf9); emit8(u, 0x03); emit8(u, 0x30); emit8(u, 0xc0); emit8(u, 0xee); /* mov dx, 0x3f9; xor al, al; out dx, al */
+        emit8(u, 0xba); emit8(u, 0xfb); emit8(u, 0x03); emit8(u, 0xb0); emit8(u, 0x80); emit8(u, 0xee); /* mov dx, 0x3fb; mov al, 0x80; out dx, al */
+        emit8(u, 0xba); emit8(u, 0xf8); emit8(u, 0x03); emit8(u, 0xb0); emit8(u, 0x03); emit8(u, 0xee); /* mov dx, 0x3f8; mov al, 0x03; out dx, al */
+        emit8(u, 0xba); emit8(u, 0xf9); emit8(u, 0x03); emit8(u, 0x30); emit8(u, 0xc0); emit8(u, 0xee); /* mov dx, 0x3f9; xor al, al; out dx, al */
+        emit8(u, 0xba); emit8(u, 0xfb); emit8(u, 0x03); emit8(u, 0xb0); emit8(u, 0x03); emit8(u, 0xee); /* mov dx, 0x3fb; mov al, 0x03; out dx, al */
+        emit8(u, 0xba); emit8(u, 0xfa); emit8(u, 0x03); emit8(u, 0xb0); emit8(u, 0xc7); emit8(u, 0xee); /* mov dx, 0x3fa; mov al, 0xc7; out dx, al */
+        emit8(u, 0xba); emit8(u, 0xfc); emit8(u, 0x03); emit8(u, 0xb0); emit8(u, 0x0b); emit8(u, 0xee); /* mov dx, 0x3fc; mov al, 0x0b; out dx, al */
+
+        /* VGA text buffer @ 0xB8000: write "[EIA_OK]" (attribute 0x1F) */
+        emit8(u, 0x48); emit8(u, 0xc7); emit8(u, 0xc7); emit32_le(u, 0xb8000); /* mov rdi, 0xb8000 */
+        emit8(u, 0x66); emit8(u, 0xc7); emit8(u, 0x07); emit8(u, 0x5b); emit8(u, 0x1f); /* [rdi+0] = 0x1f5b '[' */
+        emit8(u, 0x66); emit8(u, 0xc7); emit8(u, 0x47); emit8(u, 0x02); emit8(u, 0x45); emit8(u, 0x1f); /* [rdi+2] = 0x1f45 'E' */
+        emit8(u, 0x66); emit8(u, 0xc7); emit8(u, 0x47); emit8(u, 0x04); emit8(u, 0x49); emit8(u, 0x1f); /* [rdi+4] = 0x1f49 'I' */
+        emit8(u, 0x66); emit8(u, 0xc7); emit8(u, 0x47); emit8(u, 0x06); emit8(u, 0x41); emit8(u, 0x1f); /* [rdi+6] = 0x1f41 'A' */
+        emit8(u, 0x66); emit8(u, 0xc7); emit8(u, 0x47); emit8(u, 0x08); emit8(u, 0x5f); emit8(u, 0x1f); /* [rdi+8] = 0x1f5f '_' */
+        emit8(u, 0x66); emit8(u, 0xc7); emit8(u, 0x47); emit8(u, 0x0a); emit8(u, 0x4f); emit8(u, 0x1f); /* [rdi+10] = 0x1f4f 'O' */
+        emit8(u, 0x66); emit8(u, 0xc7); emit8(u, 0x47); emit8(u, 0x0c); emit8(u, 0x4b); emit8(u, 0x1f); /* [rdi+12] = 0x1f4b 'K' */
+        emit8(u, 0x66); emit8(u, 0xc7); emit8(u, 0x47); emit8(u, 0x0e); emit8(u, 0x5d); emit8(u, 0x1f); /* [rdi+14] = 0x1f5d ']' */
+
+        /* call main() */
+        emit8(u, 0xe8);
+        if (call_main_hole_out) *call_main_hole_out = u->text_size;
+        emit32_le(u, 0);
+
+        /* Output return code to COM1 */
+        emit8(u, 0xba); emit8(u, 0xf8); emit8(u, 0x03); emit8(u, 0xee); /* mov dx, 0x3f8; out dx, al */
+        /* QEMU ISA debug-exit */
+        emit8(u, 0xe6); emit8(u, 0xf4); /* out 0xf4, al */
+        /* Halt loop: cli; hlt; jmp .-2 */
+        emit8(u, 0xfa); emit8(u, 0xf4); emit8(u, 0xeb); emit8(u, 0xfc);
+        return;
+    }
+    if (u->target_arch == 4) {
+        /* UEFI x86_64 efi_main(ImageHandle, SystemTable) Stub:
+         * Win64 calling convention: rcx = ImageHandle, rdx = SystemTable
+         */
+        emit8(u, 0x55);                                          /* push rbp */
+        emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xe5);         /* mov rbp, rsp */
+        emit8(u, 0x48); emit8(u, 0x83); emit8(u, 0xec); emit8(u, 0x30); /* sub rsp, 48 (shadow space) */
+        emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xd3);         /* mov rbx, rdx (save SystemTable) */
+
+        /* ConOut->OutputString call */
+        emit8(u, 0x48); emit8(u, 0x85); emit8(u, 0xdb);         /* test rbx, rbx */
+        emit8(u, 0x74); emit8(u, 0x24);                         /* jz .Lno_conout (+36 bytes) */
+        emit8(u, 0x48); emit8(u, 0x8b); emit8(u, 0x4b); emit8(u, 0x40); /* mov rcx, [rbx + 0x40] (ConOut) */
+        emit8(u, 0x48); emit8(u, 0x85); emit8(u, 0xc9);         /* test rcx, rcx */
+        emit8(u, 0x74); emit8(u, 0x1c);                         /* jz .Lno_conout (+28 bytes) */
+        emit8(u, 0x48); emit8(u, 0x8d); emit8(u, 0x15); emit32_le(u, 10); /* lea rdx, [rip + 10] */
+        emit8(u, 0xeb); emit8(u, 0x08);                         /* jmp +8 over UTF-16 data */
+        /* UTF-16LE 'E', 'I', 'A', '\0' = 8 bytes */
+        emit8(u, 'E'); emit8(u, 0); emit8(u, 'I'); emit8(u, 0);
+        emit8(u, 'A'); emit8(u, 0); emit8(u, 0);   emit8(u, 0);
+        emit8(u, 0xff); emit8(u, 0x51); emit8(u, 0x08);         /* call [rcx + 8] (OutputString) */
+        /* .Lno_conout: */
+
+        /* call main() */
+        emit8(u, 0xe8);
+        if (call_main_hole_out) *call_main_hole_out = u->text_size;
+        emit32_le(u, 0);
+
+        /* Return EFI_SUCCESS (0) */
+        emit8(u, 0x31); emit8(u, 0xc0);                         /* xor eax, eax */
+        emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xec);         /* mov rsp, rbp */
+        emit8(u, 0x5d);                                         /* pop rbp */
+        emit8(u, 0xc3);                                         /* ret */
+        return;
+    }
 
     /* 0. Preserve argc and argv from initial process stack */
     emit8(u, 0x48); emit8(u, 0x8b); emit8(u, 0x3c); emit8(u, 0x24); /* mov rdi, [rsp] */
@@ -1970,7 +2062,7 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
     uint32_t call_main_hole = 0;
     emit_start_stub(u, &call_main_hole);
     u->start_stub_size = u->text_size;
-    u->entry_vaddr = 0x410000;
+    u->entry_vaddr = (u->target_arch == 3) ? 0x101000 : 0x410000;
 
     /* Global function catalog and call fixups */
     CompiledFn *compiled_fns = NULL;

@@ -823,6 +823,30 @@ int main(void) {
         uint8_t widen_stencil_i32[] = { 0x48, 0x63, 0x07, 0xc3 };
         memcpy(widen_arena.v_write + 192, widen_stencil_i32, sizeof(widen_stencil_i32));
 
+        /*
+         * Stencil 5: f32 -> f64 floating point widening at offset 256
+         *   cvtss2sd xmm0, dword ptr [rdi] ; f3 0f 5a 07
+         *   ret                            ; c3
+         */
+        uint8_t widen_stencil_f32[] = { 0xf3, 0x0f, 0x5a, 0x07, 0xc3 };
+        memcpy(widen_arena.v_write + 256, widen_stencil_f32, sizeof(widen_stencil_f32));
+
+        /*
+         * Stencil 6: f64 -> f32 floating point conversion at offset 320
+         *   cvtsd2ss xmm0, qword ptr [rdi] ; f2 0f 5a 07
+         *   ret                            ; c3
+         */
+        uint8_t narrow_stencil_f64[] = { 0xf2, 0x0f, 0x5a, 0x07, 0xc3 };
+        memcpy(widen_arena.v_write + 320, narrow_stencil_f64, sizeof(narrow_stencil_f64));
+
+        /*
+         * Stencil 7: Store truncation (u64 -> u32 store) at offset 384
+         *   mov [rdi], esi                 ; 89 37
+         *   ret                            ; c3
+         */
+        uint8_t store_stencil32[] = { 0x89, 0x37, 0xc3 };
+        memcpy(widen_arena.v_write + 384, store_stencil32, sizeof(store_stencil32));
+
         hasi_cache_sync();
         dvam_lock_writer(&widen_arena);
 
@@ -846,7 +870,25 @@ int main(void) {
         WidenFnSigned widen_call_signed = (WidenFnSigned)(widen_arena.v_exec + 192);
         assert(widen_call_signed(&i32_val) == -42);
 
-        printf("  [PASS] Widening adapter stencils verified (u32->u64=42, u16->u64=42, u8->u64=42, i32->i64=-42)\n");
+        float f32_val = 42.5f;
+        typedef double (*WidenFnF32)(const float *);
+        WidenFnF32 widen_call_f32 = (WidenFnF32)(widen_arena.v_exec + 256);
+        double f64_res = widen_call_f32(&f32_val);
+        assert(f64_res == 42.5);
+
+        double f64_val = 42.25;
+        typedef float (*NarrowFnF64)(const double *);
+        NarrowFnF64 narrow_call_f64 = (NarrowFnF64)(widen_arena.v_exec + 320);
+        float f32_res = narrow_call_f64(&f64_val);
+        assert(f32_res == 42.25f);
+
+        uint32_t target_store = 0;
+        typedef void (*StoreFn32)(uint32_t *, uint64_t);
+        StoreFn32 store_call32 = (StoreFn32)(widen_arena.v_exec + 384);
+        store_call32(&target_store, 0x10000002AULL); /* Upper bits truncated */
+        assert(target_store == 42);
+
+        printf("  [PASS] Extended widening/narrowing stencils verified (u32->u64, u16->u64, u8->u64, i32->i64, f32<->f64, store trunc)\n");
 
         dvam_free_arena(&widen_arena);
     }

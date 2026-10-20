@@ -208,7 +208,8 @@ uint64_t blake3_hash64(const uint8_t *buf, size_t len) {
 #define EIA_SIGNER_ENABLED 1
 #include "eia_ed25519.c"
 
-int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_upbp, int target_arch, int is_signed) {
+static uint8_t *spark0_create_elf_buf(const CompiledUnit *unit, size_t *out_size, int is_upbp, int target_arch) {
+    if (target_arch == 4) is_upbp = 1; /* UEFI executables require PE32+ COFF headers */
     /* Calculate section offsets */
     uint64_t holo_offset = is_upbp ? 1152 : 0x80;
     uint64_t contracts_offset = is_upbp ? 1248 : (holo_offset + sizeof(UniversalHologramHeader)); /* 0x80 + 96 = 0xE0 */
@@ -220,8 +221,8 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
     uint64_t type_graph_offset = relocs_offset + relocs_size;
     uint64_t type_graph_size = unit->type_graph_count * sizeof(EiaTypeGraphEntry);
 
-    uint64_t text_offset = 0x10000; /* 64KB into file / 0x410000 vaddr */
-    uint64_t rodata_offset = 0x30000; /* 192KB into file / 0x430000 vaddr */
+    uint64_t text_offset = (target_arch == 3) ? 0x1000 : 0x10000; /* Baremetal: 4KB / Native: 64KB */
+    uint64_t rodata_offset = (target_arch == 3) ? 0x3000 : 0x30000; /* Baremetal: 12KB / Native: 192KB */
     if (text_offset + unit->text_size > rodata_offset) {
         rodata_offset = (text_offset + unit->text_size + 0xFFF) & ~0xFFFULL;
     }
@@ -232,15 +233,11 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
     uint8_t *file_buf = (uint8_t *)calloc(total_file_size, 1);
     if (!file_buf) {
         fprintf(stderr, "Failed to allocate %lu bytes for ELF output\n", (unsigned long)total_file_size);
-        return -1;
+        return NULL;
     }
 
     if (is_upbp) {
-        /* 1. DOS MZ Header Stub at Offset 0x000 (0x4D 0x5A) */
-        /* Compatible with Windows loader and POSIX shell variable assignment.
-         * Strict POSIX standard (no bash-only syntax) ensuring execution on dash/Ubuntu,
-         * macOS, and Windows with accurate native exit code propagation (e.g. 7, 42). */
-        const char *tramp1 = "MZ= tail +129c $0>z;chmod +x z;./z;c=${?#126};exit ${c:-42}\n";
+        const char *tramp1 = "MZ= tail +129c $0>z;chmod +x z;./z;c=$?;rm -f z;exit $c    \n";
         memcpy(file_buf, tramp1, 60);
         /* bytes 60-63: e_lfanew = 0x140 */
         file_buf[60] = 0x40;
@@ -300,9 +297,19 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
         file_buf[opt_base + 20] = 0; file_buf[opt_base + 21] = 0; file_buf[opt_base + 22] = 1;
         file_buf[opt_base + 24] = 0; file_buf[opt_base + 25] = 0; file_buf[opt_base + 26] = 0;
         file_buf[opt_base + 27] = 0x40; file_buf[opt_base + 28] = 1; /* 0x140000000 */
-        file_buf[opt_base + 32] = 0; file_buf[opt_base + 33] = 0x10;
-        file_buf[opt_base + 36] = 0; file_buf[opt_base + 37] = 0x02;
-        file_buf[opt_base + 68] = 3; file_buf[opt_base + 69] = 0;
+        file_buf[opt_base + 32] = 0; file_buf[opt_base + 33] = 0x10; /* SectionAlignment = 0x1000 */
+        file_buf[opt_base + 36] = 0; file_buf[opt_base + 37] = 0x10; /* FileAlignment = 0x1000 */
+        /* SizeOfImage (opt_base + 56) and SizeOfHeaders (opt_base + 60) */
+        uint32_t pe_image_sz = (uint32_t)((total_file_size + 0xFFF) & ~0xFFFULL);
+        set_u32(file_buf, (opt_base + 56) / 4, pe_image_sz);
+        set_u32(file_buf, (opt_base + 60) / 4, 0x1000); /* SizeOfHeaders = 4096 */
+        file_buf[opt_base + 68] = (target_arch == 4) ? 10 : 3; /* 10: EFI_APPLICATION, 3: CUI */
+        file_buf[opt_base + 69] = 0;
+        set_u32(file_buf, (opt_base + 72) / 4, 0x200000); /* SizeOfStackReserve = 2MB */
+        set_u32(file_buf, (opt_base + 80) / 4, 0x1000);   /* SizeOfStackCommit = 4KB */
+        set_u32(file_buf, (opt_base + 88) / 4, 0x100000); /* SizeOfHeapReserve = 1MB */
+        set_u32(file_buf, (opt_base + 96) / 4, 0x1000);   /* SizeOfHeapCommit = 4KB */
+        set_u32(file_buf, (opt_base + 108) / 4, 16);      /* NumberOfRvaAndSizes = 16 */
 
         /* 5. Offset 0x200 (512): Mach-O 64-bit Headers */
         uint64_t macho_base = 512;
@@ -339,7 +346,7 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
             ehdr->e_machine = 0x3E; /* EM_X86_64 */
         }
         ehdr->e_version = 1;
-        ehdr->e_entry = unit->entry_vaddr; /* 0x401000 (_start) */
+        ehdr->e_entry = unit->entry_vaddr; /* 0x401000 (_start) or 0x101000 (baremetal) */
         ehdr->e_phoff = 64;
         ehdr->e_shoff = 0;
         ehdr->e_flags = 0;
@@ -355,8 +362,9 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
         phdr->p_type = 1; /* PT_LOAD */
         phdr->p_flags = 5; /* PF_R | PF_X (Strict W^X compliance) */
         phdr->p_offset = 0;
-        phdr->p_vaddr = 0x400000;
-        phdr->p_paddr = 0x400000;
+        uint64_t load_vaddr = (target_arch == 3) ? 0x100000 : 0x400000;
+        phdr->p_vaddr = load_vaddr;
+        phdr->p_paddr = load_vaddr;
         phdr->p_filesz = total_file_size;
         phdr->p_memsz = (target_arch == 0) ? (total_file_size + 0x100000) : total_file_size;
         phdr->p_align = 0x1000;
@@ -441,7 +449,26 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
         memcpy(file_buf + rodata_offset, unit->rodata_buf, unit->rodata_size);
     }
 
+    if (out_size) *out_size = total_file_size;
+    return file_buf;
+}
+
+int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_upbp, int target_arch, int is_signed) {
+    size_t total_file_size = 0;
+    uint8_t *file_buf = spark0_create_elf_buf(unit, &total_file_size, is_upbp, target_arch);
+    if (!file_buf) return -1;
+
+    uint64_t holo_offset = is_upbp ? 1152 : 0x80;
+    UniversalHologramHeader *holo = (UniversalHologramHeader *)(file_buf + holo_offset);
+
     if (is_signed) {
+        uint64_t contracts_offset = is_upbp ? 1248 : (holo_offset + sizeof(UniversalHologramHeader));
+        uint64_t contracts_size = unit->contract_count * sizeof(SymbolContract);
+        uint64_t relocs_offset = contracts_offset + contracts_size;
+        uint64_t relocs_size = unit->reloc_count * sizeof(EiaRelocHole);
+        uint64_t type_graph_offset = relocs_offset + relocs_size;
+        uint64_t type_graph_size = unit->type_graph_count * sizeof(EiaTypeGraphEntry);
+
         uint64_t auth_offset = type_graph_offset + type_graph_size;
         uint64_t auth_size = sizeof(EiaSignatureRecord);
         EiaSignatureRecord sig_rec;
@@ -494,11 +521,224 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
     return 0;
 }
 
+int spark0_write_universal_binary(const CompiledUnit *u_x86, const CompiledUnit *u_arm, const CompiledUnit *u_riscv, const char *out_path, int is_signed) {
+    size_t sz_x86 = 0, sz_arm = 0, sz_riscv = 0;
+    uint8_t *buf_x86 = spark0_create_elf_buf(u_x86, &sz_x86, 0, 0);
+    uint8_t *buf_arm = spark0_create_elf_buf(u_arm, &sz_arm, 0, 1);
+    uint8_t *buf_riscv = spark0_create_elf_buf(u_riscv, &sz_riscv, 0, 2);
+
+    if (!buf_x86 || !buf_arm || !buf_riscv) {
+        if (buf_x86) free(buf_x86);
+        if (buf_arm) free(buf_arm);
+        if (buf_riscv) free(buf_riscv);
+        return -1;
+    }
+
+    uint64_t total_size = 0xD0000;
+    uint8_t *file_buf = (uint8_t *)calloc(total_size, 1);
+    if (!file_buf) {
+        free(buf_x86); free(buf_arm); free(buf_riscv);
+        return -1;
+    }
+
+    /* 1. DOS MZ Header Stub at Offset 0x000 (0x4D 0x5A) */
+    const char *tramp1 = "MZ= tail -c+641 \"$0\"|head -n7|sh -s -- \"$0\" \"$@\";exit $?   \n";
+    memcpy(file_buf, tramp1, 60);
+    file_buf[60] = 0x40; file_buf[61] = 0x01; /* e_lfanew = 0x140 */
+
+    /* 2. Multi-ISA Shell Trampoline at Offset 0x040 (64) */
+    memcpy(file_buf + 64, "#!/bin/sh\n", 10);
+    memset(file_buf + 74, ' ', 8);
+    memcpy(file_buf + 82, "tail -c+641 \"$0\"|head -n7|sh;    ", 33);
+    memcpy(file_buf + 115, "exec true   \n", 13);
+
+    /* Embed Multi-Architecture shell dispatcher at offset 640 */
+    const char *multi_tramp =
+        "f=\"$1\"; [ $# -gt 0 ] && shift\n"
+        "case `uname -m` in\n"
+        "  aarch64*|arm64*) o=327680;;\n"
+        "  riscv64*)        o=589824;;\n"
+        "  *)               o=65536;;\n"
+        "esac\n"
+        "tail -c+$((o+1)) \"$f\"|head -c262144>z;chmod +x z;./z \"$@\";c=$?;rm -f z;exit $c\n";
+    memcpy(file_buf + 640, multi_tramp, strlen(multi_tramp));
+
+    /* 3. ELF64 Header at offset 128 */
+    uint64_t elf_base = 128;
+    Elf64Header *ehdr = (Elf64Header *)(file_buf + elf_base);
+    memcpy(ehdr->e_ident, "\x7f\x45\x4c\x46\x02\x01\x01\0\0\0\0\0\0\0\0\0", 16);
+    ehdr->e_type = 2; /* ET_EXEC */
+    ehdr->e_machine = 0x3E; /* EM_X86_64 */
+    ehdr->e_version = 1;
+    ehdr->e_entry = 0x410000;
+    ehdr->e_phoff = 64;
+    ehdr->e_ehsize = sizeof(Elf64Header);
+    ehdr->e_phentsize = sizeof(Elf64ProgramHeader);
+    ehdr->e_phnum = 1;
+
+    Elf64ProgramHeader *phdr = (Elf64ProgramHeader *)(file_buf + elf_base + 64);
+    phdr->p_type = 1; /* PT_LOAD */
+    phdr->p_flags = 5; /* PF_R | PF_X */
+    phdr->p_offset = 0;
+    phdr->p_vaddr = 0x400000;
+    phdr->p_paddr = 0x400000;
+    phdr->p_filesz = total_size;
+    phdr->p_memsz = total_size + 0x100000;
+    phdr->p_align = 0x1000;
+
+    /* 4. PE/COFF Headers at offset 320 */
+    uint64_t pe_base = 320;
+    memcpy(file_buf + pe_base, "PE\0\0", 4);
+    file_buf[pe_base + 4] = 0x64; file_buf[pe_base + 5] = 0x86; /* AMD64 */
+    file_buf[pe_base + 6] = 1;
+    file_buf[pe_base + 20] = 240;
+    file_buf[pe_base + 22] = 0x22;
+
+    uint64_t opt_base = pe_base + 24;
+    file_buf[opt_base + 0] = 0x0B; file_buf[opt_base + 1] = 0x02; /* PE32+ */
+    file_buf[opt_base + 2] = 1;
+    file_buf[opt_base + 16] = 0; file_buf[opt_base + 17] = 0; file_buf[opt_base + 18] = 1;
+    file_buf[opt_base + 20] = 0; file_buf[opt_base + 21] = 0; file_buf[opt_base + 22] = 1;
+    file_buf[opt_base + 27] = 0x40; file_buf[opt_base + 28] = 1;
+    file_buf[opt_base + 32] = 0; file_buf[opt_base + 33] = 0x10;
+    file_buf[opt_base + 36] = 0; file_buf[opt_base + 37] = 0x10;
+    set_u32(file_buf, (opt_base + 56) / 4, (uint32_t)total_size);
+    set_u32(file_buf, (opt_base + 60) / 4, 0x1000);
+    file_buf[opt_base + 68] = 3;
+    set_u32(file_buf, (opt_base + 72) / 4, 0x200000);
+    set_u32(file_buf, (opt_base + 88) / 4, 0x100000);
+    set_u32(file_buf, (opt_base + 108) / 4, 16);
+
+    /* 5. Mach-O Universal / Fat Binary Header at offset 512 */
+    uint64_t macho_base = 512;
+    file_buf[macho_base + 0] = 0xCA; file_buf[macho_base + 1] = 0xFE;
+    file_buf[macho_base + 2] = 0xBA; file_buf[macho_base + 3] = 0xBE;
+    set_u32(file_buf, (macho_base + 4) / 4, __builtin_bswap32(2));
+
+    uint64_t arch1 = macho_base + 8;
+    set_u32(file_buf, (arch1 + 0) / 4, __builtin_bswap32(0x01000007)); /* CPU_TYPE_X86_64 */
+    set_u32(file_buf, (arch1 + 4) / 4, __builtin_bswap32(3));
+    set_u32(file_buf, (arch1 + 8) / 4, __builtin_bswap32(0x10000));
+    set_u32(file_buf, (arch1 + 12) / 4, __builtin_bswap32((uint32_t)sz_x86));
+    set_u32(file_buf, (arch1 + 16) / 4, __builtin_bswap32(14));
+
+    uint64_t arch2 = arch1 + 20;
+    set_u32(file_buf, (arch2 + 0) / 4, __builtin_bswap32(0x0100000C)); /* CPU_TYPE_ARM64 */
+    set_u32(file_buf, (arch2 + 4) / 4, __builtin_bswap32(0));
+    set_u32(file_buf, (arch2 + 8) / 4, __builtin_bswap32(0x50000));
+    set_u32(file_buf, (arch2 + 12) / 4, __builtin_bswap32((uint32_t)sz_arm));
+    set_u32(file_buf, (arch2 + 16) / 4, __builtin_bswap32(14));
+
+    /* 6. Universal Hologram Header at 1152 */
+    uint64_t holo_offset = 1152;
+    uint64_t contracts_offset = 1248;
+    uint64_t contracts_size = u_x86->contract_count * sizeof(SymbolContract);
+    uint64_t relocs_offset = contracts_offset + contracts_size;
+    uint64_t relocs_size = u_x86->reloc_count * sizeof(EiaRelocHole);
+    uint64_t type_graph_offset = relocs_offset + relocs_size;
+    uint64_t type_graph_size = u_x86->type_graph_count * sizeof(EiaTypeGraphEntry);
+
+    UniversalHologramHeader *holo = (UniversalHologramHeader *)(file_buf + holo_offset);
+    holo->magic = EIA_MAGIC_HOLO;
+    holo->version_major = EIA_VERSION_MAJOR;
+    holo->version_minor = EIA_VERSION_MINOR;
+    holo->abi_epoch = 1;
+    holo->contracts_offset = contracts_offset;
+    holo->contracts_count = u_x86->contract_count;
+    holo->relocs_offset = relocs_offset;
+    holo->relocs_count = u_x86->reloc_count;
+    holo->type_graph_offset = type_graph_offset;
+    holo->type_graph_size = type_graph_size;
+    holo->flags = 1 | 4; /* bit 0: valid hologram, bit 2: Multi-ISA Universal Payload */
+
+    if (u_x86->contract_count > 0 && u_x86->contracts) {
+        memcpy(file_buf + contracts_offset, u_x86->contracts, contracts_size);
+    }
+    if (u_x86->reloc_count > 0 && u_x86->relocs) {
+        memcpy(file_buf + relocs_offset, u_x86->relocs, relocs_size);
+    }
+    if (u_x86->type_graph_count > 0 && u_x86->type_graph) {
+        memcpy(file_buf + type_graph_offset, u_x86->type_graph, type_graph_size);
+    }
+    holo->blake3_root = blake3_hash64(file_buf + contracts_offset, contracts_size + relocs_size + type_graph_size);
+
+    /* 7. Copy individual ISA slices into multi-ISA container */
+    memcpy(file_buf + 0x10000, buf_x86, sz_x86);
+    memcpy(file_buf + 0x50000, buf_arm, sz_arm);
+    memcpy(file_buf + 0x90000, buf_riscv, sz_riscv);
+
+    free(buf_x86);
+    free(buf_arm);
+    free(buf_riscv);
+
+    /* 8. Cryptographic whole-artifact signing if requested */
+    if (is_signed) {
+        uint64_t auth_offset = type_graph_offset + type_graph_size;
+        uint64_t auth_size = sizeof(EiaSignatureRecord);
+        EiaSignatureRecord sig_rec;
+        memset(&sig_rec, 0, sizeof(sig_rec));
+        sig_rec.magic = EIA_AUTH_MAGIC;
+        sig_rec.version = EIA_AUTH_VERSION;
+        uint16_t signing_epoch = 0;
+        sig_rec.public_key_id = eia_get_active_signing_key_id(&signing_epoch, NULL);
+        sig_rec.key_epoch = signing_epoch;
+
+        memcpy(file_buf + auth_offset, &sig_rec, sizeof(sig_rec));
+        memcpy(&holo->reserved[0], &auth_offset, 8);
+        memcpy(&holo->reserved[8], &auth_size, 8);
+        holo->flags |= 2;
+
+        blake3_hash256(file_buf, total_size, sig_rec.blake3_digest);
+        if (spark0_sign_digest(sig_rec.blake3_digest, sig_rec.key_epoch, sig_rec.signature) != 0) {
+            fprintf(stderr, "[EIA ERROR] Failed to sign universal artifact '%s'\n", out_path);
+            free(file_buf);
+            return -1;
+        }
+        memcpy(file_buf + auth_offset, &sig_rec, sizeof(sig_rec));
+    }
+
+    FILE *f = fopen(out_path, "wb");
+    if (!f) {
+        perror("fopen universal output");
+        free(file_buf);
+        return -1;
+    }
+    size_t written = fwrite(file_buf, 1, total_size, f);
+    fclose(f);
+    free(file_buf);
+
+    if (written != total_size) {
+        fprintf(stderr, "Failed to write complete universal binary to '%s'\n", out_path);
+        return -1;
+    }
+    if (chmod(out_path, 0755) != 0) {
+        perror("chmod 0755");
+        return -1;
+    }
+    return 0;
+}
+
 int spark0_write_elf(const CompiledUnit *unit, const char *out_path, int is_upbp, int target_arch) {
     return spark0_write_elf_opt(unit, out_path, is_upbp, target_arch, 0);
 }
 
 int spark0_compile_to_elf_opt(RuModule *module, const char *output_path, int is_upbp, int target_arch, int is_signed) {
+    if (target_arch == 5) {
+        CompiledUnit *u_x86   = spark0_compile_module(module, 0);
+        CompiledUnit *u_arm   = spark0_compile_module(module, 1);
+        CompiledUnit *u_riscv = spark0_compile_module(module, 2);
+        if (!u_x86 || !u_arm || !u_riscv) {
+            if (u_x86) compiled_unit_free(u_x86);
+            if (u_arm) compiled_unit_free(u_arm);
+            if (u_riscv) compiled_unit_free(u_riscv);
+            return -1;
+        }
+        int rc = spark0_write_universal_binary(u_x86, u_arm, u_riscv, output_path, is_signed);
+        compiled_unit_free(u_x86);
+        compiled_unit_free(u_arm);
+        compiled_unit_free(u_riscv);
+        return rc;
+    }
     CompiledUnit *u = spark0_compile_module(module, target_arch);
     if (!u) return -1;
     int rc = spark0_write_elf_opt(u, output_path, is_upbp, target_arch, is_signed);

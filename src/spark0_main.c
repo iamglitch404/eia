@@ -9,7 +9,7 @@ static void print_usage(void) {
            "Usage: spark0 <source.rx> -o <output_binary> [flags]\n\n"
            "Flags:\n"
            "  -o <path>             Specify executable output path\n"
-           "  --target=<isa>        Target architecture: x86_64 (default), arm64, riscv64\n"
+           "  --target=<isa>        Target architecture: x86_64 (default), arm64, riscv64, baremetal, uefi, universal\n"
            "  --upbp                Emit Universal Polyglot Binary Package (Multi-OS)\n"
            "  -h, --help            Show this help dialog\n");
 }
@@ -53,7 +53,7 @@ int main(int argc, char **argv) {
     int is_upbp = 0;
     int is_signed = 0;
 
-    int target_arch = 0; /* 0=x86_64, 1=arm64, 2=riscv64 */
+    int target_arch = 0; /* 0=x86_64, 1=arm64, 2=riscv64, 3=baremetal, 4=uefi */
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-o") == 0) {
@@ -75,6 +75,13 @@ int main(int argc, char **argv) {
                 target_arch = 1;
             } else if (strcmp(t, "riscv64") == 0) {
                 target_arch = 2;
+            } else if (strcmp(t, "baremetal") == 0 || strcmp(t, "multiboot") == 0) {
+                target_arch = 3;
+            } else if (strcmp(t, "uefi") == 0 || strcmp(t, "efi") == 0) {
+                target_arch = 4;
+            } else if (strcmp(t, "universal") == 0 || strcmp(t, "multiarch") == 0) {
+                target_arch = 5;
+                is_upbp = 1;
             } else {
                 fprintf(stderr, "Error: unsupported target architecture '%s'\n", t);
                 return 1;
@@ -88,6 +95,13 @@ int main(int argc, char **argv) {
                     target_arch = 1;
                 } else if (strcmp(t, "riscv64") == 0) {
                     target_arch = 2;
+                } else if (strcmp(t, "baremetal") == 0 || strcmp(t, "multiboot") == 0) {
+                    target_arch = 3;
+                } else if (strcmp(t, "uefi") == 0 || strcmp(t, "efi") == 0) {
+                    target_arch = 4;
+                } else if (strcmp(t, "universal") == 0 || strcmp(t, "multiarch") == 0) {
+                    target_arch = 5;
+                    is_upbp = 1;
                 } else {
                     fprintf(stderr, "Error: unsupported target architecture '%s'\n", t);
                     return 1;

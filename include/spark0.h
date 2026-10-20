@@ -192,6 +192,21 @@ typedef struct GdamGeneration {
 } GdamGeneration;
 
 #define MAX_LOADED_PROVIDERS 64
+#define MAX_GDAM_THREADS 128
+
+typedef struct {
+    _Atomic(uint64_t) thread_id;
+    _Atomic(uint64_t) entered_epoch;
+    _Atomic(bool)     in_critical_section;
+} GdamThreadSlot;
+
+typedef struct GdamObjectNode {
+    void                  **object_ptr_ref; /* Direct reference to application object pointer */
+    uint64_t                type_sig_hash;  /* BLAKE3-64 canonical structural hash */
+    size_t                  element_count;  /* 1 for single struct, >1 for array of structs */
+    size_t                  element_size;   /* Current byte size */
+    struct GdamObjectNode  *next;
+} GdamObjectNode;
 
 #ifndef _CONCURRENT_GDAM_STATE_DEFINED
 #define _CONCURRENT_GDAM_STATE_DEFINED
@@ -203,8 +218,21 @@ typedef struct {
     GdamGeneration           *staged_generation;
     uint8_t                  *retired_records[MAX_LOADED_PROVIDERS + 1];
     size_t                    retired_count;
+    GdamThreadSlot            threads[MAX_GDAM_THREADS];
+    _Atomic(size_t)           thread_count;
+    GdamObjectNode           *object_graph;
+    _Atomic(int)              object_lock;
 } ConcurrentGdamState;
 #endif
+
+/* Target architecture definitions */
+#define EIA_TARGET_X86_64    0
+#define EIA_TARGET_ARM64     1
+#define EIA_TARGET_RISCV64   2
+#define EIA_TARGET_BAREMETAL 3
+#define EIA_TARGET_UEFI      4
+#define EIA_TARGET_UNIVERSAL 5
+#define MULTIBOOT_HEADER_MAGIC 0x1BADB002
 
 /* GDAM Runtime API */
 void gdam_init(ConcurrentGdamState *gdam, GdamGeneration *init_gen);
@@ -222,6 +250,16 @@ size_t gdam_migrate_record(
 int eia_gdam_stage_upgrade(ConcurrentGdamState *gdam, GdamGeneration *next_gen);
 uint64_t eia_gdam_commit_upgrade(ConcurrentGdamState *gdam, GdamGeneration *new_gen, uint64_t type_hash);
 int eia_gdam_rollback_upgrade(ConcurrentGdamState *gdam);
+
+/* Dynamic Thread Registration & Multi-Object Graph Migration */
+int eia_gdam_register_thread(ConcurrentGdamState *gdam, uint64_t thread_id);
+int eia_gdam_unregister_thread(ConcurrentGdamState *gdam, uint64_t thread_id);
+void eia_gdam_thread_enter(ConcurrentGdamState *gdam, uint64_t thread_id);
+void eia_gdam_thread_leave(ConcurrentGdamState *gdam, uint64_t thread_id);
+int eia_gdam_register_object(ConcurrentGdamState *gdam, void **obj_ref, uint64_t type_hash, size_t element_count, size_t elem_size);
+int eia_gdam_unregister_object(ConcurrentGdamState *gdam, void **obj_ref);
+int eia_gdam_publish_object_pointer(ConcurrentGdamState *gdam, void **obj_ref, void *new_ptr);
+uint64_t eia_gdam_migrate_object_graph(ConcurrentGdamState *gdam, GdamGeneration *new_gen, uint64_t type_hash);
 
 
 /* ========================================================================= */

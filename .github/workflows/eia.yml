@@ -83,6 +83,30 @@ jobs:
           print('Multi-architecture targets (EM_AARCH64 & EM_RISCV) verified on ${{ matrix.os }}')
           "
 
+      - name: Verify Universal Multi-ISA Artifact & Polyglot Header Structure
+        run: |
+          ./bin/spark0 tests/hello_eia.rx -o bin/hello_universal --target=universal
+          exit_code=0
+          /bin/sh bin/hello_universal || exit_code=$?
+          echo "Universal multi-ISA shell execution exit code: $exit_code"
+          if [ "$exit_code" -ne 42 ]; then
+            echo "Expected exit code 42, got $exit_code"
+            exit 1
+          fi
+          python3 -c "
+          with open('bin/hello_universal', 'rb') as f:
+              b = f.read()
+          assert b[0:2] in (b'MZ', b'#!'), 'Missing MZ or shebang magic'
+          assert b[60:62] == b'\x40\x01', 'Invalid e_lfanew offset to PE header'
+          assert b[320:324] == b'PE\x00\x00', 'Missing PE/COFF header'
+          assert b[512:516] == b'\xca\xfe\xba\xbe', 'Missing Mach-O Fat header'
+          assert b[1152:1156] == bytes([69, 73, 72, 68]), 'Missing Universal Hologram Header'
+          assert b[0x10000:0x10004] == b'\x7fELF', 'Missing x86_64 ELF slice'
+          assert b[0x50000:0x50004] == b'\x7fELF', 'Missing ARM64 ELF slice'
+          assert b[0x90000:0x90004] == b'\x7fELF', 'Missing RISC-V 64 ELF slice'
+          print('Universal multi-ISA binary successfully verified on ${{ matrix.os }}')
+          "
+
       - name: Stage-1 compiler subsystems cross-compilation
         run: |
           ./bin/spark0 compiler/runtime.rx -o bin/stage1_runtime
@@ -268,10 +292,20 @@ jobs:
           ./bin/test_eia_abi_bridge
           echo "EIA System V AMD64 <-> Win64 ABI Calling Convention Bridge Suite: 100% PASSED"
 
+          # Bare-Metal Multiboot 1 & UEFI PE32+ Boot Verification Suite
+          gcc -O2 -Wall -Wextra -Iinclude -o bin/test_firmware_boot tests/test_firmware_boot.c
+          ./bin/test_firmware_boot
+          echo "EIA Bare-Metal Multiboot 1 & UEFI Firmware Boot Verification Suite: 100% PASSED"
+
+          # Formal Performance & Invariant Proof Suite
+          gcc -O2 -Wall -Wextra -Iinclude -o bin/test_eia_perf_formal tests/test_eia_perf_formal.c
+          ./bin/test_eia_perf_formal
+          echo "EIA Formal Performance & Invariant Proof Suite: 100% PASSED"
+
           # GDAM Concurrent Live Upgrade & Hot Migration Suite (TSan & ASan)
-          gcc -O2 -Wall -Wextra -pthread -fsanitize=thread -Iinclude -o bin/test_gdam_hot_migration_tsan tests/test_gdam_hot_migration.c
+          gcc -O2 -Wall -Wextra -pthread -fsanitize=thread -Iinclude -DEIA_LOADER_LIB src/eia_loader.c tests/test_gdam_hot_migration.c -o bin/test_gdam_hot_migration_tsan
           ./bin/test_gdam_hot_migration_tsan
-          gcc -O2 -Wall -Wextra -pthread -fsanitize=address,undefined -Iinclude -o bin/test_gdam_hot_migration_asan tests/test_gdam_hot_migration.c
+          gcc -O2 -Wall -Wextra -pthread -fsanitize=address,undefined -Iinclude -DEIA_LOADER_LIB src/eia_loader.c tests/test_gdam_hot_migration.c -o bin/test_gdam_hot_migration_asan
           ./bin/test_gdam_hot_migration_asan
           echo "EIA GDAM Concurrent Live Upgrades & Hot Migration Suite: 100% PASSED"
 

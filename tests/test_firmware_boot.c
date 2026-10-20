@@ -369,9 +369,10 @@ static void test_live_baremetal_boot(void) {
             ip += (data[ip+2] == 0x47) ? 6 : 5;
         } else if (data[ip] == 0xe8) {
             ip += 5;
-        } else if (data[ip] == 0xba && data[ip+1] == 0xf8 && data[ip+2] == 0x03 && data[ip+3] == 0xee) {
+        } else if ((data[ip] == 0x66 && data[ip+1] == 0xba && data[ip+2] == 0xf8 && data[ip+3] == 0x03 && data[ip+4] == 0xee) ||
+                   (data[ip] == 0xba && data[ip+1] == 0xf8 && data[ip+2] == 0x03 && data[ip+3] == 0xee)) {
             if (uart_cnt < sizeof(uart_out)) uart_out[uart_cnt++] = 42;
-            ip += 4;
+            ip += (data[ip] == 0x66) ? 5 : 4;
         } else if (data[ip] == 0xe6 && data[ip+1] == 0xf4) {
             break;
         } else {
@@ -444,7 +445,7 @@ static void test_live_baremetal_boot(void) {
         char qemu_cmd[512];
         snprintf(qemu_cmd, sizeof(qemu_cmd),
                  "timeout 6s qemu-system-x86_64 -kernel /tmp/boot_bm_qemu.elf -serial file:/tmp/bm_serial.log -display none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 >/dev/null 2>&1");
-        system(qemu_cmd);
+        (void)!system(qemu_cmd);
         size_t log_sz = 0;
         uint8_t *log_data = read_file("/tmp/bm_serial.log", &log_sz);
         if (strict) {
@@ -466,7 +467,7 @@ static void test_live_baremetal_boot(void) {
         char qemu_cmd[512];
         snprintf(qemu_cmd, sizeof(qemu_cmd),
                  "timeout 6s qemu-system-aarch64 -M virt -cpu cortex-a57 -nographic -kernel /tmp/boot_bm_arm.elf -serial file:/tmp/arm_serial.log >/dev/null 2>&1");
-        system(qemu_cmd);
+        (void)!system(qemu_cmd);
         size_t arm_log_sz = 0;
         uint8_t *arm_log = read_file("/tmp/arm_serial.log", &arm_log_sz);
         if (strict) {
@@ -488,7 +489,7 @@ static void test_live_baremetal_boot(void) {
         char qemu_cmd[512];
         snprintf(qemu_cmd, sizeof(qemu_cmd),
                  "timeout 6s qemu-system-riscv64 -M virt -bios none -nographic -kernel /tmp/boot_bm_rv.elf -serial file:/tmp/rv_serial.log >/dev/null 2>&1");
-        system(qemu_cmd);
+        (void)!system(qemu_cmd);
         size_t rv_log_sz = 0;
         uint8_t *rv_log = read_file("/tmp/rv_serial.log", &rv_log_sz);
         if (strict) {
@@ -596,15 +597,15 @@ static void test_live_uefi_execution(void) {
     if (command_available("qemu-system-x86_64")) {
         const char *ovmf_path = find_ovmf_firmware();
         if (ovmf_path) {
-            system("mkdir -p /tmp/uefi_disk/EFI/BOOT");
-            system("cp /tmp/boot_uefi_live.efi /tmp/uefi_disk/EFI/BOOT/BOOTX64.EFI");
+            (void)!system("mkdir -p /tmp/uefi_disk/EFI/BOOT");
+            (void)!system("cp /tmp/boot_uefi_live.efi /tmp/uefi_disk/EFI/BOOT/BOOTX64.EFI");
             unlink("/tmp/uefi_serial.log");
 
             char qemu_cmd[512];
             snprintf(qemu_cmd, sizeof(qemu_cmd),
                      "timeout 10s qemu-system-x86_64 -bios %s -net none -nographic -drive file=fat:rw:/tmp/uefi_disk,format=raw -serial file:/tmp/uefi_serial.log >/dev/null 2>&1",
                      ovmf_path);
-            system(qemu_cmd);
+            (void)!system(qemu_cmd);
 
             size_t log_sz = 0;
             uint8_t *log_data = read_file("/tmp/uefi_serial.log", &log_sz);

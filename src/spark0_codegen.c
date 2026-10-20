@@ -274,6 +274,7 @@ static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
         emit8(u, 0xfa);                                                 /* cli */
         emit8(u, 0xfc);                                                 /* cld */
         emit8(u, 0x48); emit8(u, 0xc7); emit8(u, 0xc4); emit32_le(u, 0x00090000); /* mov rsp, 0x90000 */
+        emit8(u, 0xbc); emit32_le(u, 0x00090000);                      /* mov esp, 0x90000 */
 
         /* 16550 UART COM1 (0x3F8) */
         emit8(u, 0xba); emit8(u, 0xf9); emit8(u, 0x03); emit8(u, 0x30); emit8(u, 0xc0); emit8(u, 0xee); /* mov dx, 0x3f9; xor al, al; out dx, al */
@@ -300,10 +301,11 @@ static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
         if (call_main_hole_out) *call_main_hole_out = u->text_size;
         emit32_le(u, 0);
 
-        /* Output return code to COM1 */
-        emit8(u, 0xba); emit8(u, 0xf8); emit8(u, 0x03); emit8(u, 0xee); /* mov dx, 0x3f8; out dx, al */
+        /* Output return code to COM1 (port 0x3F8) */
+        emit8(u, 0x66); emit8(u, 0xba); emit8(u, 0xf8); emit8(u, 0x03); /* mov dx, 0x3f8 */
+        emit8(u, 0xee);                                                 /* out dx, al */
         /* QEMU ISA debug-exit */
-        emit8(u, 0xe6); emit8(u, 0xf4); /* out 0xf4, al */
+        emit8(u, 0xe6); emit8(u, 0xf4);                                 /* out 0xf4, al */
         /* Halt loop: cli; hlt; jmp .-2 */
         emit8(u, 0xfa); emit8(u, 0xf4); emit8(u, 0xeb); emit8(u, 0xfc);
         const char *x86_str = "[EIA_BAREMETAL_X86_OK]\r\n";

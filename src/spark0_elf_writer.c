@@ -221,8 +221,8 @@ static uint8_t *spark0_create_elf_buf(const CompiledUnit *unit, size_t *out_size
     uint64_t type_graph_offset = relocs_offset + relocs_size;
     uint64_t type_graph_size = unit->type_graph_count * sizeof(EiaTypeGraphEntry);
 
-    uint64_t text_offset = (target_arch == 3) ? 0x1000 : 0x10000; /* Baremetal: 4KB / Native: 64KB */
-    uint64_t rodata_offset = (target_arch == 3) ? 0x3000 : 0x30000; /* Baremetal: 12KB / Native: 192KB */
+    uint64_t text_offset = (target_arch == 3 || target_arch == 8 || target_arch == 9) ? 0x1000 : 0x10000; /* Baremetal: 4KB / Native: 64KB */
+    uint64_t rodata_offset = (target_arch == 3 || target_arch == 8 || target_arch == 9) ? 0x3000 : 0x30000; /* Baremetal: 12KB / Native: 192KB */
     if (text_offset + unit->text_size > rodata_offset) {
         rodata_offset = (text_offset + unit->text_size + 0xFFF) & ~0xFFFULL;
     }
@@ -338,15 +338,15 @@ static uint8_t *spark0_create_elf_buf(const CompiledUnit *unit, size_t *out_size
         Elf64Header *ehdr = (Elf64Header *)file_buf;
         memcpy(ehdr->e_ident, "\x7f\x45\x4c\x46\x02\x01\x01\0\0\0\0\0\0\0\0\0", 16);
         ehdr->e_type = 2; /* ET_EXEC */
-        if (target_arch == 1) {
+        if (target_arch == 1 || target_arch == 8) {
             ehdr->e_machine = 183; /* EM_AARCH64 */
-        } else if (target_arch == 2) {
+        } else if (target_arch == 2 || target_arch == 9) {
             ehdr->e_machine = 243; /* EM_RISCV */
         } else {
             ehdr->e_machine = 0x3E; /* EM_X86_64 */
         }
         ehdr->e_version = 1;
-        ehdr->e_entry = unit->entry_vaddr; /* 0x401000 (_start) or 0x101000 (baremetal) */
+        ehdr->e_entry = unit->entry_vaddr; /* 0x401000, 0x101000 (x86_bm), 0x80040 (arm_bm), 0x80000040 (rv_bm) */
         ehdr->e_phoff = 64;
         ehdr->e_shoff = 0;
         ehdr->e_flags = 0;
@@ -362,7 +362,9 @@ static uint8_t *spark0_create_elf_buf(const CompiledUnit *unit, size_t *out_size
         phdr->p_type = 1; /* PT_LOAD */
         phdr->p_flags = 5; /* PF_R | PF_X (Strict W^X compliance) */
         phdr->p_offset = 0;
-        uint64_t load_vaddr = (target_arch == 3) ? 0x100000 : 0x400000;
+        uint64_t load_vaddr = (target_arch == 3) ? 0x100000 : 
+                              (target_arch == 8) ? 0x80000 : 
+                              (target_arch == 9) ? 0x80000000 : 0x400000;
         phdr->p_vaddr = load_vaddr;
         phdr->p_paddr = load_vaddr;
         phdr->p_filesz = total_file_size;
@@ -713,6 +715,23 @@ int spark0_write_elf_opt(const CompiledUnit *unit, const char *out_path, int is_
     if (chmod(out_path, 0755) != 0) {
         perror("chmod 0755");
         return -1;
+    }
+
+    /* Emit raw binary image alongside ELF for bare-metal targets */
+    if (target_arch == 8 || target_arch == 9) {
+        char bin_path[512];
+        snprintf(bin_path, sizeof(bin_path), "%s.bin", out_path);
+        FILE *bf = fopen(bin_path, "wb");
+        if (bf) {
+            if (unit->text_size > 0 && unit->text_buf) {
+                fwrite(unit->text_buf, 1, unit->text_size, bf);
+            }
+            if (unit->rodata_size > 0 && unit->rodata_buf) {
+                fwrite(unit->rodata_buf, 1, unit->rodata_size, bf);
+            }
+            fclose(bf);
+            chmod(bin_path, 0644);
+        }
     }
 
     return 0;

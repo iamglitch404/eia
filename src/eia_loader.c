@@ -33,6 +33,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <pthread.h>
 #endif
 #include "spark0.h"
 #include "gdam.h"
@@ -44,6 +47,8 @@
 
 static ConcurrentGdamState g_runtime_gdam;
 static GdamGeneration g_provider_gens[MAX_LOADED_PROVIDERS + 1];
+static GdamKernelResource *g_kernel_resources = NULL;
+static pthread_mutex_t g_kernel_res_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void gdam_init(ConcurrentGdamState *gdam, GdamGeneration *init_gen) {
     memset(gdam, 0, sizeof(*gdam));
@@ -344,6 +349,17 @@ int gdam_runtime_init(ConcurrentGdamState *gdam, GdamGeneration *init_gen) {
 int gdam_runtime_shutdown(ConcurrentGdamState *gdam) {
     if (!gdam) return GDAM_ERR_INVALID_ARG;
     gdam_reclaim_retired(gdam);
+#ifndef _WIN32
+    pthread_mutex_lock(&g_kernel_res_lock);
+    GdamKernelResource *kcurr = g_kernel_resources;
+    while (kcurr) {
+        GdamKernelResource *next = kcurr->next;
+        free(kcurr);
+        kcurr = next;
+    }
+    g_kernel_resources = NULL;
+    pthread_mutex_unlock(&g_kernel_res_lock);
+#endif
     return GDAM_SUCCESS;
 }
 
@@ -385,6 +401,138 @@ uint64_t gdam_commit_migration(ConcurrentGdamState *gdam, GdamGeneration *new_ge
 
 int gdam_abort_migration(ConcurrentGdamState *gdam) {
     return gdam_rollback(gdam) == 0 ? GDAM_SUCCESS : GDAM_ERR_ROLLBACK;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Kernel Handle & Stream Socket Migration (FD, SCM_RIGHTS, Seek State)      */
+/* ------------------------------------------------------------------------- */
+
+int gdam_register_kernel_handle(ConcurrentGdamState *gdam, int fd, int resource_type) {
+    if (fd < 0) return GDAM_ERR_INVALID_ARG;
+    (void)gdam;
+    GdamKernelResource *node = (GdamKernelResource *)calloc(1, sizeof(GdamKernelResource));
+    if (!node) return GDAM_ERR_NO_MEMORY;
+    node->fd = fd;
+    node->resource_type = resource_type;
+#ifndef _WIN32
+    node->flags = fcntl(fd, F_GETFL, 0);
+    node->seek_offset = lseek(fd, 0, SEEK_CUR);
+#endif
+    pthread_mutex_lock(&g_kernel_res_lock);
+    node->next = g_kernel_resources;
+    g_kernel_resources = node;
+    pthread_mutex_unlock(&g_kernel_res_lock);
+    return GDAM_SUCCESS;
+}
+
+int gdam_migrate_kernel_handle(ConcurrentGdamState *gdam, int old_fd, int *new_fd_out) {
+    if (old_fd < 0 || !new_fd_out) return GDAM_ERR_INVALID_ARG;
+    (void)gdam;
+#ifndef _WIN32
+    int new_fd = fcntl(old_fd, F_DUPFD_CLOEXEC, 0);
+    if (new_fd < 0) {
+        new_fd = dup(old_fd);
+        if (new_fd < 0) return GDAM_ERR_INVALID_ARG;
+    }
+
+    off_t off = lseek(old_fd, 0, SEEK_CUR);
+    if (off != (off_t)-1) {
+        lseek(new_fd, off, SEEK_SET);
+    }
+
+    pthread_mutex_lock(&g_kernel_res_lock);
+    GdamKernelResource *curr = g_kernel_resources;
+    while (curr) {
+        if (curr->fd == old_fd) {
+            curr->fd = new_fd;
+            curr->seek_offset = off;
+            break;
+        }
+        curr = curr->next;
+    }
+    pthread_mutex_unlock(&g_kernel_res_lock);
+
+    *new_fd_out = new_fd;
+    return GDAM_SUCCESS;
+#else
+    *new_fd_out = old_fd;
+    return GDAM_SUCCESS;
+#endif
+}
+
+int gdam_unregister_kernel_handle(ConcurrentGdamState *gdam, int fd) {
+    (void)gdam;
+    pthread_mutex_lock(&g_kernel_res_lock);
+    GdamKernelResource **curr = &g_kernel_resources;
+    while (*curr) {
+        if ((*curr)->fd == fd) {
+            GdamKernelResource *to_free = *curr;
+            *curr = (*curr)->next;
+            free(to_free);
+            pthread_mutex_unlock(&g_kernel_res_lock);
+            return GDAM_SUCCESS;
+        }
+        curr = &(*curr)->next;
+    }
+    pthread_mutex_unlock(&g_kernel_res_lock);
+    return GDAM_ERR_INVALID_ARG;
+}
+
+int gdam_send_fd_scm_rights(int unix_sock, int fd_to_send) {
+#ifndef _WIN32
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    char buf[CMSG_SPACE(sizeof(int))];
+    memset(buf, 0, sizeof(buf));
+
+    struct iovec io;
+    io.iov_base = (void *)"EIA_FD";
+    io.iov_len = 6;
+    msg.msg_iov = &io;
+    msg.msg_iovlen = 1;
+    msg.msg_control = buf;
+    msg.msg_controllen = sizeof(buf);
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    *((int *)CMSG_DATA(cmsg)) = fd_to_send;
+
+    if (sendmsg(unix_sock, &msg, 0) < 0) return -1;
+    return 0;
+#else
+    (void)unix_sock; (void)fd_to_send;
+    return -1;
+#endif
+}
+
+int gdam_recv_fd_scm_rights(int unix_sock, int *fd_received_out) {
+#ifndef _WIN32
+    if (!fd_received_out) return -1;
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    char m_buf[16];
+    struct iovec io;
+    io.iov_base = m_buf;
+    io.iov_len = sizeof(m_buf);
+    char c_buf[CMSG_SPACE(sizeof(int))];
+    memset(c_buf, 0, sizeof(c_buf));
+
+    msg.msg_iov = &io;
+    msg.msg_iovlen = 1;
+    msg.msg_control = c_buf;
+    msg.msg_controllen = sizeof(c_buf);
+
+    if (recvmsg(unix_sock, &msg, 0) < 0) return -1;
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS) return -1;
+    *fd_received_out = *((int *)CMSG_DATA(cmsg));
+    return 0;
+#else
+    (void)unix_sock; (void)fd_received_out;
+    return -1;
+#endif
 }
 
 /* Diagnostic error codes */

@@ -53,7 +53,8 @@ int main(int argc, char **argv) {
     int is_upbp = 0;
     int is_signed = 0;
 
-    int target_arch = 0; /* 0=x86_64, 1=arm64, 2=riscv64, 3=baremetal, 4=uefi */
+    int target_arch = 0; /* 0=x86_64, 1=arm64, 2=riscv64, 3=baremetal-x86, 4=uefi, 5=universal, 6=pe, 7=macho, 8=baremetal-arm64, 9=baremetal-riscv */
+    int is_baremetal = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-o") == 0) {
@@ -67,6 +68,8 @@ int main(int argc, char **argv) {
             is_upbp = 1;
         } else if (strcmp(argv[i], "--sign") == 0 || strcmp(argv[i], "--auth") == 0) {
             is_signed = 1;
+        } else if (strcmp(argv[i], "--bare-metal") == 0 || strcmp(argv[i], "--baremetal") == 0) {
+            is_baremetal = 1;
         } else if (strncmp(argv[i], "--target=", 9) == 0 || strncmp(argv[i], "-target=", 8) == 0) {
             const char *t = strchr(argv[i], '=') + 1;
             if (strcmp(t, "x86_64") == 0) {
@@ -85,6 +88,10 @@ int main(int argc, char **argv) {
                 target_arch = 6;
             } else if (strcmp(t, "macho") == 0 || strcmp(t, "macos") == 0 || strcmp(t, "darwin") == 0) {
                 target_arch = 7;
+            } else if (strcmp(t, "baremetal-arm64") == 0 || strcmp(t, "arm64-baremetal") == 0) {
+                target_arch = 8;
+            } else if (strcmp(t, "baremetal-riscv64") == 0 || strcmp(t, "riscv64-baremetal") == 0) {
+                target_arch = 9;
             } else {
                 fprintf(stderr, "Error: unsupported target architecture '%s'\n", t);
                 return 1;
@@ -108,6 +115,10 @@ int main(int argc, char **argv) {
                     target_arch = 6;
                 } else if (strcmp(t, "macho") == 0 || strcmp(t, "macos") == 0 || strcmp(t, "darwin") == 0) {
                     target_arch = 7;
+                } else if (strcmp(t, "baremetal-arm64") == 0 || strcmp(t, "arm64-baremetal") == 0) {
+                    target_arch = 8;
+                } else if (strcmp(t, "baremetal-riscv64") == 0 || strcmp(t, "riscv64-baremetal") == 0) {
+                    target_arch = 9;
                 } else {
                     fprintf(stderr, "Error: unsupported target architecture '%s'\n", t);
                     return 1;
@@ -120,6 +131,16 @@ int main(int argc, char **argv) {
             if (!input_path) {
                 input_path = argv[i];
             }
+        }
+    }
+
+    if (is_baremetal) {
+        if (target_arch == 1) {
+            target_arch = 8;
+        } else if (target_arch == 2) {
+            target_arch = 9;
+        } else if (target_arch == 0) {
+            target_arch = 3;
         }
     }
 

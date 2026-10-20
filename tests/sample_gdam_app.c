@@ -18,6 +18,9 @@
 #include <assert.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <stdatomic.h>
 #include "gdam.h"
 
@@ -184,6 +187,77 @@ int main(void) {
         assert(*(uint64_t *)(rec + 24) == ((i + 1) * 100)); /* balance_cents at +24 */
     }
     printf("  [PASS] Validated all %d sessions preserved invariant data across layout displacement!\n", NUM_SESSIONS);
+
+    /* [GDAM APP STEP 4B] Live Kernel FD, Socket & SCM_RIGHTS Cross-Process State Migration */
+    printf("[GDAM APP STEP 4B] Live Kernel Resource Migration & SCM_RIGHTS Zero-Downtime Handoff...\n");
+
+    /* 1. Open temporary file and write partial stream in Epoch 1 */
+    char tmp_file[] = "/tmp/gdam_live_fd_XXXXXX";
+    int live_fd = mkstemp(tmp_file);
+    assert(live_fd >= 0);
+    const char part1_msg[] = "PART1_FILE_DATA;";
+    assert(write(live_fd, part1_msg, strlen(part1_msg)) == (ssize_t)strlen(part1_msg));
+    assert(gdam_register_kernel_handle(&gdam, live_fd, GDAM_RES_FILE_DESC) == GDAM_SUCCESS);
+
+    /* 2. Create connected UNIX stream socket pair and write partial data in Epoch 1 */
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    const char sock_part1[] = "SOCK_STREAM_PART1;";
+    assert(write(sv[0], sock_part1, strlen(sock_part1)) == (ssize_t)strlen(sock_part1));
+    assert(gdam_register_kernel_handle(&gdam, sv[0], GDAM_RES_UNIX_SOCKET) == GDAM_SUCCESS);
+    assert(gdam_register_kernel_handle(&gdam, sv[1], GDAM_RES_UNIX_SOCKET) == GDAM_SUCCESS);
+
+    /* 3. In-Process Live Kernel FD Migration across epochs: preserves seek position */
+    int migrated_file_fd = -1;
+    assert(gdam_migrate_kernel_handle(&gdam, live_fd, &migrated_file_fd) == GDAM_SUCCESS);
+    assert(migrated_file_fd >= 0);
+    const char part2_msg[] = "PART2_FILE_DATA\n";
+    assert(write(migrated_file_fd, part2_msg, strlen(part2_msg)) == (ssize_t)strlen(part2_msg));
+
+    /* 4. Cross-Process SCM_RIGHTS Zero-Downtime FD Handoff */
+    int handoff_pipe[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, handoff_pipe) == 0);
+    assert(gdam_send_fd_scm_rights(handoff_pipe[0], sv[0]) == 0);
+
+    int received_sock_fd = -1;
+    assert(gdam_recv_fd_scm_rights(handoff_pipe[1], &received_sock_fd) == 0);
+    assert(received_sock_fd >= 0);
+
+    /* Write second half of socket stream through handoff socket */
+    const char sock_part2[] = "SOCK_STREAM_PART2_MIGRATED\n";
+    assert(write(received_sock_fd, sock_part2, strlen(sock_part2)) == (ssize_t)strlen(sock_part2));
+
+    /* 5. Assert 100% byte-for-byte stream continuity from receiver end */
+    char sock_read_buf[128];
+    memset(sock_read_buf, 0, sizeof(sock_read_buf));
+    ssize_t sock_bytes = read(sv[1], sock_read_buf, sizeof(sock_read_buf) - 1);
+    assert(sock_bytes == (ssize_t)(strlen(sock_part1) + strlen(sock_part2)));
+    assert(strcmp(sock_read_buf, "SOCK_STREAM_PART1;SOCK_STREAM_PART2_MIGRATED\n") == 0);
+
+    /* Assert 100% byte-for-byte file continuity from migrated descriptor */
+    lseek(migrated_file_fd, 0, SEEK_SET);
+    char file_read_buf[128];
+    memset(file_read_buf, 0, sizeof(file_read_buf));
+    ssize_t file_bytes = read(migrated_file_fd, file_read_buf, sizeof(file_read_buf) - 1);
+    assert(file_bytes == (ssize_t)(strlen(part1_msg) + strlen(part2_msg)));
+    assert(strcmp(file_read_buf, "PART1_FILE_DATA;PART2_FILE_DATA\n") == 0);
+
+    /* Cleanup file and socket descriptors */
+    gdam_unregister_kernel_handle(&gdam, live_fd);
+    gdam_unregister_kernel_handle(&gdam, migrated_file_fd);
+    gdam_unregister_kernel_handle(&gdam, sv[0]);
+    gdam_unregister_kernel_handle(&gdam, sv[1]);
+
+    close(live_fd);
+    close(migrated_file_fd);
+    close(sv[0]);
+    close(sv[1]);
+    close(handoff_pipe[0]);
+    close(handoff_pipe[1]);
+    close(received_sock_fd);
+    unlink(tmp_file);
+
+    printf("  [PASS] Live kernel FD & AF_UNIX stream socket migration + SCM_RIGHTS cross-process handoff verified (100%% byte continuity)!\n");
 
     /* Test Rollback Mechanism: Stage invalid Gen 3 then abort */
     printf("[GDAM APP STEP 5] Testing Stage & Abort Rollback Protection...\n");

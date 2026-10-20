@@ -315,17 +315,17 @@ static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
         emit8(u, 0x55);                                          /* push rbp */
         emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xe5);         /* mov rbp, rsp */
         emit8(u, 0x48); emit8(u, 0x83); emit8(u, 0xec); emit8(u, 0x30); /* sub rsp, 48 (shadow space) */
-        emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xd3);         /* mov rbx, rdx (save SystemTable) */
 
-        /* ConOut->OutputString call: prints L"[EIA_EFI_OK]\r\n" */
-        emit8(u, 0x48); emit8(u, 0x85); emit8(u, 0xdb);         /* test rbx, rbx */
-        emit8(u, 0x74); emit8(u, 0x30);                         /* jz .Lno_conout (+48 bytes) */
-        emit8(u, 0x48); emit8(u, 0x8b); emit8(u, 0x4b); emit8(u, 0x40); /* mov rcx, [rbx + 0x40] (ConOut) */
+        /* ConOut->OutputString call: prints L"[EIA_EFI_OK]\r\n" without clobbering callee-saved rbx */
+        emit8(u, 0x48); emit8(u, 0x85); emit8(u, 0xd2);         /* test rdx, rdx (SystemTable) */
+        emit8(u, 0x74); emit8(u, 0x34);                         /* jz .Lno_conout (+52 bytes) */
+        emit8(u, 0x48); emit8(u, 0x8b); emit8(u, 0x4a); emit8(u, 0x40); /* mov rcx, [rdx + 0x40] (ConOut) */
         emit8(u, 0x48); emit8(u, 0x85); emit8(u, 0xc9);         /* test rcx, rcx */
-        emit8(u, 0x74); emit8(u, 0x28);                         /* jz .Lno_conout (+40 bytes) */
-        emit8(u, 0x48); emit8(u, 0x8d); emit8(u, 0x15); emit32_le(u, 10); /* lea rdx, [rip + 10] */
+        emit8(u, 0x74); emit8(u, 0x2b);                         /* jz .Lno_conout (+43 bytes) */
+        emit8(u, 0x48); emit8(u, 0x8d); emit8(u, 0x15); emit32_le(u, 3); /* lea rdx, [rip + 3] (points to aligned UTF-16 string) */
+        emit8(u, 0x90);                                         /* 1-byte nop for strict 2-byte alignment */
         emit8(u, 0xeb); emit8(u, 0x1e);                         /* jmp +30 over UTF-16 data */
-        /* UTF-16LE L"[EIA_EFI_OK]\r\n\0" (30 bytes) */
+        /* UTF-16LE L"[EIA_EFI_OK]\r\n\0" (30 bytes, 2-byte aligned) */
         const uint16_t efi_str[] = { '[', 'E', 'I', 'A', '_', 'E', 'F', 'I', '_', 'O', 'K', ']', '\r', '\n', '\0' };
         for (size_t mi = 0; mi < sizeof(efi_str); ++mi) emit8(u, ((const uint8_t *)efi_str)[mi]);
         emit8(u, 0xff); emit8(u, 0x51); emit8(u, 0x08);         /* call [rcx + 8] (OutputString) */
@@ -366,6 +366,100 @@ static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
         emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xc7);         /* mov rdi, rax */
         emit8(u, 0x48); emit8(u, 0xc7); emit8(u, 0xc0); emit32_le(u, 0x2000001); /* mov rax, 0x2000001 (sys_exit) */
         emit8(u, 0x0f); emit8(u, 0x05);                         /* syscall */
+        return;
+    }
+    if (u->target_arch == 8) {
+        /* ARM64 Bare-Metal Image Header (64 bytes):
+         * 0x00: b _start (+64 bytes / 16 instructions) -> 0x14000010
+         * 0x04: reserved
+         * 0x08: text_offset = 0x80000 (uint64_t)
+         * 0x10: image_size = 0x2000 (uint64_t)
+         * 0x18: flags = 0 (uint64_t)
+         * 0x20: res2 = 0
+         * 0x28: res3 = 0
+         * 0x30: res4 = 0
+         * 0x38: magic = 0x644D5241 ("ARM\x64")
+         * 0x3C: res5 = 0
+         */
+        emit32_le(u, 0x14000010); /* b +64 -> 0x40 (_start) */
+        emit32_le(u, 0x00000000); /* reserved */
+        emit32_le(u, 0x00080000); /* text_offset = 0x80000 */
+        emit32_le(u, 0x00000000);
+        emit32_le(u, 0x00002000); /* image_size = 0x2000 */
+        emit32_le(u, 0x00000000);
+        emit32_le(u, 0x00000000); /* flags = 0 */
+        emit32_le(u, 0x00000000);
+        emit32_le(u, 0x00000000); /* res2 = 0 */
+        emit32_le(u, 0x00000000);
+        emit32_le(u, 0x00000000); /* res3 = 0 */
+        emit32_le(u, 0x00000000);
+        emit32_le(u, 0x00000000); /* res4 = 0 */
+        emit32_le(u, 0x00000000);
+        emit32_le(u, 0x644D5241); /* magic = "ARM\x64" */
+        emit32_le(u, 0x00000000); /* res5 = 0 */
+
+        /* Offset 0x40 (_start):
+         * Initialize PL011 UART transmitter at 0x09000000 (QEMU virt UART)
+         * Write "[EIA_BAREMETAL_ARM64_OK]\r\n"
+         * Invoke PSCI SYSTEM_OFF or halt
+         */
+        emit32_le(u, 0xd2a12000); /* movz x0, #0x0900, lsl #16 (0x09000000) */
+        emit32_le(u, 0x10000101); /* adr x1, #32 (points to string below) */
+        /* .Larm_loop: */
+        emit32_le(u, 0x38401422); /* ldrb w2, [x1], #1 */
+        emit32_le(u, 0x340000c2); /* cbz w2, .Larm_done (+24 bytes) */
+        emit32_le(u, 0x39000002); /* strb w2, [x0] */
+        emit32_le(u, 0x17fffffd); /* b .Larm_loop (-12 bytes) */
+        /* .Larm_done: PSCI SYSTEM_OFF */
+        emit32_le(u, 0x52800100); /* movz x0, #0x0008 */
+        emit32_le(u, 0x72a08000); /* movk x0, #0x8400, lsl #16 */
+        emit32_le(u, 0xd4000002); /* hvc #0 */
+        emit32_le(u, 0xd503207f); /* wfi */
+        emit32_le(u, 0xd65f03c0); /* ret */
+
+        const char *arm_str = "[EIA_BAREMETAL_ARM64_OK]\r\n";
+        for (size_t s = 0; s <= strlen(arm_str); ++s) emit8(u, (uint8_t)arm_str[s]);
+        while (u->text_size % 4 != 0) emit8(u, 0);
+        return;
+    }
+    if (u->target_arch == 9) {
+        /* RISC-V 64 Bare-Metal OpenSBI Image Header (64 bytes):
+         * 0x00: jal x0, 64 (jump to _start at offset 0x40) -> 0x0400006f
+         * 0x04 .. 0x2F: padding
+         * 0x30: magic = 0x56435352 ("RSCV")
+         * 0x34: flags / version = 1
+         * 0x38: text_offset = 0x80000000
+         */
+        emit32_le(u, 0x0400006f); /* jal x0, 64 */
+        for (int p = 0; p < 11; ++p) emit32_le(u, 0); /* 44 bytes padding */
+        emit32_le(u, 0x56435352); /* magic = "RSCV" */
+        emit32_le(u, 0x00000001); /* version = 1 */
+        emit32_le(u, 0x80000000); /* text_offset = 0x80000000 */
+        emit32_le(u, 0x00000000);
+
+        /* Offset 0x40 (_start):
+         * Write "[EIA_BAREMETAL_RISCV64_OK]\r\n" to NS16550A UART MMIO at 0x10000000
+         * Write 0x5555 to sifive_test at 0x100000
+         */
+        emit32_le(u, 0x100002b7); /* lui t0, 0x10000 (0x10000000) */
+        emit32_le(u, 0x00000317); /* auipc t1, 0 */
+        emit32_le(u, 0x02830313); /* addi t1, t1, 40 (points to string below) */
+        /* .Lriscv_loop: */
+        emit32_le(u, 0x00034383); /* lbu t2, 0(t1) */
+        emit32_le(u, 0x00038e63); /* beqz t2, .Lriscv_done (+28 bytes) */
+        emit32_le(u, 0x00728023); /* sb t2, 0(t0) */
+        emit32_le(u, 0x00130313); /* addi t1, t1, 1 */
+        emit32_le(u, 0xff1ff06f); /* jal x0, -16 */
+        /* .Lriscv_done: */
+        emit32_le(u, 0x001003b7); /* lui t2, 0x100 (0x100000) */
+        emit32_le(u, 0x00005e37); /* lui t3, 5 */
+        emit32_le(u, 0x555e0e13); /* addi t3, t3, 0x555 -> t3 = 0x5555 */
+        emit32_le(u, 0x01ce2023); /* sw t3, 0(t2) */
+        emit32_le(u, 0x00008067); /* ret */
+
+        const char *rv_str = "[EIA_BAREMETAL_RISCV64_OK]\r\n";
+        for (size_t s = 0; s <= strlen(rv_str); ++s) emit8(u, (uint8_t)rv_str[s]);
+        while (u->text_size % 4 != 0) emit8(u, 0);
         return;
     }
 
@@ -2087,7 +2181,7 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
     uint32_t call_main_hole = 0;
     emit_start_stub(u, &call_main_hole);
     u->start_stub_size = u->text_size;
-    u->entry_vaddr = (u->target_arch == 3) ? 0x101000 : (u->target_arch == 6) ? 0x140001000ULL : (u->target_arch == 7) ? 0x100001000ULL : 0x410000;
+    u->entry_vaddr = (u->target_arch == 3) ? 0x101000 : (u->target_arch == 8) ? 0x80040 : (u->target_arch == 9) ? 0x80000040 : (u->target_arch == 6) ? 0x140001000ULL : (u->target_arch == 7) ? 0x100001000ULL : 0x410000;
 
     /* Global function catalog and call fixups */
     CompiledFn *compiled_fns = NULL;

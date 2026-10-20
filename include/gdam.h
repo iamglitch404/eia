@@ -9,11 +9,8 @@
  * 3. Atomic Publication: Migrations transition generations atomically with sequential consistency.
  * 4. Cooperative Safe-Points: Readers enter/leave safe-points without locks; writers synchronize via RCU-like reclamation.
  * 5. Rollback Protection: If invariant checks fail during staging or migration, state rolls back cleanly.
- *
- * Scope & Limitations:
- * - GDAM manages heap/memory objects conforming to EIA structural type graphs.
- * - Unmanaged OS resources (raw file descriptors, sockets, kernel locks, thread IDs) require
- *   custom application-level resource re-binding hooks upon migration.
+ * 6. Kernel Handle Migration: Live file descriptors, socket pairs, and stream channels are cloned,
+ *    rebound, and transferred across schema epochs and processes via SCM_RIGHTS without in-flight data loss.
  */
 
 #ifndef EIA_GDAM_H
@@ -38,6 +35,22 @@ extern "C" {
 #define GDAM_ERR_ROLLBACK      -4
 #define GDAM_ERR_EPOCH_MISMATCH -5
 
+/* Kernel Handle Resource Types */
+#define GDAM_RES_FILE_DESC   1
+#define GDAM_RES_UNIX_SOCKET 2
+#define GDAM_RES_INET_SOCKET 3
+
+typedef struct GdamKernelResource {
+    int resource_type;          /* GDAM_RES_FILE_DESC, GDAM_RES_UNIX_SOCKET, etc. */
+    int fd;                     /* Active file descriptor */
+    int flags;                  /* fcntl flags (e.g. O_RDWR, O_NONBLOCK) */
+    int64_t seek_offset;        /* Exact file seek position */
+    int socket_family;          /* AF_UNIX or AF_INET */
+    int socket_type;            /* SOCK_STREAM or SOCK_DGRAM */
+    uint64_t epoch;             /* Associated epoch */
+    struct GdamKernelResource *next;
+} GdamKernelResource;
+
 /* Runtime Lifecycle API */
 int gdam_runtime_init(ConcurrentGdamState *gdam, GdamGeneration *init_gen);
 int gdam_runtime_shutdown(ConcurrentGdamState *gdam);
@@ -57,6 +70,15 @@ int gdam_publish_pointer(ConcurrentGdamState *gdam, void **obj_ref, void *new_pt
 int gdam_stage_migration(ConcurrentGdamState *gdam, GdamGeneration *next_gen);
 uint64_t gdam_commit_migration(ConcurrentGdamState *gdam, GdamGeneration *new_gen, uint64_t type_hash);
 int gdam_abort_migration(ConcurrentGdamState *gdam);
+
+/* Kernel Handle & Stream Socket Migration */
+int gdam_register_kernel_handle(ConcurrentGdamState *gdam, int fd, int resource_type);
+int gdam_migrate_kernel_handle(ConcurrentGdamState *gdam, int old_fd, int *new_fd_out);
+int gdam_unregister_kernel_handle(ConcurrentGdamState *gdam, int fd);
+
+/* Cross-Process Zero-Downtime FD Handoff via SCM_RIGHTS */
+int gdam_send_fd_scm_rights(int unix_sock, int fd_to_send);
+int gdam_recv_fd_scm_rights(int unix_sock, int *fd_received_out);
 
 #ifdef __cplusplus
 }

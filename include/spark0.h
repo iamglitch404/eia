@@ -45,6 +45,47 @@ typedef enum {
 /* ========================================================================= */
 
 /*
+ * Standard ELF32 Header (52 bytes)
+ * Used for x86 Multiboot 1 bare-metal images (QEMU / GRUB loader requirement).
+ * Exactly 52 bytes. Offsets: 0x00 .. 0x33.
+ */
+typedef struct {
+    uint8_t  e_ident[16];   /* 0x00: Magic number & ELF identification */
+    uint16_t e_type;        /* 0x10: Object file type */
+    uint16_t e_machine;     /* 0x12: Architecture (EM_386=3) */
+    uint32_t e_version;     /* 0x14: Object file version */
+    uint32_t e_entry;       /* 0x18: Virtual entry address */
+    uint32_t e_phoff;       /* 0x1C: Program header table file offset */
+    uint32_t e_shoff;       /* 0x20: Section header table file offset */
+    uint32_t e_flags;       /* 0x24: Processor-specific flags */
+    uint16_t e_ehsize;      /* 0x28: ELF header size in bytes (52) */
+    uint16_t e_phentsize;   /* 0x2A: Program header table entry size (32) */
+    uint16_t e_phnum;       /* 0x2C: Program header table entry count */
+    uint16_t e_shentsize;   /* 0x2E: Section header table entry size */
+    uint16_t e_shnum;       /* 0x30: Section header table entry count */
+    uint16_t e_shstrndx;    /* 0x32: Section header string table index */
+} __attribute__((packed)) Elf32Header;
+
+_Static_assert(sizeof(Elf32Header) == 52, "Elf32Header must be exactly 52 bytes");
+
+/*
+ * Standard ELF32 Program Header (32 bytes)
+ * Exactly 32 bytes. Offsets: 0x00 .. 0x1F.
+ */
+typedef struct {
+    uint32_t p_type;        /* 0x00: Segment type (PT_LOAD=1) */
+    uint32_t p_offset;      /* 0x04: Segment file offset */
+    uint32_t p_vaddr;       /* 0x08: Segment virtual address */
+    uint32_t p_paddr;       /* 0x0C: Segment physical address */
+    uint32_t p_filesz;      /* 0x10: Segment size in file */
+    uint32_t p_memsz;       /* 0x14: Segment size in memory */
+    uint32_t p_flags;       /* 0x18: Segment flags */
+    uint32_t p_align;       /* 0x1C: Segment alignment */
+} __attribute__((packed)) Elf32ProgramHeader;
+
+_Static_assert(sizeof(Elf32ProgramHeader) == 32, "Elf32ProgramHeader must be exactly 32 bytes");
+
+/*
  * Standard ELF64 Header (64 bytes)
  * Exactly 64 bytes. Offsets: 0x00 .. 0x3F.
  */

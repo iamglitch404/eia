@@ -333,6 +333,34 @@ static uint8_t *spark0_create_elf_buf(const CompiledUnit *unit, size_t *out_size
         file_buf[seg_base + 42] = 4;
         file_buf[seg_base + 56] = 7;
         file_buf[seg_base + 60] = 7;
+    } else if (target_arch == 3) {
+        /* 1. ELF32 Header for x86 Multiboot 1 (52 bytes) - QEMU/GRUB loader requires ELFCLASS32 & EM_386 */
+        Elf32Header *ehdr = (Elf32Header *)file_buf;
+        memcpy(ehdr->e_ident, "\x7f\x45\x4c\x46\x01\x01\x01\0\0\0\0\0\0\0\0\0", 16);
+        ehdr->e_type = 2; /* ET_EXEC */
+        ehdr->e_machine = 3; /* EM_386 */
+        ehdr->e_version = 1;
+        ehdr->e_entry = (uint32_t)unit->entry_vaddr; /* 0x101000 */
+        ehdr->e_phoff = sizeof(Elf32Header); /* 52 */
+        ehdr->e_shoff = 0;
+        ehdr->e_flags = 0;
+        ehdr->e_ehsize = sizeof(Elf32Header); /* 52 */
+        ehdr->e_phentsize = sizeof(Elf32ProgramHeader); /* 32 */
+        ehdr->e_phnum = 1;
+        ehdr->e_shentsize = 0;
+        ehdr->e_shnum = 0;
+        ehdr->e_shstrndx = 0;
+
+        /* 2. ELF32 Program Header (32 bytes) */
+        Elf32ProgramHeader *phdr = (Elf32ProgramHeader *)(file_buf + sizeof(Elf32Header));
+        phdr->p_type = 1; /* PT_LOAD */
+        phdr->p_flags = 5; /* PF_R | PF_X (Strict W^X compliance) */
+        phdr->p_offset = 0;
+        phdr->p_vaddr = 0x100000;
+        phdr->p_paddr = 0x100000;
+        phdr->p_filesz = (uint32_t)total_file_size;
+        phdr->p_memsz = (uint32_t)total_file_size;
+        phdr->p_align = 0x1000;
     } else {
         /* 1. ELF64 Header (64 bytes) */
         Elf64Header *ehdr = (Elf64Header *)file_buf;
@@ -346,7 +374,7 @@ static uint8_t *spark0_create_elf_buf(const CompiledUnit *unit, size_t *out_size
             ehdr->e_machine = 0x3E; /* EM_X86_64 */
         }
         ehdr->e_version = 1;
-        ehdr->e_entry = unit->entry_vaddr; /* 0x401000, 0x101000 (x86_bm), 0x80040 (arm_bm), 0x80000040 (rv_bm) */
+        ehdr->e_entry = unit->entry_vaddr; /* 0x401000, 0x80040 (arm_bm), 0x80000040 (rv_bm) */
         ehdr->e_phoff = 64;
         ehdr->e_shoff = 0;
         ehdr->e_flags = 0;
@@ -362,8 +390,7 @@ static uint8_t *spark0_create_elf_buf(const CompiledUnit *unit, size_t *out_size
         phdr->p_type = 1; /* PT_LOAD */
         phdr->p_flags = 5; /* PF_R | PF_X (Strict W^X compliance) */
         phdr->p_offset = 0;
-        uint64_t load_vaddr = (target_arch == 3) ? 0x100000 : 
-                              (target_arch == 8) ? 0x80000 : 
+        uint64_t load_vaddr = (target_arch == 8) ? 0x80000 : 
                               (target_arch == 9) ? 0x80000000 : 0x400000;
         phdr->p_vaddr = load_vaddr;
         phdr->p_paddr = load_vaddr;
@@ -464,7 +491,9 @@ static uint8_t *spark0_create_pe_buf(const CompiledUnit *unit, size_t *out_size,
     uint32_t headers_size = 0x1000;
     uint32_t text_offset = headers_size;
     uint32_t rodata_offset = text_offset + text_aligned;
-    uint32_t total_file_size = rodata_offset + rodata_aligned;
+
+    int num_sections = (unit->rodata_size > 0) ? 2 : 1;
+    uint32_t total_file_size = (num_sections == 2) ? (rodata_offset + rodata_aligned) : (text_offset + text_aligned);
 
     uint8_t *file_buf = (uint8_t *)calloc(total_file_size, 1);
     if (!file_buf) return NULL;
@@ -491,7 +520,7 @@ static uint8_t *spark0_create_pe_buf(const CompiledUnit *unit, size_t *out_size,
     /* 3. COFF File Header at 0x84 (20 bytes) */
     uint64_t coff_base = pe_base + 4;
     file_buf[coff_base + 0] = 0x64; file_buf[coff_base + 1] = 0x86; /* Machine = 0x8664 (AMD64) */
-    file_buf[coff_base + 2] = 2;    file_buf[coff_base + 3] = 0;    /* NumberOfSections = 2 */
+    file_buf[coff_base + 2] = (uint8_t)num_sections; file_buf[coff_base + 3] = 0; /* NumberOfSections */
     file_buf[coff_base + 16] = 240; file_buf[coff_base + 17] = 0;   /* SizeOfOptionalHeader = 240 */
     uint16_t pe_char = is_uefi ? 0x202E : 0x0023; /* 0x0023 = RELOCS_STRIPPED | EXECUTABLE | LARGE_ADDRESS_AWARE */
     file_buf[coff_base + 18] = (uint8_t)(pe_char & 0xFF);
@@ -502,7 +531,7 @@ static uint8_t *spark0_create_pe_buf(const CompiledUnit *unit, size_t *out_size,
     file_buf[opt_base + 0] = 0x0B; file_buf[opt_base + 1] = 0x02;   /* Magic = 0x020B (PE32+) */
     file_buf[opt_base + 2] = 1;    file_buf[opt_base + 3] = 0;      /* Linker version 1.0 */
     set_u32(file_buf, (opt_base + 4) / 4, text_aligned);            /* SizeOfCode */
-    set_u32(file_buf, (opt_base + 8) / 4, rodata_aligned);          /* SizeOfInitializedData */
+    set_u32(file_buf, (opt_base + 8) / 4, (num_sections == 2) ? rodata_aligned : 0); /* SizeOfInitializedData */
     set_u32(file_buf, (opt_base + 12) / 4, 0);                      /* SizeOfUninitializedData */
     set_u32(file_buf, (opt_base + 16) / 4, text_offset);            /* AddressOfEntryPoint = 0x1000 */
     set_u32(file_buf, (opt_base + 20) / 4, text_offset);            /* BaseOfCode = 0x1000 */
@@ -524,7 +553,7 @@ static uint8_t *spark0_create_pe_buf(const CompiledUnit *unit, size_t *out_size,
     file_buf[opt_base + 68] = is_uefi ? 10 : 3;                     /* Subsystem: 10=EFI, 3=CUI */
     file_buf[opt_base + 69] = 0;
     if (!is_uefi) {
-        file_buf[opt_base + 70] = 0x20; file_buf[opt_base + 71] = 0x81; /* DllCharacteristics = 0x8120: NX_COMPAT | TERMINAL_SERVER_AWARE */
+        file_buf[opt_base + 70] = 0x00; file_buf[opt_base + 71] = 0x81; /* DllCharacteristics = 0x8100: NX_COMPAT | TERMINAL_SERVER_AWARE */
     }
     set_u32(file_buf, (opt_base + 72) / 4, 0x200000);               /* SizeOfStackReserve = 2MB */
     set_u32(file_buf, (opt_base + 80) / 4, 0x1000);                 /* SizeOfStackCommit = 4KB */
@@ -543,20 +572,22 @@ static uint8_t *spark0_create_pe_buf(const CompiledUnit *unit, size_t *out_size,
     set_u32(file_buf, (sec_base + 20) / 4, text_offset);             /* PointerToRawData */
     set_u32(file_buf, (sec_base + 36) / 4, 0x60000020);              /* CNT_CODE | MEM_EXECUTE | MEM_READ */
 
-    /* Section 2: .rdata */
-    uint64_t rdata_sec = sec_base + 40;
-    memcpy(file_buf + rdata_sec, ".rdata\0\0", 8);
-    set_u32(file_buf, (rdata_sec + 8) / 4, (uint32_t)unit->rodata_size); /* VirtualSize */
-    set_u32(file_buf, (rdata_sec + 12) / 4, rodata_offset);             /* VirtualAddress */
-    set_u32(file_buf, (rdata_sec + 16) / 4, rodata_aligned);            /* SizeOfRawData */
-    set_u32(file_buf, (rdata_sec + 20) / 4, rodata_offset);             /* PointerToRawData */
-    set_u32(file_buf, (rdata_sec + 36) / 4, 0x40000040);              /* CNT_INITIALIZED_DATA | MEM_READ */
+    if (num_sections == 2) {
+        /* Section 2: .rdata */
+        uint64_t rdata_sec = sec_base + 40;
+        memcpy(file_buf + rdata_sec, ".rdata\0\0", 8);
+        set_u32(file_buf, (rdata_sec + 8) / 4, (uint32_t)unit->rodata_size); /* VirtualSize */
+        set_u32(file_buf, (rdata_sec + 12) / 4, rodata_offset);             /* VirtualAddress */
+        set_u32(file_buf, (rdata_sec + 16) / 4, rodata_aligned);            /* SizeOfRawData */
+        set_u32(file_buf, (rdata_sec + 20) / 4, rodata_offset);             /* PointerToRawData */
+        set_u32(file_buf, (rdata_sec + 36) / 4, 0x40000040);              /* CNT_INITIALIZED_DATA | MEM_READ */
+    }
 
     /* Copy payload data */
     if (unit->text_size > 0 && unit->text_buf) {
         memcpy(file_buf + text_offset, unit->text_buf, unit->text_size);
     }
-    if (unit->rodata_size > 0 && unit->rodata_buf) {
+    if (num_sections == 2 && unit->rodata_size > 0 && unit->rodata_buf) {
         memcpy(file_buf + rodata_offset, unit->rodata_buf, unit->rodata_size);
     }
 

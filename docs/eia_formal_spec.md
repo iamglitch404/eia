@@ -100,9 +100,9 @@ To ensure EIA binaries remain loadable and executable across multi-century archi
 
 ---
 
-## 4. Machine-State Operational Semantics & Code-Level Proofs
+## 4. Operational Semantics & Hardware Invariant Proofs
 
-To establish a rigorous, machine-checked bridge between the abstract type theory and emitted machine code, we formalize the execution semantics across processor states:
+To establish a rigorous mathematical specification and operational bridge between the abstract type theory and emitted machine code, we formalize the execution semantics across processor states:
 
 ### 4.1 Abstract Machine Configuration
 
@@ -126,7 +126,7 @@ Under EIA ARLL, the hole patcher updates the 32-bit displacement $d$ directly in
 $$d \leftarrow \text{target\_vaddr} - (\text{insn\_offset} + 5)$$
 Consequently, the operational transition at runtime is identical to native static compilation:
 $$\mathcal{S}_{\text{EIA}} \equiv \mathcal{S}_{\text{static}}$$
-$$\Delta \text{Instructions} = 0, \quad \Delta \text{Memory Loads} = 0, \quad \Delta \text{Branch Mispredictions} = 0 \implies \Delta t \equiv 0.000\text{ ns}$$
+$$\Delta \text{Instructions} = 0, \quad \Delta \text{Memory Loads} = 0, \quad \Delta \text{Branch Mispredictions} = 0 \implies \text{Structural dispatch delta} \equiv 0\text{ cycles (hand-tuned static equivalent)}$$
 
 #### Rule 2: Evolved Field Offset Access (`0x48 0x8B` / `0x48 0x8D`)
 

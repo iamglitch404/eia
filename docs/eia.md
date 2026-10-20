@@ -173,14 +173,22 @@ Resides in the process address space as a self-contained bootstrap stub:
 * Automatically synthesizes and emits calling convention bridge thunks (`arll_calling_convention_bridge`, 24 bytes in `.text`) when crossing host OS boundaries (converting System V AMD64 register arguments to Windows x64 register conventions).
 * Implements the multi-OS host syscall translation layer (`arll_resolve_host_syscall_vector` & `arll_host_syscall_gate_stencil` in `compiler/packaging.rx:221-320`) to map Linux (`0F 05`), Windows NT (`mov r10, rcx; mov eax, ssn; syscall`), and macOS Darwin (`0x2000000 | sys_id; syscall`).
 
-### 4.4 Universal Polyglot Binary Packaging (`UPBP`) & Multi-Architecture Targets
-A single binary file format that executes natively across platforms and silicon architectures:
-* **Offset 0x000–0x03F**: DOS `MZ` stub header with `e_lfanew = 0x140` (320) pointing to PE header.
-* **Offset 0x040–0x07F**: POSIX Shell script (`#!/bin/sh`) trampoline for non-native shell environments.
-* **Offset 0x080–0x13F** (128): ELF64 Header and PT_LOAD segment headers (Linux loader maps PT_LOAD segments directly). Supports multi-architecture targeting via `--target=x86_64` (default, `EM_X86_64`), `--target=arm64` (`EM_AARCH64`), and `--target=riscv64` (`EM_RISCV`).
-* **Offset 0x140–0x1FF** (320): PE/COFF Headers (PE signature, COFF header, PE32+ Optional Header, and `.text` section headers for Windows native loading).
-* **Offset 0x200–0x47F** (512): Mach-O 64-bit headers and load commands (`0xFEEDFACF`, `LC_SEGMENT_64` for macOS Darwin native execution).
-* **Offset 0x480+** (1152): Universal Hologram Header ($\Sigma_\infty$, `EIAH`), Contracts (`.eia_contract`), Relocation holes (`.eia_reloc`), Type Graph (`.eia_typegraph`), Authentication Record (`.eia_auth`), and executable native code pages.
+### 4.4 Dual Artifact Architecture: Native Binaries & Universal Multi-ISA Containers (`'UEIA'`)
+EIA provides a dual delivery strategy:
+
+1. **Direct OS-Native Artifacts**:
+   - **Linux**: Strict ELF64 binaries (`\x7fELF` at offset 0, `EM_X86_64`, `EM_AARCH64`, `EM_RISCV`) directly executable by the Linux kernel `execve(2)` with strict $W \oplus X$ segment permissions.
+   - **Windows**: Strict PE32+ binaries (`MZ` at 0x0, PE header at `e_lfanew`, Subsystem 3 CUI, ImageBase 0x140000000) directly loadable by Windows NT loader (`ntdll.dll`).
+   - **macOS**: Strict Mach-O 64 binaries (`MH_MAGIC_64` 0xFEEDFACF, `CPU_TYPE_X86_64`, `__TEXT` segment) directly loadable by Darwin `dyld`.
+   - **Firmware & Bare-Metal**: Native UEFI PE32+ (Subsystem 10 EFI_APPLICATION), x86_64 Multiboot 1, ARM64 64-byte Linux Image Header, and RISC-V 64 OpenSBI Header images bootable directly by firmware and hardware.
+
+2. **Universal Multi-Architecture Packages (`'UEIA'` v2.0 Container Format)**:
+   - For universal cross-architecture distribution, EIA emits `.eia` packages prefixed with the authoritative 32-bit magic `0x41494555` (`'UEIA'`).
+   - **Slices**: Contains independent, non-overlapping executable slices for x86_64, ARM64, and RISC-V 64, each complete with its own dedicated Hologram header ($\Sigma_\infty$), type graph, and contracts.
+   - **Loading**: Parsed and executed directly in-memory by the autonomous resident loader `eia-run`, selecting the native ISA slice without disk extraction or shell wrappers.
+
+3. **Legacy UPBP Polyglot (Backward Compatibility)**:
+   - Preserves the historical polyglot container (`MZ` + `/bin/sh` trampoline) for backward-compatible shell invocation where needed, strictly demarcated from direct kernel execution.
 
 ### 4.5 Dual Virtual Alias Mapping (DVAM) & $W \oplus X$
 To satisfy operating system Write XOR Execute ($W \oplus X$ security policies without paying the overhead of `mprotect()` syscalls during hole patching:

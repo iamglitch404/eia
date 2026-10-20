@@ -306,6 +306,9 @@ static void emit_start_stub(CompiledUnit *u, uint32_t *call_main_hole_out) {
         emit8(u, 0xe6); emit8(u, 0xf4); /* out 0xf4, al */
         /* Halt loop: cli; hlt; jmp .-2 */
         emit8(u, 0xfa); emit8(u, 0xf4); emit8(u, 0xeb); emit8(u, 0xfc);
+        const char *x86_str = "[EIA_BAREMETAL_X86_OK]\r\n";
+        for (size_t s = 0; s <= strlen(x86_str); ++s) emit8(u, (uint8_t)x86_str[s]);
+        while (u->text_size % 4 != 0) emit8(u, 0);
         return;
     }
     if (u->target_arch == 4) {

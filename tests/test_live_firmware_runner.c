@@ -211,7 +211,17 @@ static void test_live_baremetal_multiisa_runner(void) {
         }
         assert(strcmp(vga_chars, "[EIA_OK]") == 0);
         assert(uart_cnt > 0 && uart_out[0] == 42);
-        printf("  [PASS] x86_64 Bare-Metal Runner: Multiboot 1 + VGA buffer '%s' + COM1 UART exit 42 verified\n", vga_chars);
+
+        /* Verify x86_64 Bare-Metal string token */
+        const char *x_found = NULL;
+        for (size_t k = 0; k + 22 <= sz; ++k) {
+            if (memcmp(data + k, "[EIA_BAREMETAL_X86_OK]", 22) == 0) {
+                x_found = (const char *)(data + k);
+                break;
+            }
+        }
+        assert(x_found != NULL && "x86_64 bare-metal [EIA_BAREMETAL_X86_OK] string not found");
+        printf("  [PASS] x86_64 Bare-Metal Runner: Multiboot 1 + VGA '%s' + COM1 exit 42 + '[EIA_BAREMETAL_X86_OK]' verified\n", vga_chars);
         free(data);
         unlink("/tmp/live_runner_x86.elf");
     }

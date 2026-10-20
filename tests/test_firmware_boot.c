@@ -377,7 +377,16 @@ static void test_live_baremetal_boot(void) {
     }
     assert(strcmp(vga_chars, "[EIA_OK]") == 0);
     assert(uart_cnt > 0 && uart_out[0] == 42);
-    printf("  [PASS] Live x86_64 Bare-Metal Execution: VGA text buffer '[EIA_OK]' and COM1 exit code 42 verified!\n");
+
+    const char *x_found = NULL;
+    for (size_t k = 0; k + 22 <= sz; ++k) {
+        if (memcmp(data + k, "[EIA_BAREMETAL_X86_OK]", 22) == 0) {
+            x_found = (const char *)(data + k);
+            break;
+        }
+    }
+    assert(x_found != NULL);
+    printf("  [PASS] Live x86_64 Bare-Metal Execution: VGA text buffer '[EIA_OK]', COM1 exit 42, and '[EIA_BAREMETAL_X86_OK]' verified!\n");
     free(data);
 
     /* 2. ARM64 Bare-Metal Hardware Execution */

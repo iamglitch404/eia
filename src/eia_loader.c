@@ -419,7 +419,6 @@ int gdam_register_kernel_handle(ConcurrentGdamState *gdam, int fd, int resource_
 #ifndef _WIN32
     node->flags = fcntl(fd, F_GETFL, 0);
     node->seek_offset = lseek(fd, 0, SEEK_CUR);
-#ifndef _WIN32
     pthread_mutex_lock(&g_kernel_res_lock);
     node->next = g_kernel_resources;
     g_kernel_resources = node;

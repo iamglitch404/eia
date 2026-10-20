@@ -5,7 +5,7 @@
 > **Subsystem**: Eternal Interface Architecture (`EIA` / `EIA-Omega`)  
 > **Classification**: Universal Interface & Post-ABI Invariance Engine (Multi-century post-ABI semantic invariance via Universal Holograms and zero-cost hole patching)  
 > **Workspace Location**: [`file:///home/bishwaxyz/rubix/planned/eia/main.md`](file:///home/bishwaxyz/rubix/planned/eia/main.md)  
-> **Status**: Official Canonical Architecture  
+> **Status**: Official Canonical Architecture — Production Candidate (v1.0-RC1)  
 > **Governing Maxim**: *"The file format is not a physical constraint; it is an arbitrary wrapper. The calling interface is not a frozen set of registers; it is an invariant mathematical contract. Software should not die because a struct gained a field or an operating system changed its loader."*
 
 ---
@@ -489,19 +489,19 @@ The GDAM runtime provides zero-downtime, live online schema evolution for applic
 
 ## 14. Comprehensive Platform & Format Support Matrix
 
-| Target / Artifact | Format / Architecture | Execution Mode | Loader Contract | Test Suite & Validation | Status | Verified Evidence & Implementation Architecture |
+| Target / Artifact | Format / Architecture | Execution Mode | Loader Contract | Test Suite & Validation | Status | Verified Evidence & Engineering Implementation |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Linux Native** | ELF64 (`x86_64`) | Direct Native Kernel | Linux kernel `execve` | `tests/hello_eia.rx` | **PASS** | Direct kernel execution (exit code 42); strict W^X enforced. |
-| **Linux AArch64** | ELF64 (`aarch64`) | QEMU / Native Silicon | Linux AArch64 kernel / QEMU | `tests/test_eia_abi_bridge.c` | **PASS** | Executed in QEMU AArch64 (`qemu-aarch64`); verified AAPCS semantics. |
-| **Linux RISC-V 64** | ELF64 (`riscv64`) | QEMU / Native Silicon | Linux RISC-V kernel / QEMU | `tests/test_eia_abi_bridge.c` | **PASS** | Executed in QEMU RISC-V 64 (`qemu-riscv64`); verified LP64D semantics. |
-| **Windows Native** | PE32+ (`x86_64`) | Direct Windows Loader | Windows NT loader (`ntdll.dll`) | `tests/test_firmware_boot.c` | **PASS** | Verified with `file` & `objdump -p`; Machine 0x8664, Subsystem 3 (CUI), ImageBase 0x140000000. |
-| **macOS Native** | Mach-O 64 (`x86_64`) | Direct Darwin Loader | Darwin `dyld` | `tests/test_firmware_boot.c` | **PASS** | Verified with `file`; `MH_MAGIC_64` (0xFEEDFACF), `CPU_TYPE_X86_64`, `__TEXT` segment. |
-| **UEFI Application** | PE32+ (`x86_64`) | Firmware Loader / OVMF / In-Process Native CPU | UEFI 2.x Firmware Specification | `tests/test_firmware_boot.c` & `tests/test_live_firmware_runner.c` | **PASS (100% Live)** | Subsystem 10 (EFI_APPLICATION), SizeOfImage 0x2000, SizeOfHeaders 0x1000; native CPU Win64 MS_ABI invocation of `efi_main` emitting `L"[EIA_EFI_OK]\r\n"`, and OVMF boot in CI. |
-| **Bare-Metal x86-64** | ELF64 with Multiboot 1 | Direct Firmware / In-Process Hardware / QEMU | Multiboot 1 (`0x1BADB002`) | `tests/test_firmware_boot.c` & `tests/test_live_firmware_runner.c` | **PASS (100% Live)** | Magic 0x1BADB002, Checksum sum=0, jump `0xEB 0x0E`, UART COM1 (`0x3F8`) & VGA (`0xB8000`) emitting `'[EIA_OK]'`. |
-| **Bare-Metal ARM64** | Raw Image / ELF64 (`aarch64`) | Direct Firmware / In-Process Hardware / QEMU | Linux ARM64 Image Header (`0x644D5241`) | `tests/test_firmware_boot.c` & `tests/test_live_firmware_runner.c` | **PASS (100% Live)** | 64-byte Image header (`b _start` = `0x14000010`, `text_offset = 0x80000`, `magic = 'ARM\x64'`), PL011 UART MMIO (`0x09000000`) emitting `"[EIA_BAREMETAL_ARM64_OK]\r\n"`, and PSCI `SYSTEM_OFF`. |
-| **Bare-Metal RISC-V 64** | Raw Image / ELF64 (`riscv64`) | Direct Firmware / In-Process Hardware / QEMU | OpenSBI RISC-V Header (`0x56435352`) | `tests/test_firmware_boot.c` & `tests/test_live_firmware_runner.c` | **PASS (100% Live)** | 64-byte OpenSBI header (`jal x0, 64` = `0x0400006f`, `text_offset = 0x80000000`, `magic = 'RSCV'`), NS16550A UART MMIO (`0x10000000`) emitting `"[EIA_BAREMETAL_RISCV64_OK]\r\n"`, and `sifive_test` poweroff (`0x5555`). |
-| **Universal Package** | Container (`'UEIA'` v2.0) | In-Memory Launcher | EIA Resident Loader (`eia-run`) | `tests/test_eia_fuzz.c` | **PASS** | Multi-ISA container (x86_64, arm64, riscv64), independent Holograms; loaded directly via `eia-run`. |
-| **Legacy UPBP** | Polyglot (`MZ` / Shell) | Shell Trampoline | `/bin/sh` trampoline | `tests/hello_eia.rx --upbp` | **PASS** | Maintained for backward compatibility; shell extraction (`tail`/`z`) strictly distinguished from native execution. |
+| **Linux Native** | ELF64 (`x86_64`) | Direct Native Kernel | Linux kernel `execve` | `tests/hello_eia.rx` | **PASS (Direct Native)** | Direct kernel execution (exit code 42); strict W^X enforced. |
+| **Linux AArch64** | ELF64 (`aarch64`) | QEMU / Native Silicon | Linux AArch64 kernel / QEMU | `tests/test_eia_abi_bridge.c` | **PASS (QEMU Emulation)** | Executed in QEMU AArch64 (`qemu-aarch64`); verified AAPCS semantics. |
+| **Linux RISC-V 64** | ELF64 (`riscv64`) | QEMU / Native Silicon | Linux RISC-V kernel / QEMU | `tests/test_eia_abi_bridge.c` | **PASS (QEMU Emulation)** | Executed in QEMU RISC-V 64 (`qemu-riscv64`); verified LP64D semantics. |
+| **Windows Native** | PE32+ (`x86_64`) | Windows NT Loader | Windows NT loader (`ntdll.dll`) | `tests/test_firmware_boot.c` | **PASS (Format Validated)** | Verified with `file` & `objdump -p`; Machine 0x8664, Subsystem 3 (CUI), ImageBase 0x140000000; native execution on Windows CI runner in matrix. |
+| **macOS Native** | Mach-O 64 (`x86_64`) | Darwin Loader | Darwin `dyld` | `tests/test_firmware_boot.c` | **PASS (Format Validated)** | Verified with `file`; `MH_MAGIC_64` (0xFEEDFACF), `CPU_TYPE_X86_64`, `__TEXT` segment; native execution on macOS CI runner in matrix. |
+| **UEFI Application** | PE32+ (`x86_64`) | In-Process Native CPU / OVMF | UEFI 2.x Firmware Specification | `tests/test_firmware_boot.c` & `tests/test_live_firmware_runner.c` | **PASS (In-Process CPU / CI OVMF)** | Subsystem 10 (EFI_APPLICATION), SizeOfImage 0x2000, SizeOfHeaders 0x1000; native CPU Win64 MS_ABI invocation of `efi_main` emitting `L"[EIA_EFI_OK]\r\n"`, and OVMF VM boot in CI. |
+| **Bare-Metal x86-64** | ELF64 with Multiboot 1 | In-Process Hardware Runner / QEMU | Multiboot 1 (`0x1BADB002`) | `tests/test_firmware_boot.c` & `tests/test_live_firmware_runner.c` | **PASS (In-Process Hardware / CI QEMU)** | Magic 0x1BADB002, Checksum sum=0, jump `0xEB 0x0E`, UART COM1 (`0x3F8`) & VGA (`0xB8000`) emitting `'[EIA_OK]'` & `'[EIA_BAREMETAL_X86_OK]'`. |
+| **Bare-Metal ARM64** | Raw Image / ELF64 (`aarch64`) | In-Process Hardware Runner / QEMU | Linux ARM64 Image Header (`0x644D5241`) | `tests/test_firmware_boot.c` & `tests/test_live_firmware_runner.c` | **PASS (In-Process Hardware Runner)** | 64-byte Image header (`b _start` = `0x14000010`, `text_offset = 0x80000`, `magic = 'ARM\x64'`), PL011 UART MMIO (`0x09000000`) emitting `"[EIA_BAREMETAL_ARM64_OK]\r\n"`, and PSCI `SYSTEM_OFF`. |
+| **Bare-Metal RISC-V 64** | Raw Image / ELF64 (`riscv64`) | In-Process Hardware Runner / QEMU | OpenSBI RISC-V Header (`0x56435352`) | `tests/test_firmware_boot.c` & `tests/test_live_firmware_runner.c` | **PASS (In-Process Hardware Runner)** | 64-byte OpenSBI header (`jal x0, 64` = `0x0400006f`, `text_offset = 0x80000000`, `magic = 'RSCV'`), NS16550A UART MMIO (`0x10000000`) emitting `"[EIA_BAREMETAL_RISCV64_OK]\r\n"`, and `sifive_test` poweroff (`0x5555`). |
+| **Universal Package** | Container (`'UEIA'` v2.0) | In-Memory Launcher | EIA Resident Loader (`eia-run`) | `tests/test_eia_fuzz.c` | **PASS (In-Memory Loader)** | Multi-ISA container (x86_64, arm64, riscv64), independent Holograms; loaded directly via `eia-run`. |
+| **Legacy UPBP** | Polyglot (`MZ` / Shell) | Shell Trampoline | `/bin/sh` trampoline | `tests/hello_eia.rx --upbp` | **PASS (Shell Trampoline)** | Maintained for backward compatibility; shell extraction (`tail`/`z`) strictly distinguished from native execution. |
 
 
 

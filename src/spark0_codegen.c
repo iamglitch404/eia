@@ -805,6 +805,12 @@ static void compile_lvalue_addr(FnCompiler *fc, RuExpr *e) {
 
 static void compile_expr(FnCompiler *fc, RuExpr *e) {
     if (e->kind == EXPR_INT_LIT) {
+        if (fc->u->target_arch == 3) {
+            /* 32-bit x86 baremetal: mov eax, imm32 (5 bytes) */
+            emit8(fc->u, 0xb8);
+            emit32_le(fc->u, (uint32_t)e->as.int_val);
+            return;
+        }
         /* mov rax, imm64 */
         emit8(fc->u, 0x48); emit8(fc->u, 0xb8);
         emit64_le(fc->u, e->as.int_val);
@@ -1257,6 +1263,12 @@ static void compile_stmt(FnCompiler *fc, RuStmt *s) {
             emit8(fc->u, 0x31); emit8(fc->u, 0xc0); /* xor eax, eax */
         }
         /* Epilogue */
+        if (fc->u->target_arch == 3) {
+            emit8(fc->u, 0x89); emit8(fc->u, 0xec); /* mov esp, ebp */
+            emit8(fc->u, 0x5d);                     /* pop ebp */
+            emit8(fc->u, 0xc3);                     /* ret */
+            return;
+        }
         emit8(fc->u, 0x48); emit8(fc->u, 0x89); emit8(fc->u, 0xec); /* mov rsp, rbp */
         emit8(fc->u, 0x5d);                                         /* pop rbp */
         emit8(fc->u, 0xc3);                                         /* ret */
@@ -2296,11 +2308,20 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
             emit32_le(u, 0x01010113); /* addi sp, sp, 16 */
             emit32_le(u, 0x00008067); /* ret */
         } else {
-            /* x86_64 Prologue: allocate 4096 bytes for generous local stack frame */
-            emit8(u, 0x55);                                         /* push rbp */
-            emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xe5);         /* mov rbp, rsp */
-            emit8(u, 0x48); emit8(u, 0x81); emit8(u, 0xec);         /* sub rsp, 4096 */
-            emit32_le(u, 4096);
+            /* x86 Prologue */
+            if (u->target_arch == 3) {
+                /* 32-bit x86 baremetal prologue */
+                emit8(u, 0x55);                                         /* push ebp */
+                emit8(u, 0x89); emit8(u, 0xe5);                         /* mov ebp, rsp */
+                emit8(u, 0x81); emit8(u, 0xec);                         /* sub esp, 4096 */
+                emit32_le(u, 4096);
+            } else {
+                /* x86_64 Prologue: allocate 4096 bytes for generous local stack frame */
+                emit8(u, 0x55);                                         /* push rbp */
+                emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xe5);         /* mov rbp, rsp */
+                emit8(u, 0x48); emit8(u, 0x81); emit8(u, 0xec);         /* sub rsp, 4096 */
+                emit32_le(u, 4096);
+            }
 
             /* Save incoming parameters into stack slots */
             for (uint32_t p_idx = 0; p_idx < fn->param_count && p_idx < 6; ++p_idx) {
@@ -2353,9 +2374,15 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
 
             /* Default epilogue in case function falls through */
             emit8(u, 0x31); emit8(u, 0xc0);                         /* xor eax, eax */
-            emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xec);         /* mov rsp, rbp */
-            emit8(u, 0x5d);                                         /* pop rbp */
-            emit8(u, 0xc3);                                         /* ret */
+            if (u->target_arch == 3) {
+                emit8(u, 0x89); emit8(u, 0xec);                     /* mov esp, ebp */
+                emit8(u, 0x5d);                                     /* pop ebp */
+                emit8(u, 0xc3);                                     /* ret */
+            } else {
+                emit8(u, 0x48); emit8(u, 0x89); emit8(u, 0xec);     /* mov rsp, rbp */
+                emit8(u, 0x5d);                                     /* pop rbp */
+                emit8(u, 0xc3);                                     /* ret */
+            }
         }
 
         /* Collect call fixups */

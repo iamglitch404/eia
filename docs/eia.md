@@ -485,6 +485,11 @@ The GDAM runtime provides zero-downtime, live online schema evolution for applic
 - **Cross-Process Zero-Downtime Handoff**: `SCM_RIGHTS` control message passing transfers live file and socket descriptors between processes without closing the handle or dropping in-flight data packets.
 - **Concurrency & Memory Safety**: Verified with zero data races, zero torn reads, and zero leaks across 100,000+ operations under ThreadSanitizer, AddressSanitizer, and UndefinedBehaviorSanitizer (`tests/sample_gdam_app.c` & `tests/test_gdam_hot_migration.c`).
 
+### 13.3 Architectural Scope & Operational Model
+GDAM operates as an explicitly managed, registered-runtime generational migration system:
+* **Managed Participation**: Applications register migratable heap graphs (`gdam_object_register`), worker threads (`gdam_thread_register`), and kernel descriptors (`gdam_register_kernel_handle`), executing within cooperative read safepoints (`gdam_safepoint_enter`/`leave`).
+* **Non-Arbitrary Scope**: GDAM delivers mathematically verified, zero-downtime hot migration and seamless `SCM_RIGHTS` kernel handoff for participating registered runtimes, distinguishing itself from an automatic or uninstrumented migration of arbitrary legacy unmanaged programs.
+
 ---
 
 ## 14. Comprehensive Platform & Format Support Matrix

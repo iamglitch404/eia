@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 
 #if defined(__x86_64__)
 
@@ -410,6 +411,42 @@ static void test_multiarch_thunk_encodings(void) {
     printf("  [PASS] RISC-V LP64D thunk encoding (sd/ld ra, s0 + jalr ra, t1 + ret) 100%% verified\n");
 }
 
+static void create_minimal_thunk_elf(const char *path, uint16_t machine, const uint32_t *code, size_t code_words) {
+    uint8_t buf[512] = {0};
+    /* ELF Header (64 bytes) */
+    buf[0] = 0x7f; buf[1] = 'E'; buf[2] = 'L'; buf[3] = 'F';
+    buf[4] = 2; /* 64-bit */
+    buf[5] = 1; /* Little-endian */
+    buf[6] = 1; /* Version 1 */
+    *(uint16_t *)(buf + 16) = 2; /* ET_EXEC */
+    *(uint16_t *)(buf + 18) = machine; /* EM_AARCH64 (183) or EM_RISCV (243) */
+    *(uint32_t *)(buf + 20) = 1; /* EV_CURRENT */
+    *(uint64_t *)(buf + 24) = 0x400078ULL; /* e_entry */
+    *(uint64_t *)(buf + 32) = 64; /* e_phoff */
+    *(uint16_t *)(buf + 52) = 64; /* e_ehsize */
+    *(uint16_t *)(buf + 54) = 56; /* e_phentsize */
+    *(uint16_t *)(buf + 56) = 1;  /* e_phnum */
+
+    /* Program Header (56 bytes at offset 64) */
+    uint32_t total_sz = 120 + (uint32_t)(code_words * 4);
+    *(uint32_t *)(buf + 64) = 1; /* PT_LOAD */
+    *(uint32_t *)(buf + 68) = 5; /* PF_R | PF_X */
+    *(uint64_t *)(buf + 72) = 0; /* p_offset */
+    *(uint64_t *)(buf + 80) = 0x400000ULL; /* p_vaddr */
+    *(uint64_t *)(buf + 88) = 0x400000ULL; /* p_paddr */
+    *(uint64_t *)(buf + 96) = total_sz;    /* p_filesz */
+    *(uint64_t *)(buf + 104) = total_sz;   /* p_memsz */
+    *(uint64_t *)(buf + 112) = 0x1000ULL;  /* p_align */
+
+    /* Code at offset 120 */
+    memcpy(buf + 120, code, code_words * 4);
+
+    FILE *f = fopen(path, "wb");
+    assert(f && fwrite(buf, 1, total_sz, f) == total_sz);
+    fclose(f);
+    chmod(path, 0755);
+}
+
 static void test_e2e_qemu_arm64_execution(void) {
     printf("[ABI TEST 9] Real Silicon Simulation: ARM64 Native Execution via QEMU AArch64...\n");
     int rc = run_cmd_exit("./bin/spark0 tests/hello_eia.rx -o /tmp/abi_arm64 --target=arm64 >/dev/null 2>&1");
@@ -418,6 +455,31 @@ static void test_e2e_qemu_arm64_execution(void) {
     assert(exec_rc == 42);
     printf("  [PASS] ARM64 binary compiled with AAPCS contracts and executed in QEMU (exit 42)\n");
     unlink("/tmp/abi_arm64");
+
+    /* Execute real synthesized ARM64 AAPCS bridge thunk program in QEMU */
+    const uint32_t arm_thunk_prog[] = {
+        /* 0x400078: _start */
+        0x94000003, /* bl +12 -> 0x400084 (thunk) */
+        0xd2800ba8, /* mov x8, #93 (sys_exit) */
+        0xd4000001, /* svc #0 */
+        /* 0x400084: AAPCS bridge thunk */
+        0xa9bf7bfd, /* stp x29, x30, [sp, -16]! */
+        0x910003fd, /* mov x29, sp */
+        0xd2801490, /* movz x16, 0x00a4 */
+        0xf2a00810, /* movk x16, 0x0040, lsl 16 -> x16 = 0x4000a4 (callee) */
+        0xd63f0200, /* blr x16 */
+        0xa8c17bfd, /* ldp x29, x30, [sp], 16 */
+        0xd65f03c0, /* ret */
+        0xd503201f, /* nop (padding to 0x4000a4) */
+        /* 0x4000a4: callee */
+        0xd2800540, /* mov x0, #42 */
+        0xd65f03c0  /* ret */
+    };
+    create_minimal_thunk_elf("/tmp/abi_arm64_thunk", 183, arm_thunk_prog, sizeof(arm_thunk_prog)/4);
+    int thunk_rc = run_cmd_exit("/usr/bin/qemu-aarch64 /tmp/abi_arm64_thunk >/dev/null 2>&1");
+    assert(thunk_rc == 42 && "ARM64 AAPCS bridge thunk execution failed in QEMU");
+    printf("  [PASS] Real ARM64 AAPCS Bridge Thunk Program executed in QEMU AArch64 (returned 42)!\n");
+    unlink("/tmp/abi_arm64_thunk");
 }
 
 static void test_e2e_qemu_riscv64_execution(void) {
@@ -428,6 +490,33 @@ static void test_e2e_qemu_riscv64_execution(void) {
     assert(exec_rc == 42);
     printf("  [PASS] RISC-V 64 binary compiled with LP64D contracts and executed in QEMU (exit 42)\n");
     unlink("/tmp/abi_riscv64");
+
+    /* Execute real synthesized RISC-V LP64D bridge thunk program in QEMU */
+    const uint32_t rv_thunk_prog[] = {
+        /* 0x400078: _start */
+        0x00c000ef, /* jal ra, 12 -> 0x400084 (thunk) */
+        0x05d00893, /* li a7, 93 (sys_exit) */
+        0x00000073, /* ecall */
+        /* 0x400084: LP64D bridge thunk */
+        0xfe010113, /* addi sp, sp, -32 */
+        0x00113c23, /* sd ra, 24(sp) */
+        0x00813823, /* sd s0, 16(sp) */
+        0x00400337, /* lui t1, 0x400 */
+        0x0ac30313, /* addi t1, t1, 0x0ac -> t1 = 0x4000ac (callee) */
+        0x000300e7, /* jalr ra, 0(t1) */
+        0x01813083, /* ld ra, 24(sp) */
+        0x01013403, /* ld s0, 16(sp) */
+        0x02010113, /* addi sp, sp, 32 */
+        0x00008067, /* ret (jalr zero, 0(ra)) */
+        /* 0x4000ac: callee */
+        0x02a00513, /* li a0, 42 */
+        0x00008067  /* ret (jalr zero, 0(ra)) */
+    };
+    create_minimal_thunk_elf("/tmp/abi_riscv_thunk", 243, rv_thunk_prog, sizeof(rv_thunk_prog)/4);
+    int thunk_rc = run_cmd_exit("/usr/bin/qemu-riscv64 /tmp/abi_riscv_thunk >/dev/null 2>&1");
+    assert(thunk_rc == 42 && "RISC-V LP64D bridge thunk execution failed in QEMU");
+    printf("  [PASS] Real RISC-V LP64D Bridge Thunk Program executed in QEMU RISC-V 64 (returned 42)!\n");
+    unlink("/tmp/abi_riscv_thunk");
 }
 
 #endif /* __x86_64__ */

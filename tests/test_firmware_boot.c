@@ -429,7 +429,13 @@ static void test_live_baremetal_boot(void) {
     unlink("/tmp/boot_bm_rv.elf");
     unlink("/tmp/boot_bm_rv.elf.bin");
 
-    /* 4. Live QEMU if installed */
+    /* 4. Live QEMU Bare-Metal VM Boots (x86_64, ARM64, RISC-V 64) */
+    int strict = (getenv("EIA_STRICT_FIRMWARE_BOOT") != NULL);
+
+    /* 4a. x86_64 Multiboot in QEMU */
+    if (strict) {
+        assert(command_available("qemu-system-x86_64") && "qemu-system-x86_64 required in strict mode");
+    }
     if (command_available("qemu-system-x86_64")) {
         unlink("/tmp/bm_serial.log");
         char qemu_cmd[512];
@@ -438,11 +444,58 @@ static void test_live_baremetal_boot(void) {
         system(qemu_cmd);
         size_t log_sz = 0;
         uint8_t *log_data = read_file("/tmp/bm_serial.log", &log_sz);
+        if (strict) {
+            assert(log_data && log_sz > 0 && log_data[0] == 42 && "x86_64 QEMU Multiboot failed to boot or exit 42");
+        }
         if (log_data && log_sz > 0 && log_data[0] == 42) {
             printf("  [PASS] Live QEMU Bare-metal Multiboot kernel booted in VM and exited with 42!\n");
         }
         if (log_data) free(log_data);
         unlink("/tmp/bm_serial.log");
+    }
+
+    /* 4b. ARM64 Bare-Metal in QEMU */
+    if (strict) {
+        assert(command_available("qemu-system-aarch64") && "qemu-system-aarch64 required in strict mode");
+    }
+    if (command_available("qemu-system-aarch64")) {
+        unlink("/tmp/arm_serial.log");
+        char qemu_cmd[512];
+        snprintf(qemu_cmd, sizeof(qemu_cmd),
+                 "timeout 6s qemu-system-aarch64 -M virt -cpu cortex-a57 -nographic -kernel /tmp/boot_bm_arm.elf -serial file:/tmp/arm_serial.log >/dev/null 2>&1");
+        system(qemu_cmd);
+        size_t arm_log_sz = 0;
+        uint8_t *arm_log = read_file("/tmp/arm_serial.log", &arm_log_sz);
+        if (strict) {
+            assert(arm_log && strstr((const char *)arm_log, "[EIA_BAREMETAL_ARM64_OK]") && "qemu-system-aarch64 bare-metal boot failed");
+        }
+        if (arm_log && strstr((const char *)arm_log, "[EIA_BAREMETAL_ARM64_OK]")) {
+            printf("  [PASS] Live QEMU ARM64 Bare-metal kernel booted in VM and streamed '[EIA_BAREMETAL_ARM64_OK]'!\n");
+        }
+        if (arm_log) free(arm_log);
+        unlink("/tmp/arm_serial.log");
+    }
+
+    /* 4c. RISC-V 64 Bare-Metal in QEMU */
+    if (strict) {
+        assert(command_available("qemu-system-riscv64") && "qemu-system-riscv64 required in strict mode");
+    }
+    if (command_available("qemu-system-riscv64")) {
+        unlink("/tmp/rv_serial.log");
+        char qemu_cmd[512];
+        snprintf(qemu_cmd, sizeof(qemu_cmd),
+                 "timeout 6s qemu-system-riscv64 -M virt -bios none -nographic -kernel /tmp/boot_bm_rv.elf -serial file:/tmp/rv_serial.log >/dev/null 2>&1");
+        system(qemu_cmd);
+        size_t rv_log_sz = 0;
+        uint8_t *rv_log = read_file("/tmp/rv_serial.log", &rv_log_sz);
+        if (strict) {
+            assert(rv_log && strstr((const char *)rv_log, "[EIA_BAREMETAL_RISCV64_OK]") && "qemu-system-riscv64 bare-metal boot failed");
+        }
+        if (rv_log && strstr((const char *)rv_log, "[EIA_BAREMETAL_RISCV64_OK]")) {
+            printf("  [PASS] Live QEMU RISC-V 64 Bare-metal kernel booted in VM and streamed '[EIA_BAREMETAL_RISCV64_OK]'!\n");
+        }
+        if (rv_log) free(rv_log);
+        unlink("/tmp/rv_serial.log");
     }
 
     unlink("/tmp/boot_bm_qemu.rx");
@@ -531,6 +584,12 @@ static void test_live_uefi_execution(void) {
     munmap(mem, map_sz);
     free(data);
 
+    int uefi_strict = (getenv("EIA_STRICT_FIRMWARE_BOOT") != NULL);
+    if (uefi_strict) {
+        assert(command_available("qemu-system-x86_64") && "qemu-system-x86_64 required in strict mode");
+        assert(find_ovmf_firmware() != NULL && "OVMF firmware required in strict mode");
+    }
+
     if (command_available("qemu-system-x86_64")) {
         const char *ovmf_path = find_ovmf_firmware();
         if (ovmf_path) {
@@ -546,6 +605,9 @@ static void test_live_uefi_execution(void) {
 
             size_t log_sz = 0;
             uint8_t *log_data = read_file("/tmp/uefi_serial.log", &log_sz);
+            if (uefi_strict) {
+                assert(log_data && strstr((const char *)log_data, "[EIA_EFI_OK]") && "Live QEMU + OVMF UEFI boot failed to display [EIA_EFI_OK]");
+            }
             if (log_data && strstr((const char *)log_data, "[EIA_EFI_OK]")) {
                 printf("  [PASS] Live QEMU + OVMF UEFI application booted in VM and displayed [EIA_EFI_OK]!\n");
             }

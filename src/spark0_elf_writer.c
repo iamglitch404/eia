@@ -493,7 +493,7 @@ static uint8_t *spark0_create_pe_buf(const CompiledUnit *unit, size_t *out_size,
     file_buf[coff_base + 0] = 0x64; file_buf[coff_base + 1] = 0x86; /* Machine = 0x8664 (AMD64) */
     file_buf[coff_base + 2] = 2;    file_buf[coff_base + 3] = 0;    /* NumberOfSections = 2 */
     file_buf[coff_base + 16] = 240; file_buf[coff_base + 17] = 0;   /* SizeOfOptionalHeader = 240 */
-    uint16_t pe_char = is_uefi ? 0x202E : 0x0022;
+    uint16_t pe_char = is_uefi ? 0x202E : 0x0023; /* 0x0023 = RELOCS_STRIPPED | EXECUTABLE | LARGE_ADDRESS_AWARE */
     file_buf[coff_base + 18] = (uint8_t)(pe_char & 0xFF);
     file_buf[coff_base + 19] = (uint8_t)((pe_char >> 8) & 0xFF);
 
@@ -524,7 +524,7 @@ static uint8_t *spark0_create_pe_buf(const CompiledUnit *unit, size_t *out_size,
     file_buf[opt_base + 68] = is_uefi ? 10 : 3;                     /* Subsystem: 10=EFI, 3=CUI */
     file_buf[opt_base + 69] = 0;
     if (!is_uefi) {
-        file_buf[opt_base + 70] = 0x60; file_buf[opt_base + 71] = 0x81; /* DllCharacteristics = 0x8160 */
+        file_buf[opt_base + 70] = 0x20; file_buf[opt_base + 71] = 0x81; /* DllCharacteristics = 0x8120: NX_COMPAT | TERMINAL_SERVER_AWARE */
     }
     set_u32(file_buf, (opt_base + 72) / 4, 0x200000);               /* SizeOfStackReserve = 2MB */
     set_u32(file_buf, (opt_base + 80) / 4, 0x1000);                 /* SizeOfStackCommit = 4KB */

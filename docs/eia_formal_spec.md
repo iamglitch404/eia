@@ -1,10 +1,12 @@
-# Evolution-Invariant Architecture (EIA) Formal Specification & Proofs
+# Evolution-Invariant Architecture (EIA) Formal Specification & Proof Sketch
 
-**Specification Version**: 2.0.0-PROVEN  
-**Document Status**: Formal Standard & Hardware Invariant Specification  
+**Specification Version**: 2.0.0-PROOFSKETCH  
+**Document Status**: Mathematical Specification & Hardware Invariant Proof Sketch  
 **Mathematical Foundation**: Reynolds' Relational Parametricity & Operational Semantics  
 
 ---
+
+> **Scope & Verification Notice**: This document provides the mathematical specification, operational semantics, and structural inductive proof sketches for the core theorems of the Evolution-Invariant Architecture. It formalizes representation independence and steady-state dispatch equivalence. While empirically benchmarked and structurally verified against emitted machine code in `tests/test_eia_perf_formal.c`, this specification is a rigorous mathematical proof sketch rather than a machine-checked artifact from an automated theorem prover (such as Coq, Lean, or Isabelle).
 
 ## 1. Mathematical Foundations & Representation Independence
 

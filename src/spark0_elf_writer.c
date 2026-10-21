@@ -222,7 +222,7 @@ static uint8_t *spark0_create_elf_buf(const CompiledUnit *unit, size_t *out_size
     uint64_t type_graph_size = unit->type_graph_count * sizeof(EiaTypeGraphEntry);
 
     uint64_t text_offset = (target_arch == 3 || target_arch == 8 || target_arch == 9) ? 0x1000 : 0x10000; /* Baremetal: 4KB / Native: 64KB */
-    uint64_t rodata_offset = (target_arch == 3 || target_arch == 8 || target_arch == 9) ? 0x3000 : 0x30000; /* Baremetal: 12KB / Native: 192KB */
+    uint64_t rodata_offset = (target_arch == 3 || target_arch == 8 || target_arch == 9) ? 0x3000 : 0x80000; /* Baremetal: 12KB / Native: 512KB */
     if (text_offset + unit->text_size > rodata_offset) {
         rodata_offset = (text_offset + unit->text_size + 0xFFF) & ~0xFFFULL;
     }

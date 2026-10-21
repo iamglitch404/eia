@@ -2192,7 +2192,7 @@ CompiledUnit *spark0_compile_module(RuModule *module, int target_arch) {
     u->target_arch = target_arch;
     build_type_graph(u, module);
 
-    uint32_t rodata_base = 0x430000;
+    uint32_t rodata_base = 0x480000;
 
     /* Emit _start stub first */
     uint32_t call_main_hole = 0xFFFFFFFF;
